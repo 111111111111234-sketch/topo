@@ -1,0 +1,38 @@
+# ============================================================================
+# ConfTopo - Stage 2 (vllm)
+# 独立 LLM 推理环境：Python 3.10 + vLLM（CUDA 12.x）
+#
+# 构建:
+#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part2
+# ============================================================================
+
+ARG BASE_IMAGE=REPLACE_WITH_PART1_TAG
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="conftopo-stage2"
+LABEL org.opencontainers.image.description="vllm conda: Py3.10 + vLLM"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ============================================================================
+# A. vllm conda
+# ============================================================================
+RUN conda create -n vllm python=3.10 "pip>=23,<24.4" -y
+
+RUN conda run -n vllm pip install --no-cache-dir ${PIP_OPTIONS} \
+    --extra-index-url https://pypi.org/simple \
+    --retries 5 --timeout 300 \
+    "vllm>=0.19.1,<0.20"
+
+# LD_LIBRARY_PATH 隔离
+RUN mkdir -p \
+      /opt/conda/envs/vllm/etc/conda/activate.d \
+      /opt/conda/envs/vllm/etc/conda/deactivate.d && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
+          /opt/conda/envs/vllm/etc/conda/activate.d/unset_ld_path.sh && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh \
+          /opt/conda/envs/vllm/etc/conda/deactivate.d/restore_ld_path.sh
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

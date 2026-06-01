@@ -1,0 +1,199 @@
+# ============================================================================
+# ConfTopo - Stage 1 (conftopo-dev)
+# NGC 25.05: CUDA 12.9.0 | torch 2.8.0a0 | TensorRT 10.10.0.31
+# conda conftopo-dev: Py3.12 + PyPI torch 2.8.0+cu128 + ConfTopo Core
+#
+# 构建:
+#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part1
+# ============================================================================
+FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/nvidia-pytorch:25.05-py3
+
+LABEL org.opencontainers.image.title="conftopo-stage1"
+LABEL org.opencontainers.image.description="fuyao + system deps + Miniconda + conftopo-dev + zsh"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+ENV WORKSPACE=/workspace/tangyx7@xiaopeng.com
+ENV CONFTopo_DEV_PYTHON=/opt/conda/envs/conftopo-dev/bin/python
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ============================================================================
+# A. fuyao 平台标准组件（python > 3.10 模板）
+# ============================================================================
+RUN pip install ${PIP_OPTIONS} \
+    jupyterlab==4.5.1 \
+    jupyterlab-tensorboard-pro==4.0.0 \
+    tensorboard==2.20.0 \
+    fuyao-shellhub
+RUN python3 -m fuyao-shellhub
+
+COPY --from=infra-registry.cn-wulanchabu.cr.aliyuncs.com/data-infra/public:fuyao-base-1.9.7 \
+    /opt/data-infra /opt/data-infra
+ENV PATH="${PATH}:/opt/data-infra"
+
+# ============================================================================
+# B. 系统依赖（EGL/GL headless + 工具）
+# ============================================================================
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+      libopengl0 \
+      libegl1 \
+      libgles2 \
+      libgl1 \
+      libglib2.0-0 \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      zsh \
+      curl \
+      wget \
+      git \
+      vim \
+      zip \
+      tini; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+    echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+ENV MAGNUM_LOG=quiet
+ENV GLOG_minloglevel=2
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# ============================================================================
+# C. Miniconda
+# ============================================================================
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh && \
+    /opt/conda/bin/conda config --set auto_activate_base false && \
+    /opt/conda/bin/conda init bash && \
+    /opt/conda/bin/conda init zsh
+
+ENV PATH="/opt/conda/bin:${PATH}"
+
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+# ============================================================================
+# D. conftopo-dev conda（Core 开发 / 单测，PyPI torch 2.8.0+cu128）
+# ============================================================================
+RUN conda create -n conftopo-dev python=3.12 pip -y
+
+RUN conda install -n conftopo-dev -c conda-forge --override-channels -y \
+    numpy=1.26.4 scipy scikit-learn matplotlib=3.9.4 \
+    networkx=3.2.1 pillow tqdm pyyaml "setuptools<75" wheel
+
+RUN conda run -n conftopo-dev pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+RUN conda run -n conftopo-dev pip install --no-cache-dir ${PIP_OPTIONS} \
+    imageio imageio-ffmpeg h5py lmdb numba \
+    opencv-python-headless \
+    gym==0.26.2 hydra-core omegaconf yacs jsonlines \
+    msgpack msgpack-numpy numpy-quaternion \
+    "transformers>=4.40" timm==1.0.27 \
+    open_clip_torch==3.3.0 ftfy regex \
+    openai safetensors huggingface_hub gdown requests \
+    tensorboardX easydict natsort
+
+# LD_LIBRARY_PATH 隔离
+RUN mkdir -p \
+      /opt/conda/envs/conftopo-dev/etc/conda/activate.d \
+      /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+      'unset LD_LIBRARY_PATH' \
+      > /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+      'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+      > /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh && \
+    chmod +x /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
+             /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh
+
+# ============================================================================
+# E. 源码 + conftopo editable install
+# ============================================================================
+COPY setup.py /opt/conftopo-src/setup.py
+COPY conftopo /opt/conftopo-src/conftopo
+COPY habitat-lab /opt/src/habitat-lab-v017/
+COPY habitat-lab-v0.2.3/habitat-lab /opt/src/habitat-lab-v023/
+
+RUN touch /opt/src/habitat-lab-v023/README.md /opt/src/README.md \
+          /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE
+
+RUN conda run -n conftopo-dev pip install --no-cache-dir -e /opt/conftopo-src ${PIP_OPTIONS}
+
+# ============================================================================
+# F. 工具脚本
+# ============================================================================
+RUN mkdir -p /opt/conftopo-env/bin
+COPY docker_build/start-vllm.sh docker_build/verify-envs.sh /opt/conftopo-env/bin/
+RUN chmod +x /opt/conftopo-env/bin/*.sh
+
+# ============================================================================
+# G. zsh + oh-my-zsh
+# ============================================================================
+RUN RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+RUN git clone https://github.com/zsh-users/zsh-autosuggestions \
+    ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions && \
+    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git \
+    ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+RUN sed -i 's/^ZSH_THEME=.*/ZSH_THEME="ys"/' /root/.zshrc && \
+    sed -i 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting z extract)/' /root/.zshrc
+
+# ============================================================================
+# H. 环境变量 + 别名
+# ============================================================================
+RUN printf '%s\n' \
+      '# ConfTopo runtime defaults' \
+      'export WORKSPACE=/workspace/tangyx7@xiaopeng.com' \
+      'export CONFTopo_DEV_PYTHON=/opt/conda/envs/conftopo-dev/bin/python' \
+      'export CONFTopo_VLLM_PYTHON=/opt/conda/envs/vllm/bin/python' \
+      'export MAGNUM_LOG=quiet' \
+      'export GLOG_minloglevel=2' \
+      'export NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display' \
+      'export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json' \
+      > /etc/profile.d/conftopo-env.sh
+
+RUN printf '%s\n' \
+      '' \
+      '# CONFTOPO_ENV_MARKER' \
+      'export TERM=xterm-256color' \
+      'source /etc/profile.d/conftopo-env.sh' \
+      'alias conftopo-dev="conda activate conftopo-dev"' \
+      'alias conftopo-goat="conda activate goat"' \
+      'alias conftopo-etp="conda activate etpnav"' \
+      'alias start-vllm="/opt/conftopo-env/bin/start-vllm.sh"' \
+      'alias verify-envs="/opt/conftopo-env/bin/verify-envs.sh"' \
+      'alias ls="ls --color=auto"' \
+      'alias grep="grep --color=auto"' \
+      'source /opt/conda/etc/profile.d/conda.sh' \
+      >> /root/.zshrc
+
+ENV TERM=xterm-256color
+ENV SHELL=/bin/zsh
+
+RUN printf '%s\n' \
+      'if [ -n "$PS1" ] && [ -z "$ZSH_VERSION" ]; then' \
+      '  exec /bin/zsh -l' \
+      'fi' \
+      >> /root/.bashrc
+
+RUN mkdir -p ${WORKSPACE}
+WORKDIR ${WORKSPACE}
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

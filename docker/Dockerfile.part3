@@ -1,0 +1,65 @@
+# ============================================================================
+# ConfTopo - Stage 3 (goat)
+# goat 环境: Python 3.9 + habitat-sim 0.2.4 + torch 2.8.0+cu128
+# ConfTopo-GOAT / GOAT-Bench Agent 在此环境运行
+#
+# 构建:
+#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part3
+# ============================================================================
+
+ARG BASE_IMAGE=REPLACE_WITH_PART2_TAG
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="conftopo-stage3"
+LABEL org.opencontainers.image.description="goat conda: Py3.9 + habitat-sim0.2.4 + torch2.8+cu128"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ============================================================================
+# A. goat conda
+# ============================================================================
+RUN conda create -n goat python=3.9 cmake "pip<24.4" -y
+
+RUN conda install -n goat habitat-sim=0.2.4 headless -c aihabitat -c conda-forge -y
+
+RUN conda run -n goat pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+RUN conda install -n goat -c conda-forge --override-channels -y \
+    numpy=1.26.4 scipy scikit-learn matplotlib pillow tqdm pyyaml
+
+RUN conda run -n goat pip install --no-cache-dir "setuptools<70" && \
+    conda run -n goat pip install --no-cache-dir ${PIP_OPTIONS} \
+    opencv-python-headless \
+    gym==0.23.0 hydra-core omegaconf yacs jsonlines \
+    imageio imageio-ffmpeg msgpack msgpack-numpy h5py lmdb numba \
+    transformers timm open_clip_torch ftfy regex \
+    easydict tensorboardX gdown requests pytest-runner \
+    ifcfg einops openai
+
+# ============================================================================
+# B. habitat-lab 0.2.3 + conftopo editable
+# ============================================================================
+RUN touch /opt/src/habitat-lab-v023/README.md
+
+RUN env -u LD_LIBRARY_PATH conda run -n goat pip install --no-cache-dir \
+    -e /opt/src/habitat-lab-v023 --no-deps && \
+    env -u LD_LIBRARY_PATH conda run -n goat pip install --no-cache-dir \
+    -e /opt/conftopo-src
+
+# ============================================================================
+# C. LD_LIBRARY_PATH 隔离
+# ============================================================================
+RUN mkdir -p \
+      /opt/conda/envs/goat/etc/conda/activate.d \
+      /opt/conda/envs/goat/etc/conda/deactivate.d && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
+          /opt/conda/envs/goat/etc/conda/activate.d/unset_ld_path.sh && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh \
+          /opt/conda/envs/goat/etc/conda/deactivate.d/restore_ld_path.sh
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

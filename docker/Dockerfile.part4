@@ -1,0 +1,117 @@
+# ============================================================================
+# ConfTopo - Stage 4 (etpnav)
+# etpnav 环境: Python 3.9 + torch 2.8.0+cu128 + habitat-sim 0.1.7 源码编译
+# ConfTopo-ETPNav / R2R-CE Agent 在此环境运行
+#
+# 构建:
+#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part4
+# ============================================================================
+
+ARG BASE_IMAGE=REPLACE_WITH_PART3_TAG
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="conftopo-stage4"
+LABEL org.opencontainers.image.description="etpnav conda: Py3.9 + torch2.8+cu128 + habitat-sim0.1.7 src"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+ARG HABITAT_SIM_TAG=v0.1.7
+ARG HABITAT_SIM_GIT=https://github.com/facebookresearch/habitat-sim.git
+
+# ============================================================================
+# A. habitat-sim 0.1.7 源码编译所需的系统依赖
+# ============================================================================
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      ninja-build \
+      libjpeg-dev \
+      libglm-dev \
+      libgl1-mesa-dev \
+      libegl1-mesa-dev \
+      libxrandr-dev \
+      libxinerama-dev \
+      libxcursor-dev \
+      libxi-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# ============================================================================
+# B. etpnav conda
+# ============================================================================
+RUN conda create -n etpnav python=3.9 cmake "pip>=23,<24.4" -y
+
+RUN conda run -n etpnav python -c "\
+import glob, os, shutil; \
+base='/opt/conda/envs/etpnav/lib/python3.9/site-packages'; \
+[shutil.rmtree(d) for pat in ('pip-2[4-9]*','pip-[3-9]*') for d in glob.glob(os.path.join(base, pat))]; \
+pip_dir=os.path.join(base,'pip'); \
+shutil.rmtree(pip_dir) if os.path.isdir(pip_dir) else None" 2>/dev/null || true; \
+    conda run -n etpnav python -m ensurepip --upgrade 2>/dev/null || true; \
+    conda run -n etpnav pip install "pip>=23,<24.4" ${PIP_OPTIONS} 2>/dev/null || true
+
+RUN conda run -n etpnav pip install --no-cache-dir \
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+RUN conda run -n etpnav pip install --no-cache-dir ${PIP_OPTIONS} \
+    numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+    opencv-python==4.11.0.86 networkx==3.2.1 pillow tqdm pyyaml \
+    gym==0.23.1 hydra-core omegaconf yacs jsonlines \
+    imageio imageio-ffmpeg quaternion \
+    h5py lmdb msgpack msgpack-numpy numba numpy-quaternion \
+    transformers==4.12.5 tokenizers==0.10.3 timm==1.0.27 \
+    tensorboardX easydict ftfy regex \
+    open_clip_torch==3.3.0 openai safetensors huggingface_hub gdown requests \
+    scikit-image sentencepiece sacremoses stanza shapely \
+    bresenham dtw fastdtw progressbar2 gpustat \
+    "protobuf>=3.20,<5" webdataset attrs
+
+RUN conda run -n etpnav pip install --no-cache-dir \
+    git+https://github.com/openai/CLIP.git || true
+
+# ============================================================================
+# C. habitat-sim 0.1.7 源码编译
+# ============================================================================
+RUN git clone --depth 1 --branch ${HABITAT_SIM_TAG} ${HABITAT_SIM_GIT} /tmp/habitat-sim && \
+    conda run -n etpnav pip install --no-cache-dir -r /tmp/habitat-sim/requirements.txt && \
+    cd /tmp/habitat-sim && \
+    conda run -n etpnav python setup.py install --headless --with-cuda && \
+    rm -rf /tmp/habitat-sim
+
+# ============================================================================
+# D. habitat-lab 0.1.7 + conftopo editable
+# ============================================================================
+RUN touch /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE
+
+RUN env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n etpnav pip install --no-cache-dir \
+    -e /opt/src/habitat-lab-v017 --no-deps && \
+    env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n etpnav pip install --no-cache-dir \
+    -e /opt/conftopo-src
+
+# ============================================================================
+# E. LD_LIBRARY_PATH 隔离
+# ============================================================================
+RUN mkdir -p \
+      /opt/conda/envs/etpnav/etc/conda/activate.d \
+      /opt/conda/envs/etpnav/etc/conda/deactivate.d && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
+          /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh && \
+    cp -f /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh \
+          /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh
+
+# ============================================================================
+# F. 构建验证
+# ============================================================================
+COPY docker_build/verify-envs.sh /opt/conftopo-env/bin/verify-envs.sh
+RUN chmod +x /opt/conftopo-env/bin/verify-envs.sh
+
+RUN /opt/conftopo-env/bin/verify-envs.sh || \
+    (echo "WARN: verify-envs failed at build time; re-run: verify-envs" && true)
+
+WORKDIR ${WORKSPACE}
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

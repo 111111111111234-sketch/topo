@@ -1,0 +1,55 @@
+# ConfTopo Core 开发 / 单测（无 habitat、无 vLLM）
+#
+# Docker: Dockerfile.part1
+# 本地:  bash docker_build/install-dev-conda.sh
+#
+# 激活: conda activate conftopo-dev
+
+name: conftopo-dev
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - pip>=24.0
+  - numpy=1.26.4
+  - scipy
+  - scikit-learn
+  - matplotlib=3.9.4
+  - networkx=3.2.1
+  - pillow
+  - tqdm
+  - pyyaml
+  - setuptools<75
+  - wheel
+
+  - pip:
+      # PyPI torch 2.8.0+cu128（install-dev-conda.sh；NGC 25.05 基础镜像是 12.9+2.8.0a0）
+      - imageio
+      - imageio-ffmpeg
+      - h5py
+      - lmdb
+      - numba
+      - opencv-python-headless
+      - gym==0.26.2
+      - hydra-core
+      - omegaconf
+      - yacs
+      - jsonlines
+      - msgpack
+      - msgpack-numpy
+      - numpy-quaternion
+      - "transformers>=4.40"
+      - timm==1.0.27
+      - open_clip_torch==3.3.0
+      - ftfy
+      - regex
+      - openai
+      - safetensors
+      - huggingface_hub
+      - gdown
+      - requests
+      - tensorboardX
+      - easydict
+      - natsort

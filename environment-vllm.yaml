@@ -1,0 +1,16 @@
+# vLLM 推理服务（独立环境，libcudart.so.12 / CUDA 12.x）
+#
+# Docker: Dockerfile.part1
+# 本地:  bash docker_build/install-vllm-conda.sh
+#
+# 激活: conda activate vllm
+# 启动: start-vllm
+
+name: vllm
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip>=23.0,<24.4

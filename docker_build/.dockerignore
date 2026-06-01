@@ -1,0 +1,39 @@
+# Docker build context ignore (Stage 4)
+# 构建: 在项目根目录执行，-f Dockerfile.part4
+
+# 数据与模型（运行时 volume 挂载）
+data/
+models/
+ETPNav/data/
+goat-bench/data/
+*.zip
+*.tar.gz
+*.pth
+*.ckpt
+*.safetensors
+
+# 构建产物与缓存
+**/__pycache__/
+**/.git/
+**/.ipynb_checkpoints/
+work_dirs/
+work_dirs_bak/
+bifrost-*/
+.docker/
+
+# 其他大型子项目（非本镜像必需）
+PETR/
+mmdetection3d/
+mmdet3d_petr/
+Semantic-MapNet111/
+xrobot-vision/
+map-cmp-vla/
+tensorflow/
+Miniconda3-latest-Linux-x86_64.sh
+
+# 文档与备份
+docs/
+*.md
+!docker_build/*.md
+Dockerfile.part*.bak
+docker_build/Dockerfile

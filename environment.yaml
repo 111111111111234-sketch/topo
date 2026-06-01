@@ -1,0 +1,93 @@
+# ETPNav 升级栈 — ConfTopo-ETPNav Agent（habitat 0.1.7 + torch 2.8.0+cu128）
+#
+# 其他环境:
+#   conftopo-dev  → environment-dev.yaml  (Core 开发 / 单测)
+#   vllm          → environment-vllm.yaml  (LLM 服务，单独起)
+#   goat          → Dockerfile.part2       (GOAT-Bench)
+#
+# Create:
+#   conda env create -f environment.yaml
+#
+# Or update existing:
+#   conda env update -f environment.yaml --prune
+#
+# Post-install (not in conda, install from source):
+#   1. habitat-sim 0.1.7  — compile from source (CUDA 12.x)
+#   2. habitat-lab v0.1.7 — pip install -e /path/to/habitat-lab
+#   3. conftopo package   — pip install -e .
+#
+# vLLM 使用独立环境 vllm（见 environment-vllm.yaml / start-vllm）
+
+name: etpnav
+channels:
+  - conda-forge
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip>=23.0
+  - numpy=1.26.4
+  - scipy>=1.10
+  - matplotlib>=3.8
+  - networkx>=3.0
+  - pillow>=10.0
+  - tqdm
+  - pyyaml>=6.0
+  - requests
+  - setuptools
+  - wheel
+
+  - pip:
+      # PyTorch (CUDA 12.8; adjust index if your CUDA version differs)
+      - torch==2.8.0
+      - torchvision==0.23.0
+      - torchaudio==2.8.0
+
+      # ConfTopo core
+      - open_clip_torch>=3.3.0
+      - ftfy
+      - regex
+      - scipy
+
+      # LLM client (local vLLM OpenAI-compatible API)
+      - openai>=2.0
+
+      # Habitat / VLN utilities (habitat-sim installed separately)
+      - gym==0.23.1
+      - hydra-core>=1.3.2
+      - omegaconf>=2.3.0
+      - yacs>=0.1.8
+      - jsonlines
+      - opencv-python>=4.8
+      - tensorboardX>=2.6
+      - h5py>=3.8
+      - msgpack-numpy
+      - lmdb
+      - easydict
+      - webdataset
+      - gdown
+
+      # ETPNav / transformers stack
+      - transformers==4.12.5
+      - tokenizers==0.10.3
+      - timm>=1.0
+      - scikit-learn>=1.3
+      - scikit-image>=0.21
+      - sentencepiece
+      - sacremoses
+      - stanza
+      - shapely
+      - bresenham
+      - dtw
+      - fastdtw
+      - progressbar2
+      - gpustat
+      - protobuf>=3.20,<5
+
+      # CLIP (optional; open_clip_torch is preferred for ConfTopo)
+      - git+https://github.com/openai/CLIP.git
+
+      # HuggingFace (model download / cache)
+      - huggingface_hub>=0.20

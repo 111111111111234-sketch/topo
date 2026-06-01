@@ -1,0 +1,52 @@
+# Data / models / checkpoints
+data/
+models/
+work_dirs/
+work_dirs_bak/
+*.pth
+*.ckpt
+*.safetensors
+*.tar.gz
+
+# Bifrost jobs
+bifrost-*/
+
+# Large external projects
+PETR/
+mmdetection3d/
+mmdet3d_petr/
+mmdet3d_assets/
+Semantic-MapNet111/
+xrobot-vision/
+map-cmp-vla/
+tensorflow/
+multi_agents/
+Trans4Map/
+ObjectNav/
+mmcv_src/
+ipm/
+goat-bench/
+ETPNav/data/
+thor-*.zip
+Miniconda3-*.sh
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.hypothesis/
+
+# IDE / env
+.vscode/
+.conda/
+.docker/
+.ipynb_checkpoints/
+*.ipynb
+
+# Misc
+collect_all.log
+fuyao_jupyter_params.txt
+fuyao_sh_*/
+condaenv.*.requirements.txt
+dataa/
+Dockerfile.part2.bak
