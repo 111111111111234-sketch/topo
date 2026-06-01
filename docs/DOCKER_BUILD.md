@@ -35,7 +35,16 @@ TensorRT 仅部署推理时用，训练 / habitat 不依赖。
 
 ## 构建命令
 
-**重要**：必须在**项目根目录**执行 `fuyao docker`。若在 `docker/` 子目录执行，构建上下文只有 ~7KB，`COPY setup.py` / `conftopo` 会报 `not found`（日志里 `transferring context: 2B`）。
+**重要**：
+
+1. 必须在**项目根目录**执行 `fuyao docker`。若在 `docker/` 子目录执行，构建上下文只有 ~7KB，`COPY setup.py` / `conftopo` 会报 `not found`（日志里 `transferring context: 2B`）。
+2. 需要 git **upstream**（`git rev-parse @{u}`）。无公司 GitLab 时可一次性执行：
+   ```bash
+   git init --bare /tmp/conftopo-fuyao-origin.git
+   git remote add origin /tmp/conftopo-fuyao-origin.git   # 若尚无 origin
+   git push -u origin master
+   ```
+   或直接使用 `bash scripts/fuyao-docker-part1.sh`（脚本会自动配置本地 origin）。
 
 ```bash
 cd /workspace/tangyx7@xiaopeng.com
