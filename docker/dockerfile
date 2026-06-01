@@ -1,0 +1,367 @@
+# ============================================================================
+# ConfTopo / ETPNav - Stage 1 (已验证可构建)
+# 基础镜像 25.05: CUDA 12.9 + PyTorch 2.8 + Python 3.12
+# 包含: fuyao 组件 / 系统依赖 / 主环境 pip / vLLM
+#
+# 构建并推送后，将镜像 tag 用于 Dockerfile.part2 的 BASE_IMAGE
+#   fuyao docker --site=fuyao_hk --push --dockerfile=Dockerfile.part1
+# ============================================================================
+FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/nvidia-pytorch:25.05-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ----------------------------------------------------------------------------
+# fuyao 平台标准组件
+# ----------------------------------------------------------------------------
+COPY --from=infra-registry.cn-wulanchabu.cr.aliyuncs.com/data-infra/public:fuyao-base-1.9.7 \
+    /opt/data-infra/remote-kernel /tmp/remote-kernel
+RUN pip install ${PIP_OPTIONS} \
+    /tmp/remote-kernel/jupyter_enterprise_gateway-3.2.2-py3-none-any.whl \
+    /tmp/remote-kernel/jupyter_server-1.24.0-py3-none-any.whl \
+    /tmp/remote-kernel/jupyterlab-3.6.6-py3-none-any.whl \
+    jupyterlab-tensorboard-pro==3.0.0 \
+    jupyterlab==3.6.6 \
+    jupytext==1.16.1 \
+    tensorboard==2.10.1 \
+    tensorboardX==2.5 || true
+RUN mkdir -p /usr/local/share/jupyter/ && \
+    tar -C /usr/local/share/jupyter/ -xf /tmp/remote-kernel/jupyter-kernels.tar.gz || true
+RUN rm -rf /tmp/remote-kernel
+
+COPY --from=infra-registry.cn-wulanchabu.cr.aliyuncs.com/data-infra/public:fuyao-base-1.9.7 \
+    /opt/data-infra /opt/data-infra
+ENV PATH="${PATH}:/opt/data-infra"
+
+# ----------------------------------------------------------------------------
+# 系统依赖：habitat-sim EGL/OpenGL headless 渲染
+# ----------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+      libopengl0 \
+      libegl1 \
+      libgles2 \
+      libgl1 \
+      libglib2.0-0 \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      zsh \
+      curl \
+      wget \
+      git \
+      vim \
+      zip; \
+    rm -rf /var/lib/apt/lists/*
+
+# NVIDIA EGL headless 渲染支持
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+    echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+
+# ----------------------------------------------------------------------------
+# fuyao CLI
+# ----------------------------------------------------------------------------
+RUN pip3 install fuyao \
+    -i http://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com \
+    --extra-index-url http://nexus-wl.xiaopeng.link:8081/repository/ai_infra_pypi/simple --trusted-host nexus-wl.xiaopeng.link && \
+    pip install --no-cache-dir --force-reinstall "packaging>=24.2"
+
+# ----------------------------------------------------------------------------
+# ConfTopo 主环境依赖 (Python 3.12 + PyTorch 2.8)
+# ----------------------------------------------------------------------------
+RUN pip install --no-cache-dir ${PIP_OPTIONS} "setuptools<75" "packaging>=24.2"
+
+RUN pip install --no-cache-dir ${PIP_OPTIONS} \
+    numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+    pillow tqdm pyyaml networkx==3.2.1 \
+    imageio imageio-ffmpeg h5py lmdb numba \
+    opencv-python-headless \
+    gym==0.26.2 hydra-core omegaconf yacs jsonlines \
+    msgpack msgpack-numpy numpy-quaternion \
+    transformers>=4.40 timm==1.0.27 \
+    open_clip_torch==3.3.0 ftfy regex \
+    openai safetensors huggingface_hub gdown requests \
+    tensorboardX easydict natsort
+
+# ----------------------------------------------------------------------------
+# vLLM
+# ----------------------------------------------------------------------------
+RUN pip install --no-cache-dir ${PIP_OPTIONS} \
+    --extra-index-url https://pypi.org/simple \
+    --retries 5 --timeout 300 \
+    vllm
+
+# fuyao 平台要求 tini；Stage 2 会覆盖 ENTRYPOINT
+ENTRYPOINT ["tini", "-s", "--"]
+CMD ["/bin/bash"]
+
+
+#part 2
+# ============================================================================
+# ConfTopo / ETPNav - Stage 2 (稳定可构建部分)
+# 包含: Miniconda / conda ToS / goat 完整环境 / vlnce 到 torch 安装
+#
+# 构建并推送后，将镜像 tag 用于 Dockerfile.part3 的 BASE_IMAGE
+#   fuyao docker --site=fuyao_hk --push --dockerfile=Dockerfile.part2
+# ============================================================================
+
+ARG BASE_IMAGE=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:tangyx7-260529-0235
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ----------------------------------------------------------------------------
+# Miniconda (goat / vlnce)
+# ----------------------------------------------------------------------------
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh &&     bash /tmp/miniconda.sh -b -p /opt/conda &&     rm /tmp/miniconda.sh &&     /opt/conda/bin/conda init bash
+ENV PATH="/opt/conda/bin:$PATH"
+
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main &&     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+# ----------------------------------------------------------------------------
+# goat 环境: Python 3.9 + habitat-sim 0.2.4 + PyTorch 2.8
+# ----------------------------------------------------------------------------
+RUN conda create -n goat python=3.9 cmake "pip<24.4" -y
+
+RUN conda install -n goat habitat-sim=0.2.4 headless -c aihabitat -c conda-forge -y
+
+RUN conda run -n goat pip install --no-cache-dir     torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0     --index-url https://download.pytorch.org/whl/cu128
+
+RUN conda install -n goat -c conda-forge --override-channels -y     numpy=1.26.4 scipy scikit-learn matplotlib pillow tqdm pyyaml
+
+RUN conda run -n goat pip install --no-cache-dir "setuptools<70" &&     conda run -n goat pip install --no-cache-dir ${PIP_OPTIONS}     opencv-python-headless     gym==0.23.0 hydra-core omegaconf yacs jsonlines     imageio imageio-ffmpeg msgpack msgpack-numpy h5py lmdb numba     transformers timm open_clip_torch ftfy regex     easydict tensorboardX gdown requests pytest-runner
+
+# ----------------------------------------------------------------------------
+# vlnce 环境: Python 3.8 + habitat-sim 0.1.7 + PyTorch 1.9.1
+# ----------------------------------------------------------------------------
+RUN conda create -n vlnce python=3.8 "pip<24.4" -y
+
+RUN conda install -n vlnce habitat-sim=0.1.7 headless     numpy=1.19.5 scipy=1.5.3 matplotlib=3.3.2     -c aihabitat -c conda-forge -y
+
+RUN conda run -n vlnce pip install --no-cache-dir --no-deps     torch==1.9.1+cu111 torchvision==0.10.1+cu111     -f https://download.pytorch.org/whl/torch_stable.html
+
+# 注意：后续 vlnce 的 pip 依赖、CLIP、zsh 等放到 Stage 3
+ENTRYPOINT ["tini", "-s", "--"]
+CMD ["/bin/bash"]
+
+#part3
+# ============================================================================
+# ConfTopo / ETPNav - Stage 3 (在 Stage 2 基础上继续尝试)
+# 包含: vlnce 其余 pip 依赖 + CLIP + zsh
+# ============================================================================
+
+ARG BASE_IMAGE=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:tangyx7-260531-1946
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# vlnce: setuptools 降级（兼容旧包）
+RUN conda run -n vlnce pip install --no-cache-dir "setuptools<70"
+
+# gym==0.21.0 在 PyPI 上没有可用的 cp38 wheel（会走 sdist 且在新 setuptools 下失败）
+# 这里改为 conda-forge 安装，避免源码构建问题
+RUN conda install -n vlnce -c conda-forge -y gym=0.21.0
+
+RUN env -u PIP_CONSTRAINT conda run -n vlnce pip install --no-cache-dir ${PIP_OPTIONS}     "numpy==1.19.5"     opencv-python-headless==4.5.5.64     hydra-core omegaconf yacs jsonlines     msgpack msgpack-numpy h5py lmdb     transformers==4.12.5 tokenizers==0.10.3 timm==0.5.4 ftfy regex     networkx==2.8.8 easydict tensorboardX gdown requests
+
+RUN env -u PIP_CONSTRAINT conda run -n vlnce pip install --no-cache-dir     git+https://github.com/openai/CLIP.git
+
+# ----------------------------------------------------------------------------
+# 终端美化 + zsh 插件
+# ----------------------------------------------------------------------------
+RUN RUNZSH=no CHSH=no KEEP_ZSHRC=yes     sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+
+RUN git clone https://github.com/zsh-users/zsh-autosuggestions     ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions &&     git clone https://github.com/zsh-users/zsh-syntax-highlighting.git     ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+RUN sed -i 's/^ZSH_THEME=.*/ZSH_THEME="ys"/' /root/.zshrc && \
+    sed -i 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting z extract)/' /root/.zshrc && \
+    printf '%s\n' \
+      'export TERM=xterm-256color' \
+      'alias ls="ls --color=auto"' \
+      'alias grep="grep --color=auto"' \
+      'source /opt/conda/etc/profile.d/conda.sh' \
+      >> /root/.zshrc
+
+ENV TERM=xterm-256color
+ENV SHELL=/bin/zsh
+
+RUN printf '%s\n' \
+      'if [ -n "$PS1" ] && [ -z "$ZSH_VERSION" ]; then' \
+      '  exec /bin/zsh -l' \
+      'fi' \
+      >> /root/.bashrc
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]
+
+
+#part4
+# ============================================================================
+# ConfTopo / ETPNav - Stage 4 (最终阶段)
+# 1) 在已有 part1-3 镜像上叠加新能力（habitat-lab / conftopo / 脚本）
+# 2) 幂等回补：若 part3 是旧版构建，在此修补 LD_LIBRARY_PATH / 环境变量 / zsh 别名
+#
+# 构建上下文: 项目根目录
+#   fuyao docker --site=fuyao_hk --push --dockerfile=Dockerfile.part4
+# ============================================================================
+
+ARG BASE_IMAGE=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:tangyx7-260531-2040
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="conftopo-stage4"
+LABEL org.opencontainers.image.description="backfill fixes + habitat-lab + conftopo + tools"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV WORKSPACE=/workspace/tangyx7@xiaopeng.com
+ENV CONFTopo_MAIN_ENV=conftopo-main
+ENV CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python
+ENV MAGNUM_LOG=quiet
+ENV GLOG_minloglevel=2
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+
+# ============================================================================
+# A. 回补 part1-3（对已推送的旧镜像也生效；重复构建 part4 安全）
+# ============================================================================
+
+# A1. EGL vendor（part1 可能已有，无则创建）
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+    if [ ! -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ]; then \
+      echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json; \
+    fi
+
+# A2. conda 激活时清除 LD_LIBRARY_PATH（避免主环境 PyTorch 3.12 污染 goat/vlnce）
+RUN mkdir -p \
+    /opt/conda/envs/conftopo-main/etc/conda/activate.d \
+    /opt/conda/envs/conftopo-main/etc/conda/deactivate.d \
+      /opt/conda/envs/vlnce/etc/conda/activate.d \
+      /opt/conda/envs/vlnce/etc/conda/deactivate.d \
+      /opt/conda/envs/goat/etc/conda/activate.d \
+      /opt/conda/envs/goat/etc/conda/deactivate.d && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+      'unset LD_LIBRARY_PATH' \
+            > /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh && \
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+            'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+            > /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
+        chmod +x /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh \
+                         /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+            'unset LD_LIBRARY_PATH' \
+      > /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+      'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+      > /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh && \
+    chmod +x /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh \
+             /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh && \
+    cp -f /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh \
+          /opt/conda/envs/goat/etc/conda/activate.d/unset_ld_path.sh && \
+    cp -f /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh \
+          /opt/conda/envs/goat/etc/conda/deactivate.d/restore_ld_path.sh
+
+# A3. 全局环境变量（bash/zsh 通用）
+RUN printf '%s\n' \
+      '# ConfTopo runtime defaults (Stage 4 backfill)' \
+      'export WORKSPACE=/workspace/tangyx7@xiaopeng.com' \
+    'export CONFTopo_MAIN_ENV=conftopo-main' \
+    'export CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python' \
+      'export MAGNUM_LOG=quiet' \
+      'export GLOG_minloglevel=2' \
+      'export NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display' \
+      'export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json' \
+      > /etc/profile.d/conftopo-env.sh
+
+# A4. zsh 别名与 profile（旧 part3 无别名时补上）
+RUN mkdir -p /opt/conftopo-env/bin && \
+    grep -q 'CONFTOPO_ENV_MARKER' /root/.zshrc 2>/dev/null || printf '%s\n' \
+      '' \
+      '# CONFTOPO_ENV_MARKER' \
+      'source /etc/profile.d/conftopo-env.sh' \
+    'alias conftopo-main="conda activate conftopo-main"' \
+      'alias start-vllm="/opt/conftopo-env/bin/start-vllm.sh"' \
+      'alias verify-envs="/opt/conftopo-env/bin/verify-envs.sh"' \
+      '[ -f /opt/conda/etc/profile.d/conda.sh ] && source /opt/conda/etc/profile.d/conda.sh' \
+      >> /root/.zshrc
+
+# ============================================================================
+# B. Stage 4 新增：源码、habitat-lab、conftopo、工具脚本
+# ============================================================================
+
+COPY setup.py conftopo /opt/conftopo-src/
+COPY habitat-lab /opt/src/habitat-lab-v017/
+COPY habitat-lab-v0.2.3/habitat-lab /opt/src/habitat-lab-v023/
+
+COPY docker_build/start-vllm.sh docker_build/verify-envs.sh /opt/conftopo-env/bin/
+RUN chmod +x /opt/conftopo-env/bin/*.sh
+
+RUN mkdir -p ${WORKSPACE}
+
+RUN conda create -n conftopo-main python=3.12 pip -y && \
+        conda run -n conftopo-main pip install --no-cache-dir ${PIP_OPTIONS} \
+            "setuptools<75" "packaging>=24.2" \
+            numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+            pillow tqdm pyyaml networkx==3.2.1 \
+            imageio imageio-ffmpeg h5py lmdb numba \
+            opencv-python-headless \
+            gym==0.26.2 hydra-core omegaconf yacs jsonlines \
+            msgpack msgpack-numpy numpy-quaternion \
+            'transformers>=4.40' timm==1.0.27 \
+            open_clip_torch==3.3.0 ftfy regex \
+            openai safetensors huggingface_hub gdown requests \
+            tensorboardX easydict natsort
+
+# 主环境: conftopo editable
+RUN ${CONFTopo_MAIN_PYTHON} -m pip install --no-cache-dir -e /opt/conftopo-src ${PIP_OPTIONS}
+
+# habitat-lab setup.py 需要 README；COPY 后路径结构变了，创建占位文件
+RUN touch /opt/src/habitat-lab-v023/README.md /opt/src/README.md \
+          /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE
+
+# goat: habitat-lab 0.2.3 + conftopo
+RUN conda run -n goat pip install --no-cache-dir ${PIP_OPTIONS} \
+    ifcfg yacs einops "gym>=0.22,<0.24" && \
+    conda run -n goat pip install --no-cache-dir -e /opt/src/habitat-lab-v023 --no-deps && \
+    conda run -n goat pip install --no-cache-dir -e /opt/conftopo-src
+
+# vlnce: habitat-lab 0.1.7 + conftopo
+RUN env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n vlnce pip install --no-cache-dir \
+    -e /opt/src/habitat-lab-v017 --no-deps && \
+    env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n vlnce pip install --no-cache-dir \
+    -e /opt/conftopo-src
+
+# ============================================================================
+# C. 构建验证
+# ============================================================================
+RUN /opt/conftopo-env/bin/verify-envs.sh || \
+    (echo "WARN: verify-envs failed at build time; re-run: verify-envs" && true)
+
+WORKDIR ${WORKSPACE}
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

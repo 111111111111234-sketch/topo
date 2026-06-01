@@ -1,0 +1,71 @@
+# Keep only the source needed by docker/Dockerfile.unified.
+# Large assets should be mounted or downloaded at runtime.
+
+# VCS and editor noise
+.git/
+.github/
+.vscode/
+.hypothesis/
+.ipynb_checkpoints/
+**/__pycache__/
+*.pyc
+
+# Local environments and caches
+.conda/
+conftopo.egg-info/
+
+# Large model/data artifacts
+models/
+data/
+dataa/
+Data/
+ETPNav/
+goat-bench/
+work_dirs/
+work_dirs_bak/
+
+# Historical build outputs and logs
+bifrost-*/
+fuyao_sh_*/
+collect_all.log
+
+# Unused large research repos for this image
+ObjectNav/
+PETR/
+Semantic-MapNet111/
+Trans4Map/
+ipm/
+map-cmp-vla/
+mmcv_src/
+mmdet3d_assets/
+mmdet3d_petr/
+mmdetection3d/
+multi_agents/
+tensorflow/
+xrobot-vision/
+
+# Large archives and weights
+*.tar
+*.tar.gz
+*.zip
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Local notebooks and misc large files
+*.ipynb
+Miniconda3-latest-Linux-x86_64.sh
+thor-*.zip
+upstream_*.patch
+local_git_sha.txt
+upstream_git_info.txt
+fuyao_jupyter_params.txt
+
+# Keep these paths in context:
+#!setup.py
+#!conftopo/
+#!habitat-lab/
+#!docker/
+#!docker_build/
