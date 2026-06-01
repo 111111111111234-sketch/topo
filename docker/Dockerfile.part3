@@ -3,8 +3,8 @@
 # goat 环境: Python 3.9 + habitat-sim 0.2.4 + torch 2.8.0+cu128
 # ConfTopo-GOAT / GOAT-Bench Agent 在此环境运行
 #
-# 构建:
-#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part3
+# 构建（项目根目录）:
+#   cd /workspace/tangyx7@xiaopeng.com && fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part3
 # ============================================================================
 
 ARG BASE_IMAGE=REPLACE_WITH_PART2_TAG
@@ -44,7 +44,11 @@ RUN conda run -n goat pip install --no-cache-dir "setuptools<70" && \
 # ============================================================================
 # B. habitat-lab 0.2.3 + conftopo editable
 # ============================================================================
-RUN touch /opt/src/habitat-lab-v023/README.md
+COPY habitat-lab-v0.2.3/habitat-lab /opt/src/habitat-lab-v023/
+COPY setup.py /opt/conftopo-src/setup.py
+COPY conftopo /opt/conftopo-src/conftopo
+
+RUN touch /opt/src/habitat-lab-v023/README.md /opt/src/README.md
 
 RUN env -u LD_LIBRARY_PATH conda run -n goat pip install --no-cache-dir \
     -e /opt/src/habitat-lab-v023 --no-deps && \

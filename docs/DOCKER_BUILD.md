@@ -35,22 +35,26 @@ TensorRT 仅部署推理时用，训练 / habitat 不依赖。
 
 ## 构建命令
 
+**重要**：必须在**项目根目录**执行 `fuyao docker`。若在 `docker/` 子目录执行，构建上下文只有 ~7KB，`COPY setup.py` / `conftopo` 会报 `not found`（日志里 `transferring context: 2B`）。
+
 ```bash
 cd /workspace/tangyx7@xiaopeng.com
 
-# Stage 1: conftopo-dev
-fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part1
-# → 记录推送的 tag，写入 Dockerfile.part2 的 BASE_IMAGE
+# Stage 1: conftopo-dev（推荐脚本，自动 cd 到根目录并确认危险目录提示）
+bash scripts/fuyao-docker-part1.sh
 
-# Stage 2: vllm
-fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part2
+# 或手动（需输入 y 确认危险目录）
+echo y | fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part1
 
-# Stage 3: goat
-fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part3
+# → 记录推送的 tag，写入 Dockerfile.part2 的 ARG BASE_IMAGE
 
-# Stage 4: etpnav（habitat-sim 0.1.7 源码编译，耗时较长）
-fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part4
+# Stage 2–4 同样在项目根目录执行
+echo y | fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part2
+echo y | fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part3
+echo y | fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part4
 ```
+
+打包体积参考：part1 应远大于 7KB（含 `conftopo/`、`setup.py`、`docker_build/` 等，由 `.fuyaoignore` 过滤大目录）。
 
 每一阶段推送后，将镜像 tag 更新到下一阶段 `ARG BASE_IMAGE=...`。
 

@@ -3,8 +3,8 @@
 # etpnav 环境: Python 3.9 + torch 2.8.0+cu128 + habitat-sim 0.1.7 源码编译
 # ConfTopo-ETPNav / R2R-CE Agent 在此环境运行
 #
-# 构建:
-#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part4
+# 构建（项目根目录）:
+#   cd /workspace/tangyx7@xiaopeng.com && fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part4
 # ============================================================================
 
 ARG BASE_IMAGE=REPLACE_WITH_PART3_TAG
@@ -85,6 +85,10 @@ RUN git clone --depth 1 --branch ${HABITAT_SIM_TAG} ${HABITAT_SIM_GIT} /tmp/habi
 # ============================================================================
 # D. habitat-lab 0.1.7 + conftopo editable
 # ============================================================================
+COPY habitat-lab /opt/src/habitat-lab-v017/
+COPY setup.py /opt/conftopo-src/setup.py
+COPY conftopo /opt/conftopo-src/conftopo
+
 RUN touch /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE
 
 RUN env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n etpnav pip install --no-cache-dir \

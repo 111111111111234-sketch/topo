@@ -1,15 +1,20 @@
 # ============================================================================
 # ConfTopo - Stage 1 (conftopo-dev)
-# NGC 25.05: CUDA 12.9.0 | torch 2.8.0a0 | TensorRT 10.10.0.31
-# conda conftopo-dev: Py3.12 + PyPI torch 2.8.0+cu128 + ConfTopo Core
+# 基于已验证的旧 part1 镜像（fuyao + apt + pip 主环境 + vLLM）
+# 叠加: Miniconda + conftopo-dev conda + zsh + 源码 + 环境变量
 #
-# 构建:
-#   fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part1
+# 构建（必须在项目根目录执行，否则 COPY 找不到 setup.py/conftopo）:
+#   cd /workspace/tangyx7@xiaopeng.com
+#   bash scripts/fuyao-docker-part1.sh
+# 或:
+#   echo y | fuyao docker --site=fuyao_hk --push --dockerfile=docker/Dockerfile.part1
 # ============================================================================
-FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/nvidia-pytorch:25.05-py3
+
+ARG BASE_IMAGE=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:tangyx7-260529-0235
+FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="conftopo-stage1"
-LABEL org.opencontainers.image.description="fuyao + system deps + Miniconda + conftopo-dev + zsh"
+LABEL org.opencontainers.image.description="Miniconda + conftopo-dev conda + zsh"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MAX_JOBS=1
@@ -20,54 +25,7 @@ ENV CONFTopo_DEV_PYTHON=/opt/conda/envs/conftopo-dev/bin/python
 ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
 
 # ============================================================================
-# A. fuyao 平台标准组件（python > 3.10 模板）
-# ============================================================================
-RUN pip install ${PIP_OPTIONS} \
-    jupyterlab==4.5.1 \
-    jupyterlab-tensorboard-pro==4.0.0 \
-    tensorboard==2.20.0 \
-    fuyao-shellhub
-RUN python3 -m fuyao-shellhub
-
-COPY --from=infra-registry.cn-wulanchabu.cr.aliyuncs.com/data-infra/public:fuyao-base-1.9.7 \
-    /opt/data-infra /opt/data-infra
-ENV PATH="${PATH}:/opt/data-infra"
-
-# ============================================================================
-# B. 系统依赖（EGL/GL headless + 工具）
-# ============================================================================
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-      ffmpeg \
-      libopengl0 \
-      libegl1 \
-      libgles2 \
-      libgl1 \
-      libglib2.0-0 \
-      libsm6 \
-      libxext6 \
-      libxrender1 \
-      zsh \
-      curl \
-      wget \
-      git \
-      vim \
-      zip \
-      tini; \
-    rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
-    echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
-    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
-
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
-ENV MAGNUM_LOG=quiet
-ENV GLOG_minloglevel=2
-ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-
-# ============================================================================
-# C. Miniconda
+# A. Miniconda
 # ============================================================================
 RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
     bash /tmp/miniconda.sh -b -p /opt/conda && \
@@ -82,7 +40,7 @@ RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkg
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
 # ============================================================================
-# D. conftopo-dev conda（Core 开发 / 单测，PyPI torch 2.8.0+cu128）
+# B. conftopo-dev conda（Core 开发 / 单测，PyPI torch 2.8.0+cu128）
 # ============================================================================
 RUN conda create -n conftopo-dev python=3.12 pip -y
 
@@ -122,27 +80,22 @@ RUN mkdir -p \
              /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh
 
 # ============================================================================
-# E. 源码 + conftopo editable install
+# C. conftopo 源码（habitat-lab 在 part3/part4 再 COPY）
 # ============================================================================
 COPY setup.py /opt/conftopo-src/setup.py
 COPY conftopo /opt/conftopo-src/conftopo
-COPY habitat-lab /opt/src/habitat-lab-v017/
-COPY habitat-lab-v0.2.3/habitat-lab /opt/src/habitat-lab-v023/
-
-RUN touch /opt/src/habitat-lab-v023/README.md /opt/src/README.md \
-          /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE
 
 RUN conda run -n conftopo-dev pip install --no-cache-dir -e /opt/conftopo-src ${PIP_OPTIONS}
 
 # ============================================================================
-# F. 工具脚本
+# D. 工具脚本
 # ============================================================================
 RUN mkdir -p /opt/conftopo-env/bin
 COPY docker_build/start-vllm.sh docker_build/verify-envs.sh /opt/conftopo-env/bin/
 RUN chmod +x /opt/conftopo-env/bin/*.sh
 
 # ============================================================================
-# G. zsh + oh-my-zsh
+# E. zsh + oh-my-zsh
 # ============================================================================
 RUN RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
     sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
@@ -156,7 +109,7 @@ RUN sed -i 's/^ZSH_THEME=.*/ZSH_THEME="ys"/' /root/.zshrc && \
     sed -i 's/^plugins=.*/plugins=(git zsh-autosuggestions zsh-syntax-highlighting z extract)/' /root/.zshrc
 
 # ============================================================================
-# H. 环境变量 + 别名
+# F. 环境变量 + 别名
 # ============================================================================
 RUN printf '%s\n' \
       '# ConfTopo runtime defaults' \
@@ -186,6 +139,10 @@ RUN printf '%s\n' \
 
 ENV TERM=xterm-256color
 ENV SHELL=/bin/zsh
+ENV MAGNUM_LOG=quiet
+ENV GLOG_minloglevel=2
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
 RUN printf '%s\n' \
       'if [ -n "$PS1" ] && [ -z "$ZSH_VERSION" ]; then' \
