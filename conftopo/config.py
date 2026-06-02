@@ -23,6 +23,10 @@ class PerceptionConfig:
     heavy_interval: int = 5
     heavy_on_frontier: bool = True
     clip_model: str = "ViT-B/32"
+    clip_device: str = "auto"
+    object_threshold: float = 0.23
+    room_threshold: float = 0.20
+    landmark_threshold: float = 0.22
     # 房间类型标签
     room_labels: List[str] = field(default_factory=lambda: [
         "kitchen", "living room", "bedroom", "bathroom",

@@ -38,7 +38,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     def __init__(self, config: Optional[ConfTopoConfig] = None):
         super().__init__(config)
         self.perceiver = LightPerceiver(
-            room_labels=config.perception.room_labels if config else None,
+            room_labels=self.config.perception.room_labels,
         )
 
         # Agent state
@@ -203,24 +203,21 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if not self._cur_perception:
             return
 
+        pcfg = self.config.perception
+
         # Room node
         room_label = self._cur_perception.get("room_label", "unknown")
-        room_conf = self._cur_perception.get("room_confidence", 0.0)
-        if room_label != "unknown" and room_conf > 0.2:
-            # Check if we already have a room node for this type nearby
+        room_conf = float(self._cur_perception.get("room_confidence", 0.0))
+        if room_label != "unknown" and room_conf >= pcfg.room_threshold:
             existing_rooms = self.topo_map.find_nodes_within_radius(
                 self._position, radius=5.0, node_type=NodeType.ROOM
             )
-            matched_room = None
-            for r in existing_rooms:
-                if r.label == room_label:
-                    matched_room = r
-                    break
-
+            matched_room = next((r for r in existing_rooms if r.label == room_label), None)
             if matched_room:
-                # Update confidence
-                matched_room.confidence = min(1.0, matched_room.confidence + 0.05)
+                matched_room.confidence = max(matched_room.confidence, room_conf)
                 matched_room.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched_room.embedding = self._cur_rgb_embed
             else:
                 room_id = self.topo_map.add_node(
                     NodeType.ROOM,
@@ -231,25 +228,53 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 )
                 self.topo_map.add_edge(cur_vp, room_id, EdgeType.BELONGS_TO)
 
-        # Goal object detection (high similarity = potential target)
-        if self._cur_perception.get("best_goal_sim", 0) > 0.25:
-            goal_scores = self._cur_perception.get("goal_scores", [])
-            for label, sim in goal_scores:
-                if sim > 0.25:
-                    # Check if already detected nearby
-                    existing = self.topo_map.find_nodes_within_radius(
-                        self._position, radius=2.0, node_type=NodeType.OBJECT
-                    )
-                    already_found = any(o.label == label for o in existing)
-                    if not already_found:
-                        obj_id = self.topo_map.add_node(
-                            NodeType.OBJECT,
-                            position=self._position.copy(),
-                            embedding=self._cur_rgb_embed,
-                            confidence=float(sim),
-                            label=label,
-                        )
-                        self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+        # Goal object node
+        for label, sim in self._cur_perception.get("goal_scores", []):
+            sim = float(sim)
+            if sim < pcfg.object_threshold:
+                continue
+            existing = self.topo_map.find_nodes_within_radius(
+                self._position, radius=2.0, node_type=NodeType.OBJECT
+            )
+            matched = next((o for o in existing if o.label == label), None)
+            if matched:
+                matched.confidence = max(matched.confidence, sim)
+                matched.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched.embedding = self._cur_rgb_embed
+            else:
+                obj_id = self.topo_map.add_node(
+                    NodeType.OBJECT,
+                    position=self._position.copy(),
+                    embedding=self._cur_rgb_embed,
+                    confidence=sim,
+                    label=label,
+                )
+                self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+
+        # Landmark node
+        for label, sim in self._cur_perception.get("landmark_scores", []):
+            sim = float(sim)
+            if sim < pcfg.landmark_threshold:
+                continue
+            existing = self.topo_map.find_nodes_within_radius(
+                self._position, radius=3.0, node_type=NodeType.LANDMARK
+            )
+            matched = next((lm for lm in existing if lm.label == label), None)
+            if matched:
+                matched.confidence = max(matched.confidence, sim)
+                matched.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched.embedding = self._cur_rgb_embed
+            else:
+                lm_id = self.topo_map.add_node(
+                    NodeType.LANDMARK,
+                    position=self._position.copy(),
+                    embedding=self._cur_rgb_embed,
+                    confidence=sim,
+                    label=label,
+                )
+                self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
 
     def _generate_frontiers(self, cur_vp: str) -> None:
         """Generate frontier-like nodes from unexplored directions.
@@ -383,11 +408,20 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         target_pos = plan_output.get("target_position")
         if target_pos is None:
             # No target: random exploration or stop
-            return {"action": "stop"}
+            return {
+                "action": "stop",
+                "target_node_id": plan_output.get("target_node_id"),
+                "candidate_ids": plan_output.get("candidate_ids", []),
+                "scores": plan_output.get("scores", []),
+                "is_exploration": plan_output.get("is_exploration", True),
+            }
 
         return {
             "action": "navigate",
             "target_position": target_pos,
+            "target_node_id": plan_output.get("target_node_id"),
+            "candidate_ids": plan_output.get("candidate_ids", []),
+            "scores": plan_output.get("scores", []),
             "is_exploration": plan_output.get("is_exploration", False),
         }
 

@@ -209,11 +209,26 @@ class InstructionGraph:
                     Relation(r["relation_type"], r["reference"])
                     for r in gn_data.get("relations", [])
                 ]
+                target_embedding = gn_data.get("target_embedding")
+                if target_embedding is not None:
+                    target_embedding = np.asarray(target_embedding, dtype=np.float32)
+
+                room_prior_embeddings = gn_data.get("room_prior_embeddings")
+                if room_prior_embeddings is not None:
+                    room_prior_embeddings = np.asarray(room_prior_embeddings, dtype=np.float32)
+
+                landmark_embeddings = gn_data.get("landmark_embeddings")
+                if landmark_embeddings is not None:
+                    landmark_embeddings = np.asarray(landmark_embeddings, dtype=np.float32)
+
                 ig.goal_nodes.append(GoalNode(
                     target_object=gn_data["target_object"],
+                    target_embedding=target_embedding,
                     attributes=gn_data.get("attributes", []),
                     room_prior=gn_data.get("room_prior", []),
+                    room_prior_embeddings=room_prior_embeddings,
                     landmarks=gn_data.get("landmarks", []),
+                    landmark_embeddings=landmark_embeddings,
                     relations=relations,
                     goal_type=gn_data.get("goal_type", "category"),
                     confidence=gn_data.get("confidence", 1.0),

@@ -231,6 +231,42 @@ def test_goat_agent_multi_goal():
     print(f"  ✓ multi-goal memory reuse: {nodes_after_goal1} → {nodes_after_goal2} nodes")
 
 
+def test_goat_agent_semantic_node_creation():
+    """High-similarity perception creates object/room/landmark nodes."""
+    config = ConfTopoConfig()
+    config.perception.object_threshold = 0.1
+    config.perception.room_threshold = 0.1
+    config.perception.landmark_threshold = 0.1
+    agent = ConfTopoGOATAgent(config)
+
+    D = 512
+    embed = np.zeros(D, dtype=np.float32)
+    embed[0] = 1.0
+    goal = GoalNode(
+        target_object="sink",
+        target_embedding=embed.copy(),
+        room_prior=["kitchen"],
+        landmarks=["door"],
+        landmark_embeddings=embed[np.newaxis, :].copy(),
+    )
+    agent.set_new_goal(goal)
+    agent.perceiver.room_labels = ["kitchen"]
+    agent.perceiver.room_text_embeds = embed[np.newaxis, :].copy()
+
+    action = agent.step({
+        "position": [0, 0, 0],
+        "heading": 0.0,
+        "rgb_embed": embed.copy(),
+    })
+    stats = agent.memory_stats
+    assert stats["objects"] >= 1
+    assert stats["rooms"] >= 1
+    assert stats["landmarks"] >= 1
+    assert action.get("target_node_id") is not None
+    assert len(action.get("candidate_ids", [])) > 0
+    print(f"  ✓ semantic nodes: {stats}")
+
+
 if __name__ == "__main__":
     print("=== Phase 2 Integration Tests ===\n")
 
@@ -254,5 +290,8 @@ if __name__ == "__main__":
 
     print("\n[7] GOAT Agent multi-goal memory reuse")
     test_goat_agent_multi_goal()
+
+    print("\n[8] GOAT Agent semantic node creation")
+    test_goat_agent_semantic_node_creation()
 
     print("\n=== All Phase 2 tests passed! ===")
