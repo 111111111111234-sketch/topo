@@ -11,6 +11,7 @@ import gzip
 import glob
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,6 +29,78 @@ from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode,
 # Lightweight LLM client (HTTP only — does not import ETPNav / vllm_server env)
 # vLLM service runs separately: conda activate vllm_server && bash ETPNav/scripts/start_vllm.sh
 # ---------------------------------------------------------------------------
+
+def _extract_json_from_llm_text(text: str) -> Optional[dict]:
+    """Parse JSON from LLM output; tolerate Qwen3 thinking blocks and markdown fences."""
+    if not text:
+        return None
+    text = text.strip()
+    # Strip Qwen3-style thinking blocks
+    for tag in ("think", "redacted_thinking"):
+        text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            chunk = part.strip()
+            if chunk.startswith("json"):
+                chunk = chunk[4:].strip()
+            if chunk.startswith("{"):
+                text = chunk
+                break
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _normalize_str_list(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return []
+
+
+def _normalize_attributes(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        out: List[str] = []
+        for k, v in value.items():
+            if isinstance(v, bool) and v:
+                out.append(str(k))
+            elif isinstance(v, (list, tuple)):
+                out.extend(str(x) for x in v)
+            elif v is not None and not isinstance(v, dict):
+                out.append(str(v))
+        return out
+    return _normalize_str_list(value)
+
+
+def _apply_parsed_description(parsed: dict) -> Tuple[List[str], List[str], List[str], List[Relation], Optional[str]]:
+    """Normalize LLM JSON into GoalNode fields."""
+    attributes = _normalize_attributes(parsed.get("attributes"))
+    room_prior = _normalize_str_list(parsed.get("room_prior"))
+    landmarks = _normalize_str_list(parsed.get("landmarks"))
+    relations = _relations_from_llm(parsed.get("relations"))
+    target_object = parsed.get("target_object")
+    if target_object is not None:
+        target_object = str(target_object).strip()[:80]
+    return attributes, room_prior, landmarks, relations, target_object or None
+
 
 INSTRUCTION_PARSER_PROMPT = """You are a navigation instruction parser. Given a natural language navigation instruction, decompose it into a structured sequence of sub-goals.
 
@@ -95,24 +168,25 @@ class GoalGraphLLM:
     def parse_description(self, description: str, use_cache: bool = True) -> Optional[dict]:
         if use_cache and description in self._description_cache:
             return self._description_cache[description]
-        prompt = f"""Parse this object goal description into structured attributes.
-Description: "{description}"
-
-Extract JSON with keys: attributes, room_prior, landmarks, relations (list of {{"type","reference"}}).
-Output valid JSON only:"""
+        prompt = (
+            f'Parse: "{description}"\n'
+            "Return JSON: target_object (short noun), attributes (string list), "
+            "room_prior (string list), landmarks (string list), "
+            'relations (list of {"type","reference"}).'
+        )
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=300,
+                messages=[
+                    {"role": "system", "content": "/no_think\nOutput only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=256,
+                response_format={"type": "json_object"},
             )
-            text = response.choices[0].message.content.strip()
-            if "```" in text:
-                text = text.split("```")[1].strip()
-                if text.startswith("json"):
-                    text = text[4:].strip()
-            result = json.loads(text)
+            text = response.choices[0].message.content or ""
+            result = _extract_json_from_llm_text(text)
         except Exception:
             result = None
         if use_cache and result is not None:
@@ -153,6 +227,7 @@ def _goal_node_from_goat_task(
     """Build GoalNode from one GOAT sub-task."""
     entry = _find_goal_entry(goals, category, ref)
     target = category
+    raw_description: Optional[str] = None
     attributes: List[str] = []
     room_prior: List[str] = []
     landmarks: List[str] = []
@@ -163,25 +238,26 @@ def _goal_node_from_goat_task(
         target = entry.get("object_category", category)
         lang = entry.get("lang_desc") or entry.get("description") or ""
         if lang and modality == "description":
-            target = lang.strip()[:200]
+            raw_description = lang.strip()[:500]
+            # target_object stays as clean category noun; fallback to first noun phrase
             if llm_client:
                 parsed = _parse_description(lang, llm_client)
                 if parsed:
-                    attributes = parsed.get("attributes", [])
-                    room_prior = parsed.get("room_prior", [])
-                    landmarks = parsed.get("landmarks", [])
-                    relations = _relations_from_llm(parsed.get("relations"))
+                    attributes, room_prior, landmarks, relations, parsed_target = _apply_parsed_description(parsed)
+                    if parsed_target:
+                        target = parsed_target
         elif modality == "object":
             goal_type = "category"
         elif modality == "image":
             goal_type = "image"
     else:
         if modality == "description" and ref:
-            target = str(ref)
+            raw_description = str(ref)
         goal_type = modality if modality in ("object", "description", "image") else "category"
 
     return GoalNode(
         target_object=target,
+        description=raw_description,
         attributes=attributes,
         room_prior=room_prior,
         landmarks=landmarks,
@@ -200,6 +276,11 @@ def _relations_from_llm(parsed_relations) -> List[Relation]:
     """Build Relation list from LLM JSON; tolerate missing/alternate keys."""
     out: List[Relation] = []
     if not parsed_relations:
+        return out
+    if isinstance(parsed_relations, dict):
+        for rel_type, refs in parsed_relations.items():
+            for ref in _normalize_str_list(refs):
+                out.append(Relation(str(rel_type), ref[:120]))
         return out
     for r in parsed_relations:
         if isinstance(r, str) and r.strip():
@@ -401,21 +482,27 @@ def _goal_node_from_soon_layers(
     relations = _relations_from_spatial(rel_text)
     room_prior = [str(room_text).strip()] if str(room_text).strip() else []
     landmarks = [str(landmark_text).strip()] if str(landmark_text).strip() else []
-    target = str(full_text).strip()[:200] if str(full_text).strip() else (obj_name or "object")
+    raw_description = str(full_text).strip()[:500] if str(full_text).strip() else None
+    target = obj_name or "object"
 
     if llm_client and str(full_text).strip():
         parsed = _parse_description(str(full_text).strip(), llm_client)
         if parsed:
-            if parsed.get("attributes"):
-                attributes = parsed["attributes"]
-            if parsed.get("room_prior"):
-                room_prior = parsed["room_prior"]
-            if parsed.get("landmarks"):
-                landmarks = parsed["landmarks"]
-            relations = _relations_from_llm(parsed.get("relations"))
+            attrs, rp, lms, rels, parsed_target = _apply_parsed_description(parsed)
+            if parsed_target:
+                target = parsed_target
+            if attrs:
+                attributes = attrs
+            if rp:
+                room_prior = rp
+            if lms:
+                landmarks = lms
+            if rels:
+                relations = rels
 
     return GoalNode(
         target_object=target,
+        description=raw_description,
         attributes=attributes,
         room_prior=room_prior,
         landmarks=landmarks,
@@ -510,9 +597,26 @@ def process_soon(
 
 # ==================== CLIP embeddings ====================
 
+def _resolve_clip_pretrained(clip_cache: str) -> str:
+    """Prefer local checkpoint to avoid HuggingFace download timeouts."""
+    cache = Path(clip_cache)
+    candidates = [
+        cache / "ViT-B-32-laion2b_s34b_b79k.bin",
+        cache / "open_clip_pytorch_model.bin",
+        DATA_ROOT.parent / "models" / "clip" / "ViT-B-32-laion2b_s34b_b79k.bin",
+        DATA_ROOT.parent / "models" / "open_clip_pytorch_model.bin",
+    ]
+    for path in candidates:
+        if path.is_file():
+            print(f"  Using local CLIP weights: {path}")
+            return str(path)
+    print(f"  No local CLIP weights under {clip_cache}; will try HuggingFace download")
+    return "laion2b_s34b_b79k"
+
+
 def embed_goal_graphs(
     goal_graph_dir: str,
-    clip_cache: str = "/root/workspace/models/clip",
+    clip_cache: Optional[str] = None,
     include_train: bool = False,
 ):
     try:
@@ -522,9 +626,14 @@ def embed_goal_graphs(
         print("open_clip not installed, skip embedding")
         return
 
+    if clip_cache is None:
+        clip_cache = str(DATA_ROOT.parent / "models" / "clip")
+    os.makedirs(clip_cache, exist_ok=True)
+    pretrained = _resolve_clip_pretrained(clip_cache)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, _, _ = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="laion2b_s34b_b79k", cache_dir=clip_cache,
+        "ViT-B-32", pretrained=pretrained, cache_dir=clip_cache,
     )
     model = model.to(device).eval()
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
@@ -572,7 +681,13 @@ def embed_goal_graphs(
                 for gn in ep_data.get("goal_nodes", []):
                     t = gn.get("target_object", "")
                     if isinstance(t, str) and t:
-                        texts_to_encode.append(t)
+                        # Encode enriched label: "red rectangular picture" for better CLIP matching
+                        attrs = gn.get("attributes", [])
+                        if isinstance(attrs, list) and attrs:
+                            enriched = " ".join(str(a) for a in attrs[:3]) + " " + t
+                        else:
+                            enriched = t
+                        texts_to_encode.append(enriched)
                     for rp in gn.get("room_prior", []):
                         if isinstance(rp, str) and rp:
                             texts_to_encode.append(rp)
@@ -591,8 +706,14 @@ def embed_goal_graphs(
             else:
                 for gn in ep_data.get("goal_nodes", []):
                     t = gn.get("target_object", "")
-                    if isinstance(t, str) and t in text_cache:
-                        gn["target_embedding"] = text_cache[t]
+                    if isinstance(t, str) and t:
+                        attrs = gn.get("attributes", [])
+                        if isinstance(attrs, list) and attrs:
+                            enriched = " ".join(str(a) for a in attrs[:3]) + " " + t
+                        else:
+                            enriched = t
+                        if enriched in text_cache:
+                            gn["target_embedding"] = text_cache[enriched]
                     rp = gn.get("room_prior", [])
                     if rp:
                         rp_emb = [text_cache[r] for r in rp
@@ -628,6 +749,11 @@ def main():
     parser.add_argument("--embed-clip", action="store_true", help="Add CLIP text embeddings to output JSON")
     parser.add_argument("--embed-clip-train", action="store_true", help="Also embed train / test_release splits")
     parser.add_argument(
+        "--clip-cache",
+        default=str(DATA_ROOT.parent / "models" / "clip"),
+        help="Directory with ViT-B-32-laion2b_s34b_b79k.bin (avoids HuggingFace download)",
+    )
+    parser.add_argument(
         "--no-train",
         action="store_true",
         help="Skip large splits (train, test_release); only val/dev for each task",
@@ -648,7 +774,7 @@ def main():
 
     if args.embed_only:
         print("\n=== CLIP embeddings (embed-only) ===")
-        embed_goal_graphs(args.output_dir, include_train=args.embed_clip_train)
+        embed_goal_graphs(args.output_dir, clip_cache=args.clip_cache, include_train=args.embed_clip_train)
         print("\nDone!")
         return
 
@@ -696,7 +822,7 @@ def main():
 
     if args.embed_clip:
         print("\n=== CLIP embeddings ===")
-        embed_goal_graphs(args.output_dir, include_train=args.embed_clip_train)
+        embed_goal_graphs(args.output_dir, clip_cache=args.clip_cache, include_train=args.embed_clip_train)
 
     print("\nDone!")
 

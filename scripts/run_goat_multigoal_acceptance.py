@@ -290,7 +290,8 @@ def main():
     if encoder is not None:
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
 
-    sim = make_sim(find_scene_file(episode["scene_id"], ROOT / args.scene_root))
+    scene_file = find_scene_file(episode["scene_id"], ROOT / args.scene_root)
+    sim = make_sim(scene_file)
     sim_agent = sim.initialize_agent(0)
     state = set_start_state(sim_agent, episode)
     origin = np.array(state.position, dtype=np.float32)
@@ -368,7 +369,11 @@ def main():
         "coordinate_frame": "episode_start_relative",
         "scene": args.scene,
         "episode_index": args.episode_index,
+        "scene_file": str(scene_file),
+        "episode_file": str(scene_path),
         "episode_id": episode["episode_id"],
+        "origin_world": origin.round(4).tolist(),
+        "start_rotation": episode["start_rotation"],
         "thresholds": {
             "object": config.perception.object_threshold,
             "room": config.perception.room_threshold,

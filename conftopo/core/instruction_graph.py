@@ -3,7 +3,51 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 import json
+import re
 import numpy as np
+
+
+_FIND_RE = re.compile(
+    r"(?:find|locate|look for)\s+(?:me\s+)?(?:a|an|the|some)?\s*(.+?)(?:\s+(?:on|in|at|near|opposite|which|that|next|between|behind|under|above|below|beside|with)\b)",
+    re.IGNORECASE,
+)
+
+
+_STOP_WORDS = {"in", "on", "at", "near", "which", "that", "is", "it", "and", "or", "to", "with", "behind", "under", "above", "below", "beside", "next", "between", "opposite"}
+_ARTICLES = {"the", "a", "an", "some"}
+
+
+def _extract_head_noun(text: str) -> str:
+    """Quick extraction of head noun from a description sentence (for backward compat)."""
+    text = text.strip()
+    m = _FIND_RE.search(text)
+    if m:
+        candidate = m.group(1).strip()
+        if candidate:
+            words = candidate.split()
+            if len(words) <= 2:
+                return candidate
+            segments = re.split(r",\s*|\s+and\s+", candidate)
+            last_seg = segments[-1].strip()
+            seg_words = last_seg.split()
+            if len(seg_words) <= 2 and len(segments) > 1:
+                return seg_words[-1]
+            if len(seg_words) <= 2:
+                return last_seg
+            return " ".join(seg_words[-2:])
+    # Fallback: collect leading content words until a stop word/preposition
+    words = text.split()
+    result_words = []
+    for w in words:
+        clean = w.lower().rstrip(".,;:")
+        if clean in _ARTICLES and not result_words:
+            continue  # skip leading articles
+        if clean in _STOP_WORDS and result_words:
+            break
+        result_words.append(w.rstrip(".,;:"))
+        if len(result_words) >= 3:
+            break
+    return " ".join(result_words) if result_words else text[:40]
 
 
 @dataclass
@@ -29,7 +73,8 @@ class Relation:
 @dataclass
 class GoalNode:
     """GOAT / SOON-style object goal."""
-    target_object: str
+    target_object: str  # clean category/noun, e.g. "picture", "sink"
+    description: Optional[str] = None  # raw full instruction text
     target_embedding: Optional[np.ndarray] = None
     attributes: List[str] = field(default_factory=list)
     room_prior: List[str] = field(default_factory=list)
@@ -170,6 +215,7 @@ class InstructionGraph:
             data["goal_nodes"] = [
                 {
                     "target_object": gn.target_object,
+                    **({"description": gn.description} if gn.description else {}),
                     "attributes": gn.attributes,
                     "room_prior": gn.room_prior,
                     "landmarks": gn.landmarks,
@@ -221,8 +267,19 @@ class InstructionGraph:
                 if landmark_embeddings is not None:
                     landmark_embeddings = np.asarray(landmark_embeddings, dtype=np.float32)
 
+                raw_target = gn_data["target_object"]
+                description = gn_data.get("description")
+                goal_type_val = gn_data.get("goal_type", "category")
+
+                # Backward compat: if target_object looks like a full sentence
+                # (old format), migrate it to description and extract clean noun
+                if description is None and goal_type_val == "description" and len(raw_target) > 60:
+                    description = raw_target
+                    raw_target = _extract_head_noun(raw_target)
+
                 ig.goal_nodes.append(GoalNode(
-                    target_object=gn_data["target_object"],
+                    target_object=raw_target,
+                    description=description,
                     target_embedding=target_embedding,
                     attributes=gn_data.get("attributes", []),
                     room_prior=gn_data.get("room_prior", []),
@@ -230,7 +287,7 @@ class InstructionGraph:
                     landmarks=gn_data.get("landmarks", []),
                     landmark_embeddings=landmark_embeddings,
                     relations=relations,
-                    goal_type=gn_data.get("goal_type", "category"),
+                    goal_type=goal_type_val,
                     confidence=gn_data.get("confidence", 1.0),
                     status=gn_data.get("status", "pending"),
                 ))

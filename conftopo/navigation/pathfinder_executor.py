@@ -123,9 +123,10 @@ class PathfinderExecutor:
         current = np.asarray(current_relative, dtype=np.float32)
         if not probe.path_points_relative:
             return np.asarray(probe.target_position_relative, dtype=np.float32)
+        min_step_radius = max(self.waypoint_radius, self.reach_radius)
         for point in probe.path_points_relative[1:]:
             arr = np.asarray(point, dtype=np.float32)
-            if float(np.linalg.norm((arr - current)[[0, 2]])) > self.waypoint_radius:
+            if float(np.linalg.norm((arr - current)[[0, 2]])) > min_step_radius:
                 return arr
         return np.asarray(probe.path_points_relative[-1], dtype=np.float32)
 
@@ -156,6 +157,8 @@ class PathfinderExecutor:
         current_relative = world_to_relative(np.asarray(state.position, dtype=np.float32), origin_world)
         next_wp = self.choose_next_waypoint(probe, current_relative)
         action = self.low_level_action_to(sim, next_wp, origin_world)
+        if action == "target_reached" and probe.reason != "target_reached":
+            action = "move_forward"
         debug["next_waypoint_relative"] = next_wp.round(4).tolist()
         debug["low_action"] = action
         return action, _tolist(debug)
