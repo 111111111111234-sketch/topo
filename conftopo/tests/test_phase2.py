@@ -231,6 +231,75 @@ def test_goat_agent_multi_goal():
     print(f"  ✓ multi-goal memory reuse: {nodes_after_goal1} → {nodes_after_goal2} nodes")
 
 
+def test_goat_agent_semantic_node_creation():
+    """High-similarity perception creates object/room/landmark nodes."""
+    config = ConfTopoConfig()
+    config.perception.object_threshold = 0.1
+    config.perception.room_threshold = 0.1
+    config.perception.landmark_threshold = 0.1
+    agent = ConfTopoGOATAgent(config)
+
+    D = 512
+    embed = np.zeros(D, dtype=np.float32)
+    embed[0] = 1.0
+    goal = GoalNode(
+        target_object="sink",
+        target_embedding=embed.copy(),
+        room_prior=["kitchen"],
+        landmarks=["door"],
+        landmark_embeddings=embed[np.newaxis, :].copy(),
+    )
+    agent.set_new_goal(goal)
+    agent.perceiver.room_labels = ["kitchen"]
+    agent.perceiver.room_text_embeds = embed[np.newaxis, :].copy()
+
+    action = agent.step({
+        "position": [0, 0, 0],
+        "heading": 0.0,
+        "rgb_embed": embed.copy(),
+    })
+    stats = agent.memory_stats
+    assert stats["objects"] >= 1
+    assert stats["rooms"] >= 1
+    assert stats["landmarks"] >= 1
+    assert action.get("target_node_id") is not None
+    assert len(action.get("candidate_ids", [])) > 0
+    print(f"  ✓ semantic nodes: {stats}")
+
+
+
+def test_phase2_auto_threshold():
+    """Auto threshold is stable and honors the configured floor."""
+    from conftopo.acceptance.phase2 import auto_threshold
+    assert abs(auto_threshold([0.10, 0.20], min_threshold=0.045, ratio=0.85) - 0.17) < 1e-6
+    assert abs(auto_threshold([0.01], min_threshold=0.045, ratio=0.85) - 0.045) < 1e-6
+    assert abs(auto_threshold([], min_threshold=0.045, ratio=0.85) - 0.045) < 1e-6
+    print("  ✓ auto threshold")
+
+
+def test_goat_agent_sticky_target_and_frontier_consume():
+    """Sticky target prevents target flicker and consumed frontiers are skipped."""
+    config = ConfTopoConfig()
+    config.planning.sticky_target_enabled = True
+    config.planning.sticky_release_after_no_progress = 100
+    agent = ConfTopoGOATAgent(config)
+    D = 512
+    embed = np.zeros(D, dtype=np.float32)
+    embed[0] = 1.0
+    goal = GoalNode(target_object="sink", target_embedding=embed.copy())
+    agent.set_new_goal(goal)
+    first = agent.step({"position": [0, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
+    second = agent.step({"position": [0.05, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
+    assert first.get("target_node_id") == second.get("target_node_id")
+    frontier = agent.topo_map.get_frontiers()[0]
+    agent._consumed_frontier_ids.add(frontier.node_id)
+    frontier.attributes["consumed"] = True
+    agent._clear_sticky("test_consume")
+    plan = agent.plan()
+    assert frontier.node_id not in plan.get("candidate_ids", [])
+    print("  ✓ sticky target + frontier consume")
+
+
 if __name__ == "__main__":
     print("=== Phase 2 Integration Tests ===\n")
 
@@ -255,4 +324,92 @@ if __name__ == "__main__":
     print("\n[7] GOAT Agent multi-goal memory reuse")
     test_goat_agent_multi_goal()
 
+    print("\n[8] GOAT Agent semantic node creation")
+    test_goat_agent_semantic_node_creation()
+
+    print("\n[9] Auto threshold")
+    test_phase2_auto_threshold()
+
+    print("\n[10] Sticky target/frontier consume")
+    test_goat_agent_sticky_target_and_frontier_consume()
+
     print("\n=== All Phase 2 tests passed! ===")
+
+
+
+def test_goat_frontier_target_reached_consumed():
+    """Reached frontier is consumed and not selected again."""
+    config = ConfTopoConfig()
+    agent = ConfTopoGOATAgent(config)
+    D = 512
+    embed = np.zeros(D, dtype=np.float32)
+    embed[0] = 1.0
+    goal = GoalNode(target_object="sink", target_embedding=embed.copy())
+    agent.set_new_goal(goal)
+    agent.step({"position": [0, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
+
+    frontier = next(iter(agent.topo_map.get_frontiers()))
+    event = agent.on_navigation_event(frontier.node_id, "target_reached")
+    assert event["action"] == "consumed_frontier"
+    assert frontier.attributes["consumed"] is True
+
+    out = agent.plan()
+    assert frontier.node_id not in (out.get("candidate_ids") or [])
+    skipped = out.get("sticky_debug", {}).get("skipped_candidates", [])
+    assert any(row["node_id"] == frontier.node_id and row["reason"] == "consumed" for row in skipped)
+    print("  ✓ frontier target_reached -> consumed and skipped")
+
+
+def test_goat_no_progress_blocks_sticky_target():
+    """Sticky no-progress releases and blocks a target for a short TTL."""
+    config = ConfTopoConfig()
+    config.planning.sticky_release_after_no_progress = 1
+    config.planning.sticky_min_progress = 0.05
+    agent = ConfTopoGOATAgent(config)
+    agent._position = np.zeros(3, dtype=np.float32)
+    wid = agent.topo_map.add_node(NodeType.WAYPOINT_VISITED, position=np.array([2, 0, 0], dtype=np.float32))
+    node = agent.topo_map.get_node(wid)
+    agent._sticky_target_id = wid
+    agent._sticky_last_distance = 2.0
+    agent._sticky_no_progress_steps = 0
+
+    result = agent._sticky_plan_if_valid([node], [wid], np.array([1.0], dtype=np.float32))
+    assert result is None
+    assert agent._is_blocked_target(wid)
+    assert node.attributes["blocked_reason"] == "no_progress"
+    assert agent._sticky_target_id is None
+    assert agent._sticky_release_reason == "no_progress"
+    print("  ✓ no-progress -> sticky release and target blocked")
+
+
+def test_goat_candidate_filter_skips_consumed_blocked_too_close():
+    """Candidate filter reports consumed, blocked, and too-close skip reasons."""
+    config = ConfTopoConfig()
+    config.planning.target_too_close_radius = 0.5
+    agent = ConfTopoGOATAgent(config)
+    agent._position = np.zeros(3, dtype=np.float32)
+
+    consumed_id = agent.topo_map.add_node(NodeType.WAYPOINT_FRONTIER, position=np.array([2, 0, 0], dtype=np.float32))
+    consumed = agent.topo_map.get_node(consumed_id)
+    consumed.attributes["consumed"] = True
+    agent._consumed_frontier_ids.add(consumed_id)
+
+    blocked_id = agent.topo_map.add_node(NodeType.WAYPOINT_VISITED, position=np.array([3, 0, 0], dtype=np.float32))
+    blocked = agent.topo_map.get_node(blocked_id)
+    agent._block_target(blocked_id, "unit_test")
+
+    close_id = agent.topo_map.add_node(NodeType.OBJECT, position=np.array([0.1, 0, 0], dtype=np.float32))
+    close = agent.topo_map.get_node(close_id)
+
+    assert agent._candidate_skip_reason(consumed) == "consumed"
+    assert agent._candidate_skip_reason(blocked) == "blocked"
+    assert agent._candidate_skip_reason(close) == "too_close"
+    print("  ✓ candidate filter skips consumed/blocked/too_close")
+
+
+if __name__ == "__main__":
+    print("\n[11] Navigation target lifecycle")
+    test_goat_frontier_target_reached_consumed()
+    test_goat_no_progress_blocks_sticky_target()
+    test_goat_candidate_filter_skips_consumed_blocked_too_close()
+    print("\n=== Navigation stability tests passed! ===")

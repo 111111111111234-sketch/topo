@@ -220,6 +220,31 @@ def test_instruction_graph_serialization():
     print("  [PASS] instruction graph serialization")
 
 
+def test_instruction_graph_deserialize_embeddings():
+    """GoalGraph JSON embeddings survive from_dict()."""
+    data = {
+        "goal_type": "object_goal",
+        "goal_nodes": [{
+            "target_object": "rack",
+            "target_embedding": [1.0, 0.0, 0.0],
+            "room_prior": ["bedroom"],
+            "room_prior_embeddings": [[0.0, 1.0, 0.0]],
+            "landmarks": ["bed"],
+            "landmark_embeddings": [[0.0, 0.0, 1.0]],
+        }],
+    }
+    ig = InstructionGraph.from_dict(data)
+    goal = ig.goal_nodes[0]
+    assert goal.target_embedding is not None
+    assert goal.target_embedding.dtype == np.float32
+    assert goal.target_embedding.shape == (3,)
+    assert goal.room_prior_embeddings is not None
+    assert goal.room_prior_embeddings.shape == (1, 3)
+    assert goal.landmark_embeddings is not None
+    assert goal.landmark_embeddings.shape == (1, 3)
+    print("  [PASS] instruction graph embedding deserialization")
+
+
 def test_confidence_system():
     """Test confidence computation."""
     factors = ConfidenceFactors(
@@ -308,6 +333,7 @@ if __name__ == "__main__":
     test_instruction_graph_route()
     test_instruction_graph_object_goal()
     test_instruction_graph_serialization()
+    test_instruction_graph_deserialize_embeddings()
     test_confidence_system()
     test_rule_scorer()
     print("\nAll tests passed!")

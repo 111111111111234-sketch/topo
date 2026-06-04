@@ -23,6 +23,10 @@ class PerceptionConfig:
     heavy_interval: int = 5
     heavy_on_frontier: bool = True
     clip_model: str = "ViT-B/32"
+    clip_device: str = "auto"
+    object_threshold: float = 0.23
+    room_threshold: float = 0.20
+    landmark_threshold: float = 0.22
     # 房间类型标签
     room_labels: List[str] = field(default_factory=lambda: [
         "kitchen", "living room", "bedroom", "bathroom",
@@ -39,6 +43,13 @@ class PlanningConfig:
     use_retrieval: bool = False
     exploration_threshold: float = 0.3
     retrieval_hidden_dim: int = 256
+    sticky_target_enabled: bool = True
+    sticky_reach_radius: float = 0.75
+    sticky_release_after_no_progress: int = 5
+    sticky_min_progress: float = 0.05
+    frontier_consume_radius: float = 0.75
+    target_too_close_radius: float = 0.45
+    blocked_target_ttl: int = 20
 
 
 @dataclass

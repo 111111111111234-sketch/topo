@@ -25,7 +25,15 @@ echo "Dockerfile:    $DOCKERFILE"
 echo "Site:          $SITE"
 echo ""
 
-printf 'y\n' | fuyao docker --push \
-  --dockerfile="$DOCKERFILE" \
-  --site="$SITE" \
-  "${@:2}"
+# fuyao 危险目录提示从 TTY 读入，管道 echo y 无效，用 expect 自动确认
+expect <<EOF
+set timeout -1
+spawn fuyao docker --push --dockerfile=$DOCKERFILE --site=$SITE
+expect {
+  "Do you want to continue?" {
+    send "y\r"
+    exp_continue
+  }
+  eof
+}
+EOF

@@ -17,7 +17,7 @@ Usage:
             action = agent.step(obs)  # observe → update_memory → plan → act
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 from conftopo.config import ConfTopoConfig
@@ -38,11 +38,13 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     def __init__(self, config: Optional[ConfTopoConfig] = None):
         super().__init__(config)
         self.perceiver = LightPerceiver(
-            room_labels=config.perception.room_labels if config else None,
+            room_labels=self.config.perception.room_labels,
         )
 
         # Agent state
+        # Topo memory stores episode-start-relative positions.
         self._position: Optional[np.ndarray] = None
+        self._origin_position: Optional[np.ndarray] = None
         self._heading: float = 0.0
         self._prev_position: Optional[np.ndarray] = None
         self._cur_vp_id: Optional[str] = None
@@ -60,10 +62,22 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._goal_idx: int = 0
         self._goals_completed: int = 0
 
+        # Planning stability state
+        self._sticky_target_id: Optional[str] = None
+        self._sticky_last_distance: Optional[float] = None
+        self._sticky_no_progress_steps: int = 0
+        self._sticky_release_reason: str = ""
+        self._consumed_frontier_ids: Set[str] = set()
+        self._blocked_target_until: Dict[str, int] = {}
+        self._last_skipped_candidates: List[Dict[str, Any]] = []
+        self._last_navigation_event: Dict[str, Any] = {}
+        self._last_plan_debug: Dict[str, Any] = {}
+
     def reset(self):
         """Full reset for new episode (clear memory)."""
         super().reset()
         self._position = None
+        self._origin_position = None
         self._heading = 0.0
         self._prev_position = None
         self._cur_vp_id = None
@@ -71,6 +85,15 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_perception = None
         self._goal_idx = 0
         self._goals_completed = 0
+        self._sticky_target_id = None
+        self._sticky_last_distance = None
+        self._sticky_no_progress_steps = 0
+        self._sticky_release_reason = ""
+        self._consumed_frontier_ids = set()
+        self._blocked_target_until = {}
+        self._last_skipped_candidates = []
+        self._last_navigation_event = {}
+        self._last_plan_debug = {}
 
     def set_new_goal(self, goal: GoalNode):
         """Switch to a new goal within the same episode (memory preserved).
@@ -78,6 +101,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         This is the key for multi-goal: DynamicTopoMap is NOT cleared.
         """
         self.reset_keep_memory()
+        self._clear_sticky("new_goal")
 
         if self.instruction_graph is None:
             self.instruction_graph = InstructionGraph(
@@ -112,8 +136,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             - 'heading': agent heading in radians
             - 'depth' (optional): depth image
         """
+        raw_position = np.array(obs['position'], dtype=np.float32)
+        if self._origin_position is None:
+            self._origin_position = raw_position.copy()
         self._prev_position = self._position
-        self._position = np.array(obs['position'], dtype=np.float32)
+        self._position = raw_position - self._origin_position
         self._heading = obs.get('heading', 0.0)
 
         # Visual embedding (CLIP)
@@ -145,6 +172,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         # 1. Add/update visited waypoint
         cur_vp = self._add_visited_waypoint()
+
+        self._consume_reached_frontiers(cur_vp)
 
         # 2. Add semantic nodes (room, landmark detection)
         self._add_semantic_nodes(cur_vp)
@@ -198,29 +227,145 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_vp_id = cur_vp
         return cur_vp
 
+    def _clear_sticky(self, reason: str = "") -> None:
+        self._sticky_target_id = None
+        self._sticky_last_distance = None
+        self._sticky_no_progress_steps = 0
+        self._sticky_release_reason = reason
+
+    def _active_blocked_targets(self) -> Dict[str, int]:
+        expired = [nid for nid, until in self._blocked_target_until.items() if until <= self.topo_map.current_step]
+        for nid in expired:
+            self._blocked_target_until.pop(nid, None)
+            node = self.topo_map.get_node(nid)
+            if node is not None:
+                node.attributes.pop("blocked_reason", None)
+                node.attributes.pop("blocked_until_step", None)
+        return dict(self._blocked_target_until)
+
+    def _is_blocked_target(self, node_id: str) -> bool:
+        return node_id in self._active_blocked_targets()
+
+    def _block_target(self, node_id: str, reason: str, ttl: Optional[int] = None) -> None:
+        node = self.topo_map.get_node(node_id)
+        if node is None:
+            return
+        ttl = self.config.planning.blocked_target_ttl if ttl is None else ttl
+        until = self.topo_map.current_step + max(1, int(ttl))
+        self._blocked_target_until[node_id] = until
+        node.attributes["blocked_reason"] = reason
+        node.attributes["blocked_until_step"] = until
+        node.confidence = min(node.confidence, 0.1)
+
+    def _consume_or_block_target(self, node_id: str, reason: str) -> Dict[str, Any]:
+        node = self.topo_map.get_node(node_id)
+        event = {"target_node_id": node_id, "reason": reason, "action": "missing"}
+        if node is None:
+            self._last_navigation_event = event
+            return event
+        node.attributes["consume_reason"] = reason
+        node.attributes["consume_step"] = self.topo_map.current_step
+        if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+            self._consumed_frontier_ids.add(node.node_id)
+            node.attributes["consumed"] = True
+            node.confidence = min(node.confidence, 0.05)
+            event["action"] = "consumed_frontier"
+        else:
+            self._block_target(node.node_id, reason)
+            event["action"] = "blocked_target"
+        if self._sticky_target_id == node_id:
+            self._clear_sticky(reason)
+        self._last_navigation_event = event
+        return event
+
+    def on_navigation_event(self, target_node_id: Optional[str], event: str) -> Dict[str, Any]:
+        if target_node_id is None:
+            out = {"target_node_id": None, "reason": event, "action": "ignored"}
+            self._last_navigation_event = out
+            return out
+        return self._consume_or_block_target(target_node_id, event)
+
+    def _consume_reached_frontiers(self, cur_vp: str) -> None:
+        radius = self.config.planning.frontier_consume_radius
+        for node in self.topo_map.find_nodes_within_radius(
+            self._position, radius=radius, node_type=NodeType.WAYPOINT_FRONTIER
+        ):
+            self._consume_or_block_target(node.node_id, "frontier_reached")
+
+    def _is_consumed_frontier(self, node) -> bool:
+        return (
+            node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE)
+            and (node.node_id in self._consumed_frontier_ids or node.attributes.get("consumed", False))
+        )
+
+    def _sticky_plan_if_valid(self, candidates, candidate_ids, scores) -> Optional[Dict[str, Any]]:
+        cfg = self.config.planning
+        if not cfg.sticky_target_enabled or self._sticky_target_id is None:
+            return None
+        if self._sticky_target_id not in candidate_ids:
+            self._clear_sticky("target_not_candidate")
+            return None
+        node = self.topo_map.get_node(self._sticky_target_id)
+        if node is None or self._is_consumed_frontier(node) or self._is_blocked_target(node.node_id):
+            self._clear_sticky("target_unavailable")
+            return None
+        dist = float(np.linalg.norm(node.position - self._position))
+        if dist <= cfg.sticky_reach_radius:
+            self._consume_or_block_target(node.node_id, "target_reached")
+            self._clear_sticky("target_reached")
+            return None
+        if self._sticky_last_distance is not None:
+            progress = self._sticky_last_distance - dist
+            if progress < cfg.sticky_min_progress:
+                self._sticky_no_progress_steps += 1
+            else:
+                self._sticky_no_progress_steps = 0
+        self._sticky_last_distance = dist
+        if self._sticky_no_progress_steps >= cfg.sticky_release_after_no_progress:
+            self._consume_or_block_target(node.node_id, "no_progress")
+            self._clear_sticky("no_progress")
+            return None
+        idx = candidate_ids.index(self._sticky_target_id)
+        self._last_plan_debug = {
+            "sticky_target_id": self._sticky_target_id,
+            "sticky_used": True,
+            "sticky_distance": dist,
+            "sticky_no_progress_steps": self._sticky_no_progress_steps,
+            "sticky_release_reason": "",
+            "consumed_frontiers": sorted(self._consumed_frontier_ids),
+            "blocked_targets": self._active_blocked_targets(),
+            "skipped_candidates": self._last_skipped_candidates,
+            "navigation_event": self._last_navigation_event,
+        }
+        return {
+            "target_node_id": node.node_id,
+            "target_position": node.position.copy(),
+            "is_exploration": node.node_type == NodeType.WAYPOINT_FRONTIER,
+            "scores": scores,
+            "candidate_ids": candidate_ids,
+            "sticky_debug": self._last_plan_debug,
+        }
+
     def _add_semantic_nodes(self, cur_vp: str) -> None:
         """Add room/landmark/object nodes from perception results."""
         if not self._cur_perception:
             return
 
+        pcfg = self.config.perception
+
         # Room node
         room_label = self._cur_perception.get("room_label", "unknown")
-        room_conf = self._cur_perception.get("room_confidence", 0.0)
-        if room_label != "unknown" and room_conf > 0.2:
-            # Check if we already have a room node for this type nearby
+        room_conf = float(self._cur_perception.get("room_confidence", 0.0))
+        if room_label != "unknown" and room_conf >= pcfg.room_threshold:
             existing_rooms = self.topo_map.find_nodes_within_radius(
                 self._position, radius=5.0, node_type=NodeType.ROOM
             )
-            matched_room = None
-            for r in existing_rooms:
-                if r.label == room_label:
-                    matched_room = r
-                    break
-
+            matched_room = next((r for r in existing_rooms if r.label == room_label), None)
             if matched_room:
-                # Update confidence
-                matched_room.confidence = min(1.0, matched_room.confidence + 0.05)
+                matched_room.confidence = max(matched_room.confidence, room_conf)
                 matched_room.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched_room.embedding = self._cur_rgb_embed
             else:
                 room_id = self.topo_map.add_node(
                     NodeType.ROOM,
@@ -231,25 +376,53 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 )
                 self.topo_map.add_edge(cur_vp, room_id, EdgeType.BELONGS_TO)
 
-        # Goal object detection (high similarity = potential target)
-        if self._cur_perception.get("best_goal_sim", 0) > 0.25:
-            goal_scores = self._cur_perception.get("goal_scores", [])
-            for label, sim in goal_scores:
-                if sim > 0.25:
-                    # Check if already detected nearby
-                    existing = self.topo_map.find_nodes_within_radius(
-                        self._position, radius=2.0, node_type=NodeType.OBJECT
-                    )
-                    already_found = any(o.label == label for o in existing)
-                    if not already_found:
-                        obj_id = self.topo_map.add_node(
-                            NodeType.OBJECT,
-                            position=self._position.copy(),
-                            embedding=self._cur_rgb_embed,
-                            confidence=float(sim),
-                            label=label,
-                        )
-                        self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+        # Goal object node
+        for label, sim in self._cur_perception.get("goal_scores", []):
+            sim = float(sim)
+            if sim < pcfg.object_threshold:
+                continue
+            existing = self.topo_map.find_nodes_within_radius(
+                self._position, radius=2.0, node_type=NodeType.OBJECT
+            )
+            matched = next((o for o in existing if o.label == label), None)
+            if matched:
+                matched.confidence = max(matched.confidence, sim)
+                matched.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched.embedding = self._cur_rgb_embed
+            else:
+                obj_id = self.topo_map.add_node(
+                    NodeType.OBJECT,
+                    position=self._position.copy(),
+                    embedding=self._cur_rgb_embed,
+                    confidence=sim,
+                    label=label,
+                )
+                self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+
+        # Landmark node
+        for label, sim in self._cur_perception.get("landmark_scores", []):
+            sim = float(sim)
+            if sim < pcfg.landmark_threshold:
+                continue
+            existing = self.topo_map.find_nodes_within_radius(
+                self._position, radius=3.0, node_type=NodeType.LANDMARK
+            )
+            matched = next((lm for lm in existing if lm.label == label), None)
+            if matched:
+                matched.confidence = max(matched.confidence, sim)
+                matched.step_id = self.topo_map.current_step
+                if self._cur_rgb_embed is not None:
+                    matched.embedding = self._cur_rgb_embed
+            else:
+                lm_id = self.topo_map.add_node(
+                    NodeType.LANDMARK,
+                    position=self._position.copy(),
+                    embedding=self._cur_rgb_embed,
+                    confidence=sim,
+                    label=label,
+                )
+                self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
 
     def _generate_frontiers(self, cur_vp: str) -> None:
         """Generate frontier-like nodes from unexplored directions.
@@ -324,6 +497,34 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             )
             self.topo_map.add_edge(cur_vp, fid, EdgeType.NAVIGABLE)
 
+    def _candidate_skip_reason(self, node: SemanticNode) -> Optional[str]:
+        if node.node_id == self._cur_vp_id:
+            return "current"
+        if self._is_consumed_frontier(node):
+            return "consumed"
+        if self._is_blocked_target(node.node_id):
+            return "blocked"
+        if self._position is not None:
+            dist = float(np.linalg.norm(node.position - self._position))
+            if dist <= self.config.planning.target_too_close_radius:
+                if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+                    self._consume_or_block_target(node.node_id, "too_close")
+                return "too_close"
+        return None
+
+    def _debug_plan_state(self) -> Dict[str, Any]:
+        return {
+            "sticky_target_id": self._sticky_target_id,
+            "sticky_used": False,
+            "sticky_distance": self._sticky_last_distance,
+            "sticky_no_progress_steps": self._sticky_no_progress_steps,
+            "sticky_release_reason": self._sticky_release_reason,
+            "consumed_frontiers": sorted(self._consumed_frontier_ids),
+            "blocked_targets": self._active_blocked_targets(),
+            "skipped_candidates": self._last_skipped_candidates,
+            "navigation_event": self._last_navigation_event,
+        }
+
     def plan(self) -> Dict[str, Any]:
         """Determine next target based on goal + memory.
 
@@ -336,23 +537,31 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if self.instruction_graph is None or self._cur_vp_id is None:
             return {"target_node_id": None, "target_position": None, "is_exploration": True}
 
-        # Get all candidate nodes (frontiers + unvisited waypoints + high-sim objects)
-        candidates = []
-        candidate_ids = []
+        self._last_navigation_event = {}
+        primary_candidates = []
+        primary_ids = []
+        fallback_candidates = []
+        fallback_ids = []
+        self._last_skipped_candidates = []
 
         for node in self.topo_map._nodes.values():
-            if node.node_id == self._cur_vp_id:
+            reason = self._candidate_skip_reason(node)
+            if reason is not None:
+                self._last_skipped_candidates.append({"node_id": node.node_id, "type": node.node_type.value, "reason": reason})
                 continue
-            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_VISITED):
-                candidates.append(node)
-                candidate_ids.append(node.node_id)
-            elif node.node_type == NodeType.OBJECT:
-                # Include high-similarity objects as direct targets
-                candidates.append(node)
-                candidate_ids.append(node.node_id)
+            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT):
+                primary_candidates.append(node)
+                primary_ids.append(node.node_id)
+            elif node.node_type == NodeType.WAYPOINT_VISITED:
+                fallback_candidates.append(node)
+                fallback_ids.append(node.node_id)
+
+        candidates = primary_candidates if primary_candidates else fallback_candidates
+        candidate_ids = primary_ids if primary_candidates else fallback_ids
 
         if not candidates:
-            return {"target_node_id": None, "target_position": None, "is_exploration": True}
+            self._last_plan_debug = self._debug_plan_state()
+            return {"target_node_id": None, "target_position": None, "is_exploration": True, "candidate_ids": [], "scores": [], "sticky_debug": self._last_plan_debug}
 
         # Score candidates
         scores = compute_semantic_bias(
@@ -363,8 +572,27 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             normalize=False,  # use raw scores for selection
         )
 
+        sticky_plan = self._sticky_plan_if_valid(candidates, candidate_ids, scores)
+        if sticky_plan is not None:
+            return sticky_plan
+
         best_idx = int(np.argmax(scores))
         best_node = candidates[best_idx]
+        self._sticky_target_id = best_node.node_id if self.config.planning.sticky_target_enabled else None
+        self._sticky_last_distance = float(np.linalg.norm(best_node.position - self._position))
+        self._sticky_no_progress_steps = 0
+        self._last_plan_debug = {
+            "sticky_target_id": self._sticky_target_id,
+            "sticky_used": False,
+            "sticky_distance": self._sticky_last_distance,
+            "sticky_no_progress_steps": 0,
+            "sticky_release_reason": self._sticky_release_reason,
+            "consumed_frontiers": sorted(self._consumed_frontier_ids),
+            "blocked_targets": self._active_blocked_targets(),
+            "skipped_candidates": self._last_skipped_candidates,
+            "navigation_event": self._last_navigation_event,
+        }
+        self._sticky_release_reason = ""
 
         return {
             "target_node_id": best_node.node_id,
@@ -372,6 +600,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "is_exploration": best_node.node_type == NodeType.WAYPOINT_FRONTIER,
             "scores": scores,
             "candidate_ids": candidate_ids,
+            "sticky_debug": self._last_plan_debug,
         }
 
     def act(self, plan_output: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,12 +612,23 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         target_pos = plan_output.get("target_position")
         if target_pos is None:
             # No target: random exploration or stop
-            return {"action": "stop"}
+            return {
+                "action": "stop",
+                "target_node_id": plan_output.get("target_node_id"),
+                "candidate_ids": plan_output.get("candidate_ids", []),
+                "scores": plan_output.get("scores", []),
+                "is_exploration": plan_output.get("is_exploration", True),
+                "sticky_debug": plan_output.get("sticky_debug", self._last_plan_debug),
+            }
 
         return {
             "action": "navigate",
             "target_position": target_pos,
+            "target_node_id": plan_output.get("target_node_id"),
+            "candidate_ids": plan_output.get("candidate_ids", []),
+            "scores": plan_output.get("scores", []),
             "is_exploration": plan_output.get("is_exploration", False),
+            "sticky_debug": plan_output.get("sticky_debug", self._last_plan_debug),
         }
 
     def on_goal_reached(self) -> bool:
@@ -421,9 +661,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "total_nodes": self.topo_map.num_nodes,
             "visited_waypoints": len(self.topo_map.get_visited()),
             "frontiers": len(self.topo_map.get_frontiers()),
+            "candidate_waypoints": len(self.topo_map.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)),
             "objects": len(self.topo_map.get_nodes_by_type(NodeType.OBJECT)),
             "rooms": len(self.topo_map.get_nodes_by_type(NodeType.ROOM)),
             "landmarks": len(self.topo_map.get_nodes_by_type(NodeType.LANDMARK)),
             "step": self._step_count,
             "goals_completed": self._goals_completed,
+            "consumed_frontiers": len(self._consumed_frontier_ids),
+            "blocked_targets": len(self._active_blocked_targets()),
         }

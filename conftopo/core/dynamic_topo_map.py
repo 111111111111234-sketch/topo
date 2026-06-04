@@ -10,6 +10,7 @@ import networkx as nx
 class NodeType(Enum):
     WAYPOINT_VISITED = "waypoint_visited"
     WAYPOINT_FRONTIER = "waypoint_frontier"
+    WAYPOINT_CANDIDATE = "waypoint_candidate"
     LANDMARK = "landmark"
     OBJECT = "object"
     ROOM = "room"
@@ -169,6 +170,9 @@ class DynamicTopoMap:
     def get_frontiers(self) -> List[SemanticNode]:
         return self.get_nodes_by_type(NodeType.WAYPOINT_FRONTIER)
 
+    def get_candidates(self) -> List[SemanticNode]:
+        return self.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)
+
     def get_visited(self) -> List[SemanticNode]:
         return self.get_nodes_by_type(NodeType.WAYPOINT_VISITED)
 
@@ -252,16 +256,66 @@ class DynamicTopoMap:
 
     # ==================== Memory Management ====================
 
+    def add_candidate_waypoint(
+        self,
+        position: np.ndarray,
+        label: str = "",
+        confidence: float = 0.35,
+        source: str = "ghost",
+    ) -> str:
+        """Add an ETPNav-style candidate/ghost waypoint."""
+        return self.add_node(
+            NodeType.WAYPOINT_CANDIDATE,
+            position,
+            confidence=confidence,
+            label=label,
+            attributes={
+                "source": source,
+                "consumed": False,
+                "blocked": False,
+                "state": "candidate",
+            },
+        )
+
     def promote_frontier_to_visited(self, node_id: str):
-        """When agent visits a frontier, promote it to visited waypoint."""
+        """When agent visits a frontier/candidate, promote it to visited waypoint."""
         if node_id in self._nodes:
             node = self._nodes[node_id]
-            if node.node_type == NodeType.WAYPOINT_FRONTIER:
+            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+                promoted_from = "candidate" if node.node_type == NodeType.WAYPOINT_CANDIDATE else "frontier"
                 node.node_type = NodeType.WAYPOINT_VISITED
                 node.visit_count += 1
                 node.confidence = min(1.0, node.confidence + 0.3)
                 node.step_id = self._current_step
+                node.attributes["promoted_from"] = promoted_from
+                node.attributes["state"] = "visited"
+                node.attributes["consumed"] = False
+                node.attributes["blocked"] = False
                 self.graph.nodes[node_id]["node_type"] = NodeType.WAYPOINT_VISITED.value
+
+    def consume_node(self, node_id: str, reason: str):
+        """Mark a candidate/frontier target as consumed so planning will skip it."""
+        node = self._nodes.get(node_id)
+        if node is None:
+            return
+        node.attributes["consumed"] = True
+        node.attributes["consume_reason"] = reason
+        node.attributes["state"] = "consumed"
+        node.step_id = self._current_step
+        if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+            node.confidence = max(0.0, node.confidence - 0.25)
+
+    def block_node(self, node_id: str, reason: str, until_step: Optional[int] = None):
+        """Temporarily block a problematic target from target selection."""
+        node = self._nodes.get(node_id)
+        if node is None:
+            return
+        node.attributes["blocked"] = True
+        node.attributes["blocked_reason"] = reason
+        node.attributes["blocked_until_step"] = until_step
+        node.attributes["state"] = "blocked"
+        node.step_id = self._current_step
+        node.confidence = max(0.0, node.confidence - 0.15)
 
     def merge_nearby_nodes(self, node_type: Optional[NodeType] = None):
         """Merge nodes of same type that are too close together."""
