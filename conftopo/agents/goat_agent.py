@@ -28,6 +28,10 @@ from conftopo.core.rule_scorer import compute_semantic_bias
 from conftopo.perception.light_perceiver import LightPerceiver
 
 
+def _angle_delta(a: float, b: float) -> float:
+    return float((a - b + np.pi) % (2 * np.pi) - np.pi)
+
+
 class ConfTopoGOATAgent(ConfTopoBaseAgent):
     """Complete ConfTopo agent for GOAT-Bench.
 
@@ -65,6 +69,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         # Planning stability state
         self._sticky_target_id: Optional[str] = None
         self._sticky_last_distance: Optional[float] = None
+        self._sticky_last_heading: Optional[float] = None
         self._sticky_no_progress_steps: int = 0
         self._sticky_release_reason: str = ""
         self._consumed_frontier_ids: Set[str] = set()
@@ -87,6 +92,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._goals_completed = 0
         self._sticky_target_id = None
         self._sticky_last_distance = None
+        self._sticky_last_heading = None
         self._sticky_no_progress_steps = 0
         self._sticky_release_reason = ""
         self._consumed_frontier_ids = set()
@@ -230,6 +236,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     def _clear_sticky(self, reason: str = "") -> None:
         self._sticky_target_id = None
         self._sticky_last_distance = None
+        self._sticky_last_heading = None
         self._sticky_no_progress_steps = 0
         self._sticky_release_reason = reason
 
@@ -314,13 +321,19 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             self._consume_or_block_target(node.node_id, "target_reached")
             self._clear_sticky("target_reached")
             return None
+        heading_changed = False
+        if self._sticky_last_heading is not None:
+            heading_changed = abs(_angle_delta(self._heading, self._sticky_last_heading)) > 0.05
         if self._sticky_last_distance is not None:
             progress = self._sticky_last_distance - dist
-            if progress < cfg.sticky_min_progress:
+            if heading_changed:
+                self._sticky_no_progress_steps = 0
+            elif progress < cfg.sticky_min_progress:
                 self._sticky_no_progress_steps += 1
             else:
                 self._sticky_no_progress_steps = 0
         self._sticky_last_distance = dist
+        self._sticky_last_heading = self._heading
         if self._sticky_no_progress_steps >= cfg.sticky_release_after_no_progress:
             self._consume_or_block_target(node.node_id, "no_progress")
             self._clear_sticky("no_progress")
@@ -580,6 +593,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         best_node = candidates[best_idx]
         self._sticky_target_id = best_node.node_id if self.config.planning.sticky_target_enabled else None
         self._sticky_last_distance = float(np.linalg.norm(best_node.position - self._position))
+        self._sticky_last_heading = self._heading
         self._sticky_no_progress_steps = 0
         self._last_plan_debug = {
             "sticky_target_id": self._sticky_target_id,

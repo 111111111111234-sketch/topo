@@ -1,0 +1,219 @@
+# ============================================================================
+# ConfTopo public all-in-one Dockerfile
+#
+# This version avoids the private fuyao/base-image/internal-PyPI dependencies
+# used by stage1.dockerfile and stage2.dockerfile. It builds from a public
+# NVIDIA CUDA image and creates the same four runtime conda environments:
+#   - conftopo-main: ConfTopo core/tests
+#   - goat: GOAT / Habitat-Lab 0.2.3 / habitat-sim 0.2.4
+#   - vlnce: R2R-CE / ETPNav / habitat-sim 0.1.7
+#   - vllm: isolated vLLM environment
+#
+# Build:
+#   cd /home/tangyx/Desktop/codepython/topo
+#   docker build -f docker/Dockerfile.public -t conftopo-public:latest .
+#
+# Run:
+#   docker run --gpus all -it --rm -v "$PWD":/workspace/conftopo conftopo-public:latest
+# ============================================================================
+
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+ENV WORKSPACE=/workspace/conftopo
+ENV CONDA_DIR=/opt/conda
+ENV PATH=/opt/conda/bin:${PATH}
+ENV MAGNUM_LOG=quiet
+ENV GLOG_minloglevel=2
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+ENV TERM=xterm-256color
+
+ARG PIP_OPTIONS="--timeout 600 --no-cache-dir"
+ARG PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+ARG MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+ARG HABITAT_SIM_VLNCE_TAG="v0.1.7"
+ARG HABITAT_SIM_GIT="https://github.com/facebookresearch/habitat-sim.git"
+ARG HABITAT_LAB_GIT="https://github.com/facebookresearch/habitat-lab.git"
+ARG HABITAT_LAB_VLNCE_REF="v0.1.7"
+ARG HABITAT_LAB_GOAT_REF="v0.2.3"
+
+# System dependencies.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      ffmpeg \
+      git \
+      libegl1 \
+      libegl1-mesa-dev \
+      libgl1 \
+      libgl1-mesa-dev \
+      libgles2 \
+      libglib2.0-0 \
+      libglm-dev \
+      libjpeg-dev \
+      libopengl0 \
+      libsm6 \
+      libxcursor-dev \
+      libxext6 \
+      libxi-dev \
+      libxinerama-dev \
+      libxrandr-dev \
+      libxrender1 \
+      ninja-build \
+      pkg-config \
+      tini \
+      wget; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+    printf '%s\n' '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+      > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+# Miniconda.
+RUN wget -q "${MINICONDA_URL}" -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p "${CONDA_DIR}" && \
+    rm /tmp/miniconda.sh && \
+    conda config --set auto_activate_base false && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r || true
+
+# conftopo-main: project runtime and unit tests.
+RUN conda create -n conftopo-main python=3.12 pip -y && \
+    conda run -n conftopo-main pip install ${PIP_OPTIONS} \
+      torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+      --index-url "${PYTORCH_INDEX_URL}" && \
+    conda run -n conftopo-main pip install ${PIP_OPTIONS} \
+      "setuptools<75" "packaging>=24.2" \
+      numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+      pillow tqdm pyyaml networkx==3.2.1 \
+      imageio imageio-ffmpeg h5py lmdb numba \
+      opencv-python-headless \
+      gym==0.26.2 hydra-core omegaconf yacs jsonlines \
+      msgpack msgpack-numpy numpy-quaternion \
+      "transformers>=4.40" timm==1.0.27 \
+      open_clip_torch==3.3.0 ftfy regex \
+      openai safetensors huggingface_hub gdown requests \
+      tensorboardX easydict natsort
+
+# goat: Habitat-Sim 0.2.4 from public conda channels + Habitat-Lab 0.2.3.
+RUN conda create -n goat python=3.9 cmake "pip<24.4" -y && \
+    conda install -n goat habitat-sim=0.2.4 headless -c aihabitat -c conda-forge -y && \
+    conda run -n goat pip install ${PIP_OPTIONS} \
+      torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+      --index-url "${PYTORCH_INDEX_URL}" && \
+    conda install -n goat -c conda-forge --override-channels -y \
+      numpy=1.26.4 scipy scikit-learn matplotlib pillow tqdm pyyaml && \
+    conda run -n goat pip install ${PIP_OPTIONS} \
+      "setuptools<70" \
+      protobuf==3.20.1 tensorboard==2.8.0 webdataset==0.1.40 \
+      "moviepy>=1.0.1" "faster-fifo>=1.4.2" \
+      ifcfg yacs einops "gym>=0.22,<0.24" \
+      opencv-python-headless hydra-core omegaconf jsonlines \
+      imageio imageio-ffmpeg msgpack msgpack-numpy h5py lmdb numba \
+      ftfy regex tqdm GPUtil trimesh seaborn open3d \
+      transformers timm sentencepiece scikit-learn networkx \
+      easydict tensorboardX gdown requests pytest-runner openai && \
+    conda run -n goat pip install ${PIP_OPTIONS} git+https://github.com/openai/CLIP.git
+
+RUN set -eux; \
+    rm -rf /tmp/habitat-lab-goat; \
+    git clone --depth 1 --branch "${HABITAT_LAB_GOAT_REF}" "${HABITAT_LAB_GIT}" /tmp/habitat-lab-goat; \
+    touch /tmp/habitat-lab-goat/habitat-lab/README.md /tmp/habitat-lab-goat/habitat-baselines/README.md; \
+    env -u PIP_CONSTRAINT -u LD_LIBRARY_PATH /opt/conda/envs/goat/bin/pip install ${PIP_OPTIONS} /tmp/habitat-lab-goat/habitat-lab --no-deps; \
+    env -u PIP_CONSTRAINT -u LD_LIBRARY_PATH /opt/conda/envs/goat/bin/pip install ${PIP_OPTIONS} /tmp/habitat-lab-goat/habitat-baselines --no-deps; \
+    rm -rf /tmp/habitat-lab-goat
+
+# vlnce: ETPNav/R2R-CE stack, then compile habitat-sim 0.1.7.
+RUN conda create -n vlnce python=3.9 cmake "pip>=23,<24.4" -y && \
+    conda run -n vlnce pip install ${PIP_OPTIONS} \
+      torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+      --index-url "${PYTORCH_INDEX_URL}" && \
+    conda run -n vlnce pip install ${PIP_OPTIONS} \
+      numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+      opencv-python==4.11.0.86 networkx==3.2.1 pillow tqdm pyyaml \
+      gym==0.23.1 hydra-core omegaconf yacs jsonlines \
+      imageio imageio-ffmpeg quaternion \
+      h5py lmdb msgpack msgpack-numpy numba numpy-quaternion \
+      transformers==4.12.5 tokenizers==0.10.3 timm==1.0.27 \
+      tensorboardX easydict ftfy regex \
+      open_clip_torch==3.3.0 openai safetensors huggingface_hub gdown requests \
+      scikit-image sentencepiece sacremoses stanza shapely \
+      bresenham dtw fastdtw progressbar2 gpustat \
+      "protobuf>=3.20,<5" webdataset attrs && \
+    conda run -n vlnce pip install ${PIP_OPTIONS} git+https://github.com/openai/CLIP.git
+
+RUN set -eux; \
+    rm -rf /tmp/habitat-sim; \
+    git clone --depth 1 --branch "${HABITAT_SIM_VLNCE_TAG}" "${HABITAT_SIM_GIT}" /tmp/habitat-sim; \
+    env -u PIP_CONSTRAINT -u LD_LIBRARY_PATH conda run -n vlnce pip install ${PIP_OPTIONS} -r /tmp/habitat-sim/requirements.txt; \
+    git -C /tmp/habitat-sim submodule update --init --depth 1 src/deps/pybind11; \
+    python3 -c "from pathlib import Path; p = Path('/tmp/habitat-sim/src/deps/pybind11/include/pybind11/attr.h'); t = p.read_text(); p.write_text(t if '#include <cstdint>' in t else t.replace('#include \"cast.h\"\\n', '#include \"cast.h\"\\n#include <cstdint>\\n', 1))"; \
+    cd /tmp/habitat-sim; \
+    CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" conda run -n vlnce python setup.py install --headless --with-cuda; \
+    python3 -c "from pathlib import Path; import shutil; ext_dir = Path('/opt/conda/envs/vlnce/lib/python3.9/site-packages/habitat_sim/_ext'); env_lib_dir = Path('/opt/conda/envs/vlnce/lib'); libs = ('libCorradePluginManager', 'libCorradeUtility', 'libCorradeTestSuite'); [((lambda versioned, soname, plain: (None if versioned is None else ((soname.exists() or soname.symlink_to(versioned.name)), (plain.exists() or plain.symlink_to(versioned.name)), shutil.copy2(versioned, env_lib_dir / versioned.name), shutil.copy2(versioned, env_lib_dir / f'{lib_name}.so.2'), shutil.copy2(versioned, env_lib_dir / f'{lib_name}.so'))))(next(ext_dir.glob(f'{lib_name}.so.2.*'), None), ext_dir / f'{lib_name}.so.2', ext_dir / f'{lib_name}.so')) for lib_name in libs]"; \
+    rm -rf /tmp/habitat-sim
+
+RUN set -eux; \
+    rm -rf /tmp/habitat-lab-vlnce; \
+    git clone --depth 1 --branch "${HABITAT_LAB_VLNCE_REF}" "${HABITAT_LAB_GIT}" /tmp/habitat-lab-vlnce; \
+    touch /tmp/habitat-lab-vlnce/README.md /tmp/habitat-lab-vlnce/LICENSE; \
+    env -u PIP_CONSTRAINT -u LD_LIBRARY_PATH conda run -n vlnce pip install ${PIP_OPTIONS} -e /tmp/habitat-lab-vlnce --no-deps
+
+# vllm: isolated environment. This is optional at runtime but useful for the
+# goal-graph parser workflow.
+RUN conda create -n vllm python=3.12 pip -y && \
+    conda run -n vllm pip install ${PIP_OPTIONS} vllm
+
+# Copy and install the project package. Runtime bind mounts can still override
+# /workspace/conftopo with the local working tree.
+WORKDIR ${WORKSPACE}
+COPY setup.py ${WORKSPACE}/setup.py
+COPY conftopo ${WORKSPACE}/conftopo
+COPY scripts ${WORKSPACE}/scripts
+
+RUN conda run -n conftopo-main pip install ${PIP_OPTIONS} -e ${WORKSPACE} && \
+    conda run -n goat pip install ${PIP_OPTIONS} -e ${WORKSPACE} && \
+    env -u PIP_CONSTRAINT -u LD_LIBRARY_PATH conda run -n vlnce pip install ${PIP_OPTIONS} -e ${WORKSPACE}
+
+# Env-specific LD_LIBRARY_PATH handling.
+RUN printf '%s\n' \
+      "export WORKSPACE=${WORKSPACE}" \
+      > /etc/profile.d/conftopo-env.sh && \
+    for env_name in conftopo-main goat vllm; do \
+      mkdir -p /opt/conda/envs/${env_name}/etc/conda/activate.d /opt/conda/envs/${env_name}/etc/conda/deactivate.d; \
+      printf '%s\n' '#!/bin/bash' 'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' 'unset LD_LIBRARY_PATH' \
+        > /opt/conda/envs/${env_name}/etc/conda/activate.d/conftopo_ld_path.sh; \
+      printf '%s\n' '#!/bin/bash' 'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' 'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+        > /opt/conda/envs/${env_name}/etc/conda/deactivate.d/restore_ld_path.sh; \
+    done && \
+    mkdir -p /opt/conda/envs/vlnce/etc/conda/activate.d /opt/conda/envs/vlnce/etc/conda/deactivate.d && \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+      'export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.9/site-packages/habitat_sim/_ext:${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+      > /opt/conda/envs/vlnce/etc/conda/activate.d/conftopo_ld_path.sh && \
+    printf '%s\n' '#!/bin/bash' 'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' 'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+      > /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh && \
+    chmod +x /opt/conda/envs/*/etc/conda/activate.d/conftopo_ld_path.sh /opt/conda/envs/*/etc/conda/deactivate.d/restore_ld_path.sh
+
+RUN conda init bash && \
+    printf '%s\n' \
+      '' \
+      'source /etc/profile.d/conftopo-env.sh' \
+      '[ -f /opt/conda/etc/profile.d/conda.sh ] && source /opt/conda/etc/profile.d/conda.sh' \
+      'alias conftopo-main="conda activate conftopo-main"' \
+      'alias conftopo-goat="conda activate goat"' \
+      'alias conftopo-vlnce="conda activate vlnce"' \
+      'alias conftopo-etp="conda activate vlnce"' \
+      'alias vllm-env="conda activate vllm"' \
+      >> /root/.bashrc
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/bash", "-l"]

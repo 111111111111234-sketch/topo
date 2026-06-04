@@ -21,7 +21,7 @@ from run_goat_minimal import (
 )
 from conftopo.agents.goat_agent import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
-from conftopo.core.instruction_graph import GoalNode
+from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 from conftopo.perception import ClipRuntimeEncoder
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
 
@@ -110,6 +110,65 @@ def current_goal_summary(ig) -> dict[str, Any]:
             "target_embedding_dim": None if goal.target_embedding is None else int(goal.target_embedding.shape[-1]),
         }
     return {"goal": str(goal)}
+
+
+GOAL_MODALITY_ALIASES = {
+    "object": {"object", "category"},
+    "instruction": {"instruction", "description"},
+    "description": {"instruction", "description"},
+    "image": {"image"},
+}
+
+
+def goal_node_modality(goal: GoalNode) -> str:
+    goal_type = (goal.goal_type or "").lower()
+    if goal_type == "category":
+        return "object"
+    if goal_type == "description":
+        return "instruction"
+    return goal_type or "unknown"
+
+
+def available_goal_modalities(ig: InstructionGraph) -> list[str]:
+    seen = []
+    for goal in ig.goal_nodes:
+        modality = goal_node_modality(goal)
+        if modality not in seen:
+            seen.append(modality)
+    return seen
+
+
+def select_goal_modality(ig: InstructionGraph, requested: str) -> tuple[InstructionGraph, dict[str, Any]]:
+    requested = (requested or "auto").lower()
+    if requested == "auto":
+        current = ig.get_current_goal()
+        return ig, {
+            "requested_goal_modality": "auto",
+            "selected_goal_modality": goal_node_modality(current) if isinstance(current, GoalNode) else "unknown",
+            "selected_goal_index": ig.current_idx,
+            "available_goal_modalities": available_goal_modalities(ig),
+        }
+
+    aliases = GOAL_MODALITY_ALIASES[requested]
+    for idx, goal in enumerate(ig.goal_nodes):
+        if (goal.goal_type or "").lower() in aliases:
+            selected = InstructionGraph(goal_type=ig.goal_type, goal_nodes=[goal])
+            selected.set_current_goal_by_index(0)
+            return selected, {
+                "requested_goal_modality": requested,
+                "selected_goal_modality": goal_node_modality(goal),
+                "selected_goal_index": idx,
+                "available_goal_modalities": available_goal_modalities(ig),
+            }
+
+    available = ", ".join(available_goal_modalities(ig)) or "none"
+    raise ValueError(f"Goal modality '{requested}' not found for this episode. Available: {available}")
+
+
+def planar_distance(a, b) -> float:
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    return float(np.linalg.norm((aa - bb)[[0, 2]]))
 
 
 def semantic_decisions(perception: dict, thresholds: dict) -> dict[str, list[dict[str, Any]]]:
@@ -204,10 +263,11 @@ def main() -> None:
     parser.add_argument("--split", default="val_seen")
     parser.add_argument("--scene", default="4ok3usBNeis")
     parser.add_argument("--episode-index", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=0, help="0 means run until the agent stops")
     parser.add_argument("--dataset-dir", default="data/datasets/goat_bench/hm3d/v1")
     parser.add_argument("--scene-root", default="data/scene_datasets/hm3d")
     parser.add_argument("--goal-graph-dir", default="data/goal_graphs/goat")
+    parser.add_argument("--goal-modality", choices=["auto", "object", "instruction", "description", "image"], default="auto")
     parser.add_argument("--output", default="data/logs/goat_topo/topo_trace_semantic.json")
     parser.add_argument("--frame-dir", default=None)
     parser.add_argument("--clip-model", default="ViT-B/32")
@@ -222,6 +282,7 @@ def main() -> None:
     scene_path, episode = pick_episode(dataset_dir, args.split, args.scene, args.episode_index)
     scene_file = find_scene_file(episode["scene_id"], ROOT / args.scene_root)
     ig = load_goal_graph(ROOT / args.goal_graph_dir, args.split, scene_path, episode["episode_id"])
+    ig, goal_modality_debug = select_goal_modality(ig, args.goal_modality)
 
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
@@ -279,9 +340,12 @@ def main() -> None:
         "scene_file": str(scene_file),
         "episode_file": str(scene_path),
         "episode_id": episode["episode_id"],
+        "origin_world": origin.round(4).tolist(),
+        "start_rotation": episode["start_rotation"],
         "num_tasks": len(episode.get("tasks", [])),
         "tasks": episode.get("tasks", []),
         "goal_type": ig.goal_type,
+        **goal_modality_debug,
         "current_goal": current_goal_summary(ig),
         "embedding_source": "placeholder" if args.use_placeholder_embed else f"clip:{args.clip_model}",
         "thresholds": {
@@ -293,8 +357,9 @@ def main() -> None:
         "steps": [],
     }
 
+    step = 0
     try:
-        for step in range(args.max_steps):
+        while args.max_steps <= 0 or step < args.max_steps:
             obs = sim.get_sensor_observations()
             state = sim_agent.get_state()
             rgb = obs.get("color_sensor")
@@ -324,6 +389,7 @@ def main() -> None:
             target_node_id = out.get("target_node_id")
             candidate_ids = out.get("candidate_ids", []) or []
             scores = np.asarray(out.get("scores", []), dtype=np.float32).tolist()
+            perception = snapshot_perception(agent)
 
             reachable_debug = {"selected": None, "reachable_candidates": [], "unreachable_candidates": []}
             if candidate_ids:
@@ -335,7 +401,10 @@ def main() -> None:
                         target_node_id = node.node_id
                         target = node.position.copy()
 
-            if collision_debug.get("collision_like") and target_node_id is not None:
+            if agent.should_stop():
+                low_action = "stop"
+                navigation_debug = {"reachable": True, "reason": "goal_similarity_stop", "best_goal_sim": float(perception.get("best_goal_sim", 0.0))}
+            elif collision_debug.get("collision_like") and target_node_id is not None:
                 navigation_event = agent.on_navigation_event(target_node_id, "collision_like")
                 low_action = "target_reached"
                 navigation_debug = {"reachable": False, "reason": "collision_like", "release_reason": "collision_like"}
@@ -356,7 +425,14 @@ def main() -> None:
                     if low_action == "unreachable":
                         low_action = "turn_left"
                 if low_action == "target_reached":
-                    navigation_event = agent.on_navigation_event(target_node_id, "target_reached")
+                    target_dist = planar_distance(target, rel_position)
+                    navigation_debug["final_target_distance"] = target_dist
+                    if navigation_debug.get("reason") == "target_reached" or target_dist <= nav_executor.reach_radius:
+                        navigation_event = agent.on_navigation_event(target_node_id, "target_reached")
+                    else:
+                        low_action = "move_forward"
+                        navigation_debug["low_action"] = low_action
+                        navigation_debug["reason"] = "intermediate_waypoint_reached"
 
             navigation_debug["collision_like"] = bool(collision_debug.get("collision_like"))
             navigation_debug["stuck_steps"] = int(collision_debug.get("stuck_steps", 0))
@@ -365,7 +441,6 @@ def main() -> None:
             navigation_debug["unreachable_candidates"] = reachable_debug.get("unreachable_candidates", [])
 
             candidate_scores = [{"node_id": node_id, "score": float(score)} for node_id, score in zip(candidate_ids, scores)]
-            perception = snapshot_perception(agent)
             sticky_debug = dict(out.get("sticky_debug", {}) or {})
             sticky_debug["navigation_debug"] = navigation_debug
             sticky_debug["reachable_candidates"] = reachable_debug.get("reachable_candidates", [])
@@ -409,6 +484,7 @@ def main() -> None:
             if low_action not in ("target_reached", "unreachable"):
                 sim.step(low_action)
             previous_low_action = low_action
+            step += 1
     finally:
         sim.close()
 
@@ -435,7 +511,16 @@ def main() -> None:
     output = ROOT / args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(_tolist(trace), indent=2))
-    print(json.dumps({"ok": True, "output": str(output), "steps": len(trace["steps"]), "final_memory": trace["final_memory"], "final_summary": trace["final_summary"]}, indent=2))
+    print(json.dumps({
+        "ok": True,
+        "output": str(output),
+        "steps": len(trace["steps"]),
+        "requested_goal_modality": trace["requested_goal_modality"],
+        "selected_goal_modality": trace["selected_goal_modality"],
+        "current_goal": trace["current_goal"],
+        "final_memory": trace["final_memory"],
+        "final_summary": trace["final_summary"],
+    }, indent=2))
 
 
 if __name__ == "__main__":
