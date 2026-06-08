@@ -26,6 +26,7 @@ from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType, EdgeType, S
 from conftopo.core.instruction_graph import InstructionGraph, GoalNode
 from conftopo.core.rule_scorer import compute_semantic_bias
 from conftopo.perception.light_perceiver import LightPerceiver
+from conftopo.perception.heavy_perceiver import GroundingDINOBackend, HeavyPerceiver, ObjectObservation
 
 
 def _angle_delta(a: float, b: float) -> float:
@@ -54,8 +55,24 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_vp_id: Optional[str] = None
 
         # Observation cache (set in observe())
+        self._cur_rgb: Optional[Any] = None
         self._cur_rgb_embed: Optional[np.ndarray] = None
         self._cur_perception: Optional[Dict] = None
+        self._cur_heavy_observations: List[ObjectObservation] = []
+        self.heavy_perceiver: Optional[HeavyPerceiver] = (
+            HeavyPerceiver(
+                GroundingDINOBackend(
+                    config_path=self.config.perception.groundingdino_config,
+                    checkpoint_path=self.config.perception.groundingdino_checkpoint,
+                    device=self.config.perception.groundingdino_device,
+                    box_threshold=self.config.perception.object_detection_threshold,
+                    text_threshold=self.config.perception.groundingdino_text_threshold,
+                ),
+                min_confidence=self.config.perception.object_detection_threshold,
+            )
+            if self.config.perception.heavy_enabled
+            else None
+        )
 
         # Frontier generation parameters
         self._frontier_step_size: float = 2.5  # estimated distance for new frontiers
@@ -78,6 +95,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_navigation_event: Dict[str, Any] = {}
         self._last_plan_debug: Dict[str, Any] = {}
         self._environment_landmark_labels: Set[str] = set()
+        self._goal_local_step: int = 0
+        self._last_heavy_step: Optional[int] = None
+        self._heavy_perception_calls: int = 0
+        self._object_merge_count: int = 0
+        self._last_heavy_debug: Dict[str, Any] = {}
 
     def reset(self):
         """Full reset for new episode (clear memory)."""
@@ -87,8 +109,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._heading = 0.0
         self._prev_position = None
         self._cur_vp_id = None
+        self._cur_rgb = None
         self._cur_rgb_embed = None
         self._cur_perception = None
+        self._cur_heavy_observations = []
         self._goal_idx = 0
         self._goals_completed = 0
         self._sticky_target_id = None
@@ -101,10 +125,20 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates = []
         self._last_navigation_event = {}
         self._last_plan_debug = {}
+        self._goal_local_step = 0
+        self._last_heavy_step = None
+        self._heavy_perception_calls = 0
+        self._object_merge_count = 0
+        self._last_heavy_debug = {}
 
     def set_environment_landmark_labels(self, labels: List[str]) -> None:
         """Mark landmark labels that are scene-level anchors rather than goal hints."""
         self._environment_landmark_labels = {str(label) for label in labels}
+
+    def set_heavy_perceiver(self, perceiver: Optional[HeavyPerceiver]) -> None:
+        """Inject a heavy perceiver backend, mainly for tests and offline runs."""
+        self.heavy_perceiver = perceiver
+        self.config.perception.heavy_enabled = perceiver is not None
 
     def set_new_goal(self, goal: GoalNode):
         """Switch to a new goal within the same episode (memory preserved).
@@ -136,6 +170,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             )
 
         self._goal_idx += 1
+        self._goal_local_step = 0
+        self._last_heavy_step = None
 
     def observe(self, obs: Dict[str, Any]) -> None:
         """Process current observation.
@@ -148,6 +184,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             - 'depth' (optional): depth image
         """
         raw_position = np.array(obs['position'], dtype=np.float32)
+        self._cur_rgb = obs.get("rgb")
         if self._origin_position is None:
             self._origin_position = raw_position.copy()
         self._prev_position = self._position
@@ -167,6 +204,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             self._cur_perception = self.perceiver.perceive(self._cur_rgb_embed)
         else:
             self._cur_perception = {}
+        self._cur_heavy_observations = []
 
     def update_memory(self) -> None:
         """Update DynamicTopoMap with new information.
@@ -180,6 +218,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return
 
         self.topo_map.step()
+        self._goal_local_step += 1
 
         # 1. Add/update visited waypoint
         cur_vp = self._add_visited_waypoint()
@@ -187,7 +226,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._consume_reached_frontiers(cur_vp)
 
         # 2. Add semantic nodes (room, landmark detection)
-        self._add_semantic_nodes(cur_vp)
+        room_id = self._add_semantic_nodes(cur_vp)
+
+        # 2b. Add object-level heavy detections when triggered
+        self._add_heavy_object_nodes(cur_vp, room_id)
 
         # 3. Generate frontier-like nodes
         self._generate_frontiers(cur_vp)
@@ -195,6 +237,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         # 4. Memory maintenance
         self.topo_map.decay_all_confidences()
         self.topo_map.merge_nearby_nodes(NodeType.WAYPOINT_FRONTIER)
+        self.topo_map.adaptive_granularity(self._position)
         if self.topo_map.num_nodes > self.config.memory.max_nodes:
             self.topo_map.prune_low_confidence()
 
@@ -364,12 +407,13 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "sticky_debug": self._last_plan_debug,
         }
 
-    def _add_semantic_nodes(self, cur_vp: str) -> None:
+    def _add_semantic_nodes(self, cur_vp: str) -> Optional[str]:
         """Add room/landmark/object nodes from perception results."""
         if not self._cur_perception:
-            return
+            return None
 
         pcfg = self.config.perception
+        room_id = None
 
         # Room node
         room_label = self._cur_perception.get("room_label", "unknown")
@@ -384,6 +428,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 matched_room.step_id = self.topo_map.current_step
                 if self._cur_rgb_embed is not None:
                     matched_room.embedding = self._cur_rgb_embed
+                room_id = matched_room.node_id
             else:
                 room_id = self.topo_map.add_node(
                     NodeType.ROOM,
@@ -446,6 +491,121 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     },
                 )
                 self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
+        return room_id
+
+    def _heavy_labels(self) -> List[str]:
+        labels: List[str] = []
+        goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
+        if goal is not None and getattr(goal, "target_object", None):
+            labels.append(str(goal.target_object))
+            labels.extend(str(a) for a in getattr(goal, "attributes", []) if a)
+            labels.extend(str(lm) for lm in getattr(goal, "landmarks", []) if lm)
+        for label, sim in (self._cur_perception or {}).get("goal_scores", []):
+            if float(sim) >= self.config.perception.object_threshold:
+                labels.append(str(label))
+        seen = set()
+        return [x for x in labels if not (x in seen or seen.add(x))]
+
+    def _should_run_heavy_perception(self) -> Tuple[bool, str]:
+        pcfg = self.config.perception
+        if not pcfg.heavy_enabled or self.heavy_perceiver is None:
+            return False, "disabled"
+        if self._cur_rgb is None:
+            return False, "missing_rgb"
+        interval = max(1, int(pcfg.heavy_interval))
+        if self._last_heavy_step is not None and self.topo_map.current_step - self._last_heavy_step < interval:
+            return False, "cooldown"
+        if self._last_heavy_step is None and self._goal_local_step <= max(1, int(pcfg.heavy_goal_warmup_steps)):
+            return True, "goal_warmup"
+        if self.topo_map.current_step % interval == 0:
+            return True, "interval"
+        if float((self._cur_perception or {}).get("best_goal_sim", 0.0)) >= pcfg.heavy_goal_sim_threshold:
+            return True, "high_goal_similarity"
+        if pcfg.heavy_on_frontier and self._position is not None:
+            nearby_frontiers = self.topo_map.find_nodes_within_radius(
+                self._position,
+                self.config.memory.near_radius,
+                NodeType.WAYPOINT_FRONTIER,
+            )
+            if nearby_frontiers:
+                return True, "frontier_context"
+        object_nodes = self.topo_map.get_nodes_by_type(NodeType.OBJECT)
+        if not object_nodes or max(n.confidence for n in object_nodes) < pcfg.heavy_low_object_confidence:
+            return True, "low_object_confidence"
+        return False, "not_triggered"
+
+    def _object_position_from_bbox(self, bbox: List[float], heading: float) -> np.ndarray:
+        if self._position is None:
+            return np.zeros(3, dtype=np.float32)
+        x1, _, x2, _ = [float(v) for v in bbox]
+        cx = (x1 + x2) * 0.5
+        # Assume normalized bbox if values are <= 1, otherwise use a 640px image width fallback.
+        image_width = 1.0 if max(abs(x1), abs(x2)) <= 1.0 else 640.0
+        centered = (cx / image_width) - 0.5
+        bearing = heading - centered * 1.2
+        dist = min(self.config.memory.near_radius, 2.0)
+        return np.array([
+            self._position[0] - dist * np.sin(bearing),
+            self._position[1],
+            self._position[2] - dist * np.cos(bearing),
+        ], dtype=np.float32)
+
+    def _add_heavy_object_nodes(self, cur_vp: str, room_id: Optional[str]) -> None:
+        should_run, reason = self._should_run_heavy_perception()
+        self._last_heavy_debug = {"ran": False, "reason": reason, "detections": 0}
+        if not should_run:
+            return
+        labels = self._heavy_labels()
+        if not labels:
+            self._last_heavy_debug = {"ran": False, "reason": "no_labels", "detections": 0}
+            return
+        try:
+            observations = self.heavy_perceiver.perceive(
+                self._cur_rgb,
+                labels,
+                visual_embedding=self._cur_rgb_embed,
+                view_heading=self._heading,
+                step_id=self.topo_map.current_step,
+            )
+        except RuntimeError as exc:
+            self._last_heavy_debug = {"ran": False, "reason": f"backend_unavailable:{exc}", "detections": 0}
+            return
+
+        self._last_heavy_step = self.topo_map.current_step
+        self._heavy_perception_calls += 1
+        self._cur_heavy_observations = observations
+        goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
+        room_label = self._cur_perception.get("room_label") if self._cur_perception else None
+        room_priors = set(getattr(goal, "room_prior", []) or [])
+        merges = 0
+        for obs in observations:
+            target_relevance = 1.0 if goal is not None and obs.label == getattr(goal, "target_object", None) else 0.0
+            room_prior_score = 1.0 if room_label in room_priors else 0.0
+            obj_id, merged = self.topo_map.upsert_object_observation(
+                label=obs.label,
+                bbox=obs.bbox,
+                confidence=obs.confidence,
+                position=self._object_position_from_bbox(obs.bbox, obs.view_heading),
+                embedding=obs.embedding,
+                viewpoint_id=cur_vp,
+                view_heading=obs.view_heading,
+                room_context=room_label,
+                target_relevance=target_relevance,
+                room_prior_score=room_prior_score,
+                source=obs.source,
+            )
+            if room_id is not None:
+                self.topo_map.add_edge(obj_id, room_id, EdgeType.BELONGS_TO)
+            if merged:
+                merges += 1
+                self._object_merge_count += 1
+        self._last_heavy_debug = {
+            "ran": True,
+            "reason": reason,
+            "detections": len(observations),
+            "labels": labels,
+            "merged": merges,
+        }
 
     def _generate_frontiers(self, cur_vp: str) -> None:
         """Generate frontier-like nodes from unexplored directions.
@@ -679,18 +839,24 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     # ==================== Statistics ====================
 
     @property
-    def memory_stats(self) -> Dict[str, int]:
+    def memory_stats(self) -> Dict[str, Any]:
         """Return memory statistics for analysis."""
+        object_nodes = self.topo_map.get_nodes_by_type(NodeType.OBJECT)
+        mean_object_conf = float(np.mean([n.confidence for n in object_nodes])) if object_nodes else 0.0
         return {
             "total_nodes": self.topo_map.num_nodes,
             "visited_waypoints": len(self.topo_map.get_visited()),
             "frontiers": len(self.topo_map.get_frontiers()),
             "candidate_waypoints": len(self.topo_map.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)),
-            "objects": len(self.topo_map.get_nodes_by_type(NodeType.OBJECT)),
+            "objects": len(object_nodes),
             "rooms": len(self.topo_map.get_nodes_by_type(NodeType.ROOM)),
             "landmarks": len(self.topo_map.get_nodes_by_type(NodeType.LANDMARK)),
             "step": self._step_count,
             "goals_completed": self._goals_completed,
             "consumed_frontiers": len(self._consumed_frontier_ids),
             "blocked_targets": len(self._active_blocked_targets()),
+            "heavy_perception_calls": self._heavy_perception_calls,
+            "object_merge_count": self._object_merge_count,
+            "mean_object_confidence": mean_object_conf,
+            "last_heavy": self._last_heavy_debug,
         }

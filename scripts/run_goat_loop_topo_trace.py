@@ -263,6 +263,12 @@ def main() -> None:
     parser.add_argument("--clip-model", default="ViT-B/32")
     parser.add_argument("--clip-device", default="auto")
     parser.add_argument("--object-threshold", type=float, default=None)
+    parser.add_argument("--heavy-enabled", action="store_true")
+    parser.add_argument("--heavy-interval", type=int, default=None)
+    parser.add_argument("--object-detection-threshold", type=float, default=None)
+    parser.add_argument("--groundingdino-config", default=None)
+    parser.add_argument("--groundingdino-checkpoint", default=None)
+    parser.add_argument("--groundingdino-device", default=None)
     parser.add_argument("--room-threshold", type=float, default=None)
     parser.add_argument("--landmark-threshold", type=float, default=None)
     parser.add_argument(
@@ -294,6 +300,17 @@ def main() -> None:
     config.perception.clip_device = args.clip_device
     if args.object_threshold is not None:
         config.perception.object_threshold = args.object_threshold
+    config.perception.heavy_enabled = bool(args.heavy_enabled)
+    if args.heavy_interval is not None:
+        config.perception.heavy_interval = args.heavy_interval
+    if args.object_detection_threshold is not None:
+        config.perception.object_detection_threshold = args.object_detection_threshold
+    if args.groundingdino_config is not None:
+        config.perception.groundingdino_config = args.groundingdino_config
+    if args.groundingdino_checkpoint is not None:
+        config.perception.groundingdino_checkpoint = args.groundingdino_checkpoint
+    if args.groundingdino_device is not None:
+        config.perception.groundingdino_device = args.groundingdino_device
     if args.room_threshold is not None:
         config.perception.room_threshold = args.room_threshold
     if args.landmark_threshold is not None:
@@ -479,6 +496,9 @@ def main() -> None:
         "collision_like_count": sum(1 for st in trace["steps"] if st.get("collision_like")),
         "frontier_visited_count": agent.memory_stats.get("consumed_frontiers", 0),
         "semantic_node_count": agent.memory_stats.get("objects", 0) + agent.memory_stats.get("rooms", 0) + agent.memory_stats.get("landmarks", 0),
+        "heavy_perception_calls": agent.memory_stats.get("heavy_perception_calls", 0),
+        "object_merge_count": agent.memory_stats.get("object_merge_count", 0),
+        "mean_object_confidence": agent.memory_stats.get("mean_object_confidence", 0.0),
         "memory_reuse_count": memory_reuse_count(trace["steps"]),
         "target_switch_count": count_target_switches(trace["steps"]),
         "path_length_relative": path_length(trace["steps"]),

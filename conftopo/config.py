@@ -20,11 +20,21 @@ class MemoryConfig:
 @dataclass
 class PerceptionConfig:
     light_every_step: bool = True
+    heavy_enabled: bool = False
     heavy_interval: int = 5
     heavy_on_frontier: bool = True
+    heavy_goal_warmup_steps: int = 1
+    heavy_goal_sim_threshold: float = 0.35
+    heavy_low_object_confidence: float = 0.35
+    heavy_backend: str = "groundingdino"
+    groundingdino_config: Optional[str] = None
+    groundingdino_checkpoint: Optional[str] = None
+    groundingdino_device: str = "cpu"
+    groundingdino_text_threshold: float = 0.25
     clip_model: str = "ViT-B/32"
     clip_device: str = "auto"
     object_threshold: float = 0.23
+    object_detection_threshold: float = 0.25
     room_threshold: float = 0.20
     landmark_threshold: float = 0.22
     # 房间类型标签

@@ -11,6 +11,10 @@ class ConfidenceFactors:
     multi_view_count: int = 1       # how many views confirmed this node
     task_relevance: float = 0.0     # relevance to current goal
     time_decay: float = 1.0         # temporal decay factor
+    room_prior_score: float = 0.0   # whether the object fits the current/goal room
+    redundancy_penalty: float = 0.0 # repeated weak observations
+    conflict_penalty: float = 0.0   # nearby conflicting labels/geometry
+    staleness_steps: int = 0        # steps since last observation
     # For waypoint nodes
     navigability: float = 0.5       # confirmed navigable?
     execution_success: float = 0.0  # successfully visited?
@@ -23,7 +27,8 @@ SEMANTIC_WEIGHTS = {
     "detection": 0.3,
     "multi_view": 0.25,
     "task_relevance": 0.2,
-    "time_decay": 0.25,
+    "room_prior": 0.15,
+    "time_decay": 0.1,
 }
 
 # Default weights for topological nodes (waypoint / frontier)
@@ -43,17 +48,22 @@ def compute_semantic_confidence(factors: ConfidenceFactors) -> float:
     """
     multi_view_bonus = min(1.0, factors.multi_view_count / 3.0)
 
+    staleness_decay = factors.time_decay * (0.98 ** max(0, factors.staleness_steps))
+    penalty = 0.2 * min(1.0, factors.redundancy_penalty) + 0.35 * min(1.0, factors.conflict_penalty)
+
     base = (
         SEMANTIC_WEIGHTS["detection"] * factors.detection_score
         + SEMANTIC_WEIGHTS["multi_view"] * multi_view_bonus
         + SEMANTIC_WEIGHTS["task_relevance"] * factors.task_relevance
+        + SEMANTIC_WEIGHTS["room_prior"] * factors.room_prior_score
     )
     max_base = (
         SEMANTIC_WEIGHTS["detection"]
         + SEMANTIC_WEIGHTS["multi_view"]
         + SEMANTIC_WEIGHTS["task_relevance"]
+        + SEMANTIC_WEIGHTS["room_prior"]
     )
-    score = (base / max_base) * factors.time_decay
+    score = max(factors.detection_score, base / max_base) * staleness_decay - penalty
 
     return float(np.clip(score, 0.0, 1.0))
 

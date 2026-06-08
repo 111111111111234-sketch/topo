@@ -1,10 +1,12 @@
 """DynamicTopoMap: confidence-aware semantic topological memory graph."""
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from enum import Enum
 import numpy as np
 import networkx as nx
+
+from conftopo.core.confidence import ConfidenceFactors, compute_semantic_confidence
 
 
 class NodeType(Enum):
@@ -34,7 +36,34 @@ class SemanticNode:
     label: str = ""
     step_id: int = 0  # when this node was created/last updated
     visit_count: int = 0
-    attributes: Dict[str, any] = field(default_factory=dict)
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+
+def _bbox_iou(a: List[float], b: List[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    return 0.0 if denom <= 0.0 else float(inter / denom)
+
+
+def _embedding_similarity(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+    if a is None or b is None:
+        return 0.0
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a < 1e-8 or norm_b < 1e-8:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def _angle_delta(a: float, b: float) -> float:
+    return float((a - b + np.pi) % (2 * np.pi) - np.pi)
 
 
 class DynamicTopoMap:
@@ -254,6 +283,209 @@ class DynamicTopoMap:
                 decay = self.confidence_decay ** steps_since_update
                 node.confidence *= decay
 
+    # ==================== Object Observation Operations ====================
+
+    def upsert_object_observation(
+        self,
+        *,
+        label: str,
+        bbox: List[float],
+        confidence: float,
+        position: np.ndarray,
+        embedding: Optional[np.ndarray] = None,
+        viewpoint_id: Optional[str] = None,
+        view_heading: float = 0.0,
+        room_context: Optional[str] = None,
+        target_relevance: float = 0.0,
+        room_prior_score: float = 0.0,
+        source: str = "heavy",
+    ) -> Tuple[str, bool]:
+        """Create or update an object node from an object-level observation.
+
+        Returns (node_id, merged_existing).
+        """
+        label = str(label)
+        pos = np.array(position, dtype=np.float32)
+        emb = np.array(embedding, dtype=np.float32) if embedding is not None else None
+        matches = self.find_nodes_within_radius(pos, self.merge_radius * 2.0, NodeType.OBJECT)
+        match = self._best_object_match(matches, label, bbox, emb, view_heading, pos)
+
+        if match is None:
+            attrs = self._new_object_attributes(
+                bbox=bbox,
+                confidence=confidence,
+                viewpoint_id=viewpoint_id,
+                view_heading=view_heading,
+                room_context=room_context,
+                source=source,
+                target_relevance=target_relevance,
+                room_prior_score=room_prior_score,
+            )
+            node_id = self.add_node(
+                NodeType.OBJECT,
+                position=pos,
+                embedding=emb,
+                confidence=compute_semantic_confidence(ConfidenceFactors(
+                    detection_score=confidence,
+                    multi_view_count=1,
+                    task_relevance=target_relevance,
+                    room_prior_score=room_prior_score,
+                )),
+                label=label,
+                attributes=attrs,
+            )
+            if viewpoint_id is not None:
+                self.add_edge(viewpoint_id, node_id, EdgeType.OBSERVED_AT)
+            return node_id, False
+
+        self._merge_object_observation(
+            match,
+            bbox=bbox,
+            confidence=confidence,
+            position=pos,
+            embedding=emb,
+            viewpoint_id=viewpoint_id,
+            view_heading=view_heading,
+            room_context=room_context,
+            source=source,
+            target_relevance=target_relevance,
+            room_prior_score=room_prior_score,
+        )
+        if viewpoint_id is not None:
+            self.add_edge(viewpoint_id, match.node_id, EdgeType.OBSERVED_AT)
+        return match.node_id, True
+
+    def _best_object_match(
+        self,
+        candidates: List[SemanticNode],
+        label: str,
+        bbox: List[float],
+        embedding: Optional[np.ndarray],
+        view_heading: float,
+        position: np.ndarray,
+    ) -> Optional[SemanticNode]:
+        best = None
+        best_score = -1.0
+        for node in candidates:
+            if node.label != label:
+                continue
+            last_bbox = node.attributes.get("last_bbox") or bbox
+            bbox_score = _bbox_iou(last_bbox, bbox)
+            heading = float(node.attributes.get("last_view_heading", view_heading))
+            heading_score = 1.0 if abs(_angle_delta(heading, view_heading)) <= 0.45 else 0.0
+            emb_score = _embedding_similarity(node.embedding, embedding)
+            dist = float(np.linalg.norm(node.position - position))
+            score = max(bbox_score, heading_score * 0.8, emb_score)
+            if dist < self.merge_radius:
+                score = max(score, 0.5)
+            if score > best_score and score >= 0.45:
+                best = node
+                best_score = score
+        return best
+
+    def _new_object_attributes(
+        self,
+        *,
+        bbox: List[float],
+        confidence: float,
+        viewpoint_id: Optional[str],
+        view_heading: float,
+        room_context: Optional[str],
+        source: str,
+        target_relevance: float,
+        room_prior_score: float,
+    ) -> Dict[str, Any]:
+        obs = {
+            "bbox": [float(v) for v in bbox],
+            "confidence": float(confidence),
+            "viewpoint_id": viewpoint_id,
+            "view_heading": float(view_heading),
+            "step_id": self._current_step,
+            "source": source,
+        }
+        return {
+            "bbox_observations": [obs],
+            "detection_scores": [float(confidence)],
+            "viewpoints": [viewpoint_id] if viewpoint_id is not None else [],
+            "first_seen_step": self._current_step,
+            "last_seen_step": self._current_step,
+            "multi_view_count": 1,
+            "room_context": room_context,
+            "granularity": "object",
+            "last_bbox": [float(v) for v in bbox],
+            "last_view_heading": float(view_heading),
+            "target_relevance": float(target_relevance),
+            "room_prior_score": float(room_prior_score),
+            "redundancy_penalty": 0.0,
+            "conflict_penalty": 0.0,
+            "source": source,
+        }
+
+    def _merge_object_observation(
+        self,
+        node: SemanticNode,
+        *,
+        bbox: List[float],
+        confidence: float,
+        position: np.ndarray,
+        embedding: Optional[np.ndarray],
+        viewpoint_id: Optional[str],
+        view_heading: float,
+        room_context: Optional[str],
+        source: str,
+        target_relevance: float,
+        room_prior_score: float,
+    ) -> None:
+        attrs = node.attributes
+        obs = {
+            "bbox": [float(v) for v in bbox],
+            "confidence": float(confidence),
+            "viewpoint_id": viewpoint_id,
+            "view_heading": float(view_heading),
+            "step_id": self._current_step,
+            "source": source,
+        }
+        attrs.setdefault("bbox_observations", []).append(obs)
+        attrs.setdefault("detection_scores", []).append(float(confidence))
+        if viewpoint_id is not None and viewpoint_id not in attrs.setdefault("viewpoints", []):
+            attrs["viewpoints"].append(viewpoint_id)
+        attrs["last_seen_step"] = self._current_step
+        attrs["last_bbox"] = [float(v) for v in bbox]
+        attrs["last_view_heading"] = float(view_heading)
+        attrs["multi_view_count"] = max(1, len(attrs.get("viewpoints", [])), len(attrs.get("bbox_observations", [])))
+        if room_context is not None:
+            attrs["room_context"] = room_context
+        attrs["target_relevance"] = max(float(attrs.get("target_relevance", 0.0)), float(target_relevance))
+        attrs["room_prior_score"] = max(float(attrs.get("room_prior_score", 0.0)), float(room_prior_score))
+        low_scores = [s for s in attrs.get("detection_scores", []) if float(s) < 0.35]
+        attrs["redundancy_penalty"] = max(0.0, (len(low_scores) - 1) / 5.0)
+        attrs["conflict_penalty"] = self._nearby_conflict_penalty(node, position)
+        node.position = (node.position * max(1, node.visit_count) + position) / (max(1, node.visit_count) + 1)
+        node.visit_count += 1
+        if embedding is not None:
+            if node.embedding is None:
+                node.embedding = embedding
+            elif confidence >= max(attrs.get("detection_scores", [confidence])):
+                node.embedding = embedding
+            else:
+                node.embedding = (0.8 * node.embedding + 0.2 * embedding).astype(np.float32)
+        node.step_id = self._current_step
+        node.confidence = compute_semantic_confidence(ConfidenceFactors(
+            detection_score=max(float(s) for s in attrs.get("detection_scores", [confidence])),
+            multi_view_count=int(attrs["multi_view_count"]),
+            task_relevance=float(attrs.get("target_relevance", 0.0)),
+            room_prior_score=float(attrs.get("room_prior_score", 0.0)),
+            redundancy_penalty=float(attrs.get("redundancy_penalty", 0.0)),
+            conflict_penalty=float(attrs.get("conflict_penalty", 0.0)),
+        ))
+
+    def _nearby_conflict_penalty(self, node: SemanticNode, position: np.ndarray) -> float:
+        conflicts = 0
+        for other in self.find_nodes_within_radius(position, self.merge_radius, NodeType.OBJECT):
+            if other.node_id != node.node_id and other.label != node.label:
+                conflicts += 1
+        return min(1.0, conflicts / 3.0)
+
     # ==================== Memory Management ====================
 
     def add_candidate_waypoint(
@@ -368,8 +600,11 @@ class DynamicTopoMap:
                 and node.node_type == NodeType.OBJECT
                 and node.confidence < 0.5
             ):
-                # Far, low-confidence objects → mark for potential room-level merge
-                node.attributes["granularity"] = "coarse"
+                node.attributes["granularity"] = "room_level"
+            elif node.node_type == NodeType.OBJECT and dist <= self.near_radius:
+                node.attributes["granularity"] = "object"
+            elif node.node_type == NodeType.OBJECT:
+                node.attributes["granularity"] = "landmark"
 
     # ==================== Shortest Path ====================
 

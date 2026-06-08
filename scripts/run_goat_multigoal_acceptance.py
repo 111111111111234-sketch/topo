@@ -270,6 +270,12 @@ def main():
     ap.add_argument("--clip-model", default="ViT-B/32")
     ap.add_argument("--clip-device", default="auto")
     ap.add_argument("--object-threshold", type=float, default=None)
+    ap.add_argument("--heavy-enabled", action="store_true")
+    ap.add_argument("--heavy-interval", type=int, default=None)
+    ap.add_argument("--object-detection-threshold", type=float, default=None)
+    ap.add_argument("--groundingdino-config", default=None)
+    ap.add_argument("--groundingdino-checkpoint", default=None)
+    ap.add_argument("--groundingdino-device", default=None)
     ap.add_argument("--room-threshold", type=float, default=None)
     ap.add_argument("--landmark-threshold", type=float, default=None)
     ap.add_argument(
@@ -307,6 +313,17 @@ def main():
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
     config.perception.clip_device = args.clip_device
+    config.perception.heavy_enabled = bool(args.heavy_enabled)
+    if args.heavy_interval is not None:
+        config.perception.heavy_interval = args.heavy_interval
+    if args.object_detection_threshold is not None:
+        config.perception.object_detection_threshold = args.object_detection_threshold
+    if args.groundingdino_config is not None:
+        config.perception.groundingdino_config = args.groundingdino_config
+    if args.groundingdino_checkpoint is not None:
+        config.perception.groundingdino_checkpoint = args.groundingdino_checkpoint
+    if args.groundingdino_device is not None:
+        config.perception.groundingdino_device = args.groundingdino_device
     if "object" in thresholds:
         config.perception.object_threshold = float(thresholds["object"])
     if "room" in thresholds:
@@ -460,6 +477,9 @@ def main():
             "memory_reuse_count": sum(t["memory_reuse_hits"] for t in tasks),
             "semantic_reuse_count": sum(t["semantic_reuse_hits"] for t in tasks),
             "semantic_node_count": agent.memory_stats["objects"] + agent.memory_stats["rooms"] + agent.memory_stats["landmarks"],
+            "heavy_perception_calls": agent.memory_stats.get("heavy_perception_calls", 0),
+            "object_merge_count": agent.memory_stats.get("object_merge_count", 0),
+            "mean_object_confidence": agent.memory_stats.get("mean_object_confidence", 0.0),
             "collision_like_count": sum(1 for st in steps if st.get("collision_like")),
         },
     }
