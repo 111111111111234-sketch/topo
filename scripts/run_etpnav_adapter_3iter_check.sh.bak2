@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run this from the repository root in an environment where ETPNav/Habitat works.
+# It compares the original ETPNav GraphMap path with the ConfTopo adapter path
+# for a minimal 3-iteration training smoke check.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR=""
+for candidate in "$SCRIPT_DIR/../.." "$SCRIPT_DIR/.." "$PWD"; do
+  candidate="$(cd "$candidate" && pwd)"
+  if [[ -d "$candidate/ETPNav" && -d "$candidate/topo" ]]; then
+    ROOT_DIR="$candidate"
+    break
+  fi
+done
+if [[ -z "$ROOT_DIR" ]]; then
+  echo "Could not find repository root containing both ETPNav and topo." >&2
+  exit 1
+fi
+ETP_DIR="$ROOT_DIR/ETPNav"
+OUT_DIR="$ROOT_DIR/topo/data/logs/etpnav_adapter_3iter_check"
+mkdir -p "$OUT_DIR"
+
+COMMON_ARGS=(
+  --run-type train
+  --exp-config run_r2r/iter_train.yaml
+  SIMULATOR_GPU_IDS "[0]"
+  TORCH_GPU_IDS "[0]"
+  GPU_NUMBERS 1
+  NUM_ENVIRONMENTS 1
+  IL.iters 3
+  IL.log_every 1
+  IL.batch_size 1
+  IL.load_from_ckpt False
+  IL.is_requeue False
+  IL.waypoint_aug False
+  TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.ALLOW_SLIDING True
+  MODEL.pretrained_path data/pretrained/ETP/mlm.sap_r2r/ckpts/model_step_82500.pt
+)
+
+cd "$ETP_DIR"
+
+echo "[1/2] Running original ETPNav GraphMap for 3 iterations"
+python run.py \
+  --exp_name conftopo_adapter_check_baseline \
+  "${COMMON_ARGS[@]}" \
+  MODEL.use_conftopo_adapter False \
+  2>&1 | tee "$OUT_DIR/baseline_3iter.log"
+
+echo "[2/2] Running ConfTopo ETPNav adapter for 3 iterations"
+PYTHONPATH="$ROOT_DIR/topo:${PYTHONPATH:-}" python run.py \
+  --exp_name conftopo_adapter_check_adapter \
+  "${COMMON_ARGS[@]}" \
+  MODEL.use_conftopo_adapter True \
+  2>&1 | tee "$OUT_DIR/adapter_3iter.log"
+
+cat > "$OUT_DIR/README.md" <<'EOF'
+# ETPNav Adapter 3-Iteration Check
+
+This directory contains smoke-test logs for Phase 1 ETPNav compatibility:
+
+- `baseline_3iter.log`: original ETPNav `GraphMap`
+- `adapter_3iter.log`: `ConfTopoETPNavAdapter` wrapping ETPNav `GraphMap`
+
+Passing criterion: both runs complete 3 training iterations without error.
+For strict loss comparison, compare the per-iteration loss lines in both logs.
+EOF
+
+echo "Logs written to $OUT_DIR"

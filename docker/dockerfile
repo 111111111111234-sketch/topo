@@ -229,7 +229,8 @@ LABEL org.opencontainers.image.description="backfill fixes + habitat-lab + conft
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MAX_JOBS=1
 ENV WORKSPACE=/workspace/tangyx7@xiaopeng.com
-ENV CONFTopo_MAIN_PYTHON=/usr/bin/python3
+ENV CONFTopo_MAIN_ENV=conftopo-main
+ENV CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python
 ENV MAGNUM_LOG=quiet
 ENV GLOG_minloglevel=2
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
@@ -250,6 +251,8 @@ RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
 
 # A2. conda 激活时清除 LD_LIBRARY_PATH（避免主环境 PyTorch 3.12 污染 goat/vlnce）
 RUN mkdir -p \
+    /opt/conda/envs/conftopo-main/etc/conda/activate.d \
+    /opt/conda/envs/conftopo-main/etc/conda/deactivate.d \
       /opt/conda/envs/vlnce/etc/conda/activate.d \
       /opt/conda/envs/vlnce/etc/conda/deactivate.d \
       /opt/conda/envs/goat/etc/conda/activate.d \
@@ -258,6 +261,18 @@ RUN mkdir -p \
       '#!/bin/bash' \
       'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
       'unset LD_LIBRARY_PATH' \
+            > /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh && \
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+            'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+            > /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
+        chmod +x /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh \
+                         /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+            'unset LD_LIBRARY_PATH' \
       > /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh && \
     printf '%s\n' \
       '#!/bin/bash' \
@@ -275,7 +290,8 @@ RUN mkdir -p \
 RUN printf '%s\n' \
       '# ConfTopo runtime defaults (Stage 4 backfill)' \
       'export WORKSPACE=/workspace/tangyx7@xiaopeng.com' \
-      'export CONFTopo_MAIN_PYTHON=/usr/bin/python3' \
+    'export CONFTopo_MAIN_ENV=conftopo-main' \
+    'export CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python' \
       'export MAGNUM_LOG=quiet' \
       'export GLOG_minloglevel=2' \
       'export NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display' \
@@ -288,7 +304,7 @@ RUN mkdir -p /opt/conftopo-env/bin && \
       '' \
       '# CONFTOPO_ENV_MARKER' \
       'source /etc/profile.d/conftopo-env.sh' \
-      'alias conftopo-main="${CONFTopo_MAIN_PYTHON}"' \
+    'alias conftopo-main="conda activate conftopo-main"' \
       'alias start-vllm="/opt/conftopo-env/bin/start-vllm.sh"' \
       'alias verify-envs="/opt/conftopo-env/bin/verify-envs.sh"' \
       '[ -f /opt/conda/etc/profile.d/conda.sh ] && source /opt/conda/etc/profile.d/conda.sh' \
@@ -306,6 +322,20 @@ COPY docker_build/start-vllm.sh docker_build/verify-envs.sh /opt/conftopo-env/bi
 RUN chmod +x /opt/conftopo-env/bin/*.sh
 
 RUN mkdir -p ${WORKSPACE}
+
+RUN conda create -n conftopo-main python=3.12 pip -y && \
+        conda run -n conftopo-main pip install --no-cache-dir ${PIP_OPTIONS} \
+            "setuptools<75" "packaging>=24.2" \
+            numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
+            pillow tqdm pyyaml networkx==3.2.1 \
+            imageio imageio-ffmpeg h5py lmdb numba \
+            opencv-python-headless \
+            gym==0.26.2 hydra-core omegaconf yacs jsonlines \
+            msgpack msgpack-numpy numpy-quaternion \
+            'transformers>=4.40' timm==1.0.27 \
+            open_clip_torch==3.3.0 ftfy regex \
+            openai safetensors huggingface_hub gdown requests \
+            tensorboardX easydict natsort
 
 # 主环境: conftopo editable
 RUN ${CONFTopo_MAIN_PYTHON} -m pip install --no-cache-dir -e /opt/conftopo-src ${PIP_OPTIONS}

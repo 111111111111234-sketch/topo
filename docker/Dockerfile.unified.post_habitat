@@ -1,0 +1,94 @@
+ARG BASE_IMAGE=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:tangyx7-260601-0237
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="conftopo-vlnce-patch-post-habitat"
+LABEL org.opencontainers.image.description="unified patch split stage 2: habitat-sim build and lower-half unified steps"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MAX_JOBS=1
+ENV TZ=Asia/Shanghai
+ENV WORKSPACE=/workspace/tangyx7@xiaopeng.com
+ENV CONFTopo_MAIN_ENV=conftopo-main
+ENV CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python
+ENV MAGNUM_LOG=quiet
+ENV GLOG_minloglevel=2
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+ARG PIP_OPTIONS="-i https://nexus-wl.xiaopeng.link/repository/ai_infra_pypi_group/simple --timeout 600 --no-cache-dir"
+ARG HABITAT_SIM_TAG=v0.1.7
+ARG HABITAT_SIM_GIT=https://github.com/facebookresearch/habitat-sim.git
+
+# ============================================================================
+# C. 编译 habitat-sim 0.1.7
+# 避免沿用旧二进制导致的 numba / quaternion / ABI 兼容问题
+# ============================================================================
+RUN git clone --depth 1 --branch ${HABITAT_SIM_TAG} ${HABITAT_SIM_GIT} /tmp/habitat-sim && \
+    conda run -n vlnce pip install --no-cache-dir -r /tmp/habitat-sim/requirements.txt && \
+    git -C /tmp/habitat-sim submodule update --init --depth 1 src/deps/pybind11 && \
+    python -c "from pathlib import Path; p = Path('/tmp/habitat-sim/src/deps/pybind11/include/pybind11/attr.h'); t = p.read_text(); p.write_text(t if '#include <cstdint>' in t else t.replace('#include \\\"cast.h\\\"\\n', '#include \\\"cast.h\\\"\\n#include <cstdint>\\n', 1))" && \
+    cd /tmp/habitat-sim && \
+    CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+    conda run -n vlnce python setup.py install --headless --with-cuda && \
+    rm -rf /tmp/habitat-sim
+
+# ============================================================================
+# D. 重装 conftopo-main / vlnce 侧源码安装
+# goat 已存在，这里补 conftopo-main 和 vlnce 的 editable 包
+# ============================================================================
+COPY setup.py /opt/conftopo-src/setup.py
+COPY conftopo /opt/conftopo-src/conftopo
+COPY habitat-lab /opt/src/habitat-lab-v017/
+COPY docker_build/verify-envs.sh /opt/conftopo-env/bin/verify-envs.sh
+
+RUN mkdir -p /opt/conftopo-env/bin \
+             /opt/conda/envs/conftopo-main/etc/conda/activate.d \
+             /opt/conda/envs/conftopo-main/etc/conda/deactivate.d \
+             /opt/conda/envs/vlnce/etc/conda/activate.d \
+             /opt/conda/envs/vlnce/etc/conda/deactivate.d && \
+    touch /opt/src/habitat-lab-v017/README.md /opt/src/habitat-lab-v017/LICENSE && \
+    chmod +x /opt/conftopo-env/bin/verify-envs.sh && \
+    conda run -n conftopo-main pip install --no-cache-dir /opt/conftopo-src ${PIP_OPTIONS} && \
+    env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n vlnce pip install --no-cache-dir \
+        /opt/src/habitat-lab-v017 --no-deps && \
+    env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n vlnce pip install --no-cache-dir \
+        /opt/conftopo-src && \
+    rm -rf /opt/src/habitat-lab-v017 /opt/conftopo-src && \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+        'unset LD_LIBRARY_PATH' \
+        > /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh && \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+        'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+        > /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+        'unset LD_LIBRARY_PATH' \
+        > /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh && \
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+        'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+        > /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh && \
+    chmod +x /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh \
+             /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh \
+             /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh \
+             /opt/conda/envs/vlnce/etc/conda/deactivate.d/restore_ld_path.sh && \
+    grep -q 'alias conftopo-main=' /root/.zshrc 2>/dev/null || \
+        printf '%s\n' \
+            'alias conftopo-main="conda activate conftopo-main"' \
+            >> /root/.zshrc && \
+    grep -q 'alias conftopo-vlnce=' /root/.zshrc 2>/dev/null || \
+        printf '%s\n' \
+            'alias conftopo-vlnce="conda activate vlnce"' \
+            'alias conftopo-etp="conda activate vlnce"' \
+            >> /root/.zshrc && \
+    VERIFY_ONLY=vlnce /opt/conftopo-env/bin/verify-envs.sh
+
+WORKDIR ${WORKSPACE}
+
+ENTRYPOINT ["tini", "-s", "--", "/bin/zsh", "-l"]

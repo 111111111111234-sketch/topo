@@ -20,12 +20,13 @@ from run_goat_minimal import (
 )
 from run_goat_topo_trace import (
     _tolist,
+    configure_landmark_perception,
     count_target_switches,
     current_goal_summary,
-    landmark_names,
     max_score,
     memory_reuse_count,
     path_length,
+    parse_env_landmarks,
     select_goal_modality,
     snapshot_perception,
     snapshot_topo,
@@ -264,6 +265,11 @@ def main() -> None:
     parser.add_argument("--object-threshold", type=float, default=None)
     parser.add_argument("--room-threshold", type=float, default=None)
     parser.add_argument("--landmark-threshold", type=float, default=None)
+    parser.add_argument(
+        "--env-landmarks",
+        default="default",
+        help="Comma-separated scene landmark labels, 'default' for built-ins, or 'none' to disable.",
+    )
     parser.add_argument("--use-placeholder-embed", action="store_true")
     parser.add_argument("--loop-anchors", type=int, default=3)
     parser.add_argument("--loop-samples", type=int, default=80)
@@ -275,6 +281,7 @@ def main() -> None:
     parser.add_argument("--loop-return-radius", type=float, default=0.75)
     parser.add_argument("--instruction", default="Walk one loop around the room on the same floor and return to the start.")
     args = parser.parse_args()
+    env_landmark_labels = parse_env_landmarks(args.env_landmarks)
 
     dataset_dir = ROOT / args.dataset_dir
     scene_path, episode = pick_episode(dataset_dir, args.split, args.scene, args.episode_index)
@@ -302,13 +309,9 @@ def main() -> None:
     if not args.use_placeholder_embed:
         encoder = ClipRuntimeEncoder(config.perception.clip_model, config.perception.clip_device)
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
-        if isinstance(first_goal, GoalNode):
-            lm_names = landmark_names(first_goal.landmarks)
-            if lm_names:
-                lm_embeds = first_goal.landmark_embeddings
-                if lm_embeds is None:
-                    lm_embeds = encoder.encode_text(lm_names)
-                agent.perceiver.set_landmark_labels(lm_names, lm_embeds)
+        active_landmark_labels = configure_landmark_perception(agent, first_goal, encoder, env_landmark_labels)
+    else:
+        active_landmark_labels = []
 
     frame_dir = ROOT / args.frame_dir if args.frame_dir else None
     if frame_dir:
@@ -358,6 +361,8 @@ def main() -> None:
         **goal_modality_debug,
         "instruction": args.instruction,
         "current_goal": current_goal_summary(ig),
+        "environment_landmarks": env_landmark_labels,
+        "active_landmark_labels": active_landmark_labels,
         "embedding_source": "placeholder" if args.use_placeholder_embed else f"clip:{args.clip_model}",
         "thresholds": {
             "object": config.perception.object_threshold,
@@ -365,6 +370,12 @@ def main() -> None:
             "landmark": config.perception.landmark_threshold,
         },
         "coordinate_frame": "episode_start_relative",
+        "pose_sources": {
+            "position": "episode_start_relative_from_gt_world",
+            "heading": "habitat_gt_heading",
+            "world_position": "habitat_gt_world_position",
+            "world_heading": "habitat_gt_heading",
+        },
         "trajectory": trajectory,
         "control_mode": "trajectory_low_level",
         "steps": [],
@@ -395,7 +406,9 @@ def main() -> None:
             agent.observe(conf_obs)
             agent.update_memory()
 
-            rel_position = world_to_relative(np.asarray(state.position, dtype=np.float32), origin)
+            world_position = np.asarray(state.position, dtype=np.float32)
+            world_heading = float(conf_obs["heading"])
+            rel_position = world_to_relative(world_position, origin)
             route_idx = advance_route_index(rel_position, route, route_idx, args.loop_reach_radius)
             target = trajectory_target(route, route_idx)
             collision_debug = collision_tracker.update(previous_low_action, rel_position)
@@ -419,7 +432,10 @@ def main() -> None:
                 "target_node_id": None if target is None else f"traj_{route_idx:03d}",
                 "target_position": None if target is None else target.round(4).tolist(),
                 "position": rel_position.round(4).tolist(),
-                "heading": conf_obs["heading"],
+                "heading": world_heading,
+                "world_position": world_position.round(4).tolist(),
+                "world_heading": world_heading,
+                "rgb_embedding": np.asarray(rgb_embed, dtype=np.float32).round(6).tolist(),
                 "candidate_ids": [],
                 "candidate_scores": [],
                 "trajectory_progress": {

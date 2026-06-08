@@ -77,6 +77,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates: List[Dict[str, Any]] = []
         self._last_navigation_event: Dict[str, Any] = {}
         self._last_plan_debug: Dict[str, Any] = {}
+        self._environment_landmark_labels: Set[str] = set()
 
     def reset(self):
         """Full reset for new episode (clear memory)."""
@@ -100,6 +101,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates = []
         self._last_navigation_event = {}
         self._last_plan_debug = {}
+
+    def set_environment_landmark_labels(self, labels: List[str]) -> None:
+        """Mark landmark labels that are scene-level anchors rather than goal hints."""
+        self._environment_landmark_labels = {str(label) for label in labels}
 
     def set_new_goal(self, goal: GoalNode):
         """Switch to a new goal within the same episode (memory preserved).
@@ -434,6 +439,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     embedding=self._cur_rgb_embed,
                     confidence=sim,
                     label=label,
+                    attributes={
+                        "landmark_source": "environment"
+                        if label in self._environment_landmark_labels
+                        else "goal_hint"
+                    },
                 )
                 self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
 

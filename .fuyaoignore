@@ -1,40 +1,74 @@
-# fuyao docker 构建上传忽略（part4 仅需 conftopo + habitat-lab 源码）
+# fuyao docker 上传忽略。
+# docker/Dockerfile.unified 只需要少量源码；其余目录会显著拖慢上传。
+
+# VCS / editor / cache
+.git/
+.github/
+.vscode/
+.hypothesis/
+.ipynb_checkpoints/
+**/__pycache__/
+*.pyc
+.conda/
+conftopo.egg-info/
+
+# Large model and dataset trees
 data/
+dataa/
+Data/
 models/
-ETPNav/data/
+ETPNav/
 goat-bench/
+work_dirs/
+work_dirs_bak/
+
+# Historical outputs
+bifrost-*/
+fuyao_sh_*/
+collect_all.log
+
+# Unused repos for this image build
+ObjectNav/
+PETR/
+Semantic-MapNet111/
+Trans4Map/
+ipm/
+map-cmp-vla/
+mmcv_src/
+mmdet3d_assets/
+mmdet3d_petr/
+mmdetection3d/
+multi_agents/
+tensorflow/
+xrobot-vision/
+
+# Archives / weights / notebooks
 *.zip
+*.tar
 *.tar.gz
 *.pth
 *.ckpt
+*.pt
+*.bin
 *.safetensors
-
-**/__pycache__/
-**/.git/
-**/.ipynb_checkpoints/
-work_dirs/
-work_dirs_bak/
-bifrost-*/
-.docker/
-
-PETR/
-mmdetection3d/
-mmdet3d_petr/
-Semantic-MapNet111/
-xrobot-vision/
-map-cmp-vla/
-tensorflow/
-multi_agents/
-Trans4Map/
-ObjectNav/
-mmcv_src/
-ipm/
-PETR/
-ETPNav/data/
+*.ipynb
 Miniconda3-latest-Linux-x86_64.sh
 thor-*.zip
+upstream_*.patch
 
-# 大目录（保留 habitat-lab / conftopo / docker_build / Dockerfile*）
+# Misc files not needed by Dockerfile.unified
 docs/
-*.ipynb
-collect_all.log
+environment.yaml
+environment-dev.yaml
+environment-vllm.yaml
+condaenv.q2l9fbeh.requirements.txt
+local_git_sha.txt
+upstream_git_info.txt
+fuyao_jupyter_params.txt
+
+# Keep these paths in upload context:
+#!setup.py
+#!conftopo/
+#!habitat-lab/
+#!docker/
+#!docker_build/

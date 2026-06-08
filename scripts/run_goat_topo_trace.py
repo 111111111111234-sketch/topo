@@ -10,6 +10,7 @@ import numpy as np
 
 from run_goat_minimal import (
     ROOT,
+    PretrainedPointNavController,
     controller_step,
     find_scene_file,
     load_goal_graph,
@@ -24,6 +25,24 @@ from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 from conftopo.perception import ClipRuntimeEncoder
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
+
+
+DEFAULT_ENV_LANDMARK_LABELS = [
+    "window",
+    "stairs",
+    "corridor",
+    "kitchen",
+    "bedroom",
+    "bathroom",
+    "toilet",
+    "living room",
+    "table",
+    "sofa",
+    "bed",
+    "cabinet",
+    "plant",
+    "sink",
+]
 
 
 def _tolist(value: Any) -> Any:
@@ -95,6 +114,59 @@ def landmark_names(raw) -> list[str]:
         else:
             names.append(str(item))
     return names
+
+
+def parse_env_landmarks(value: str) -> list[str]:
+    value = (value or "default").strip()
+    if value.lower() in {"", "none", "off", "false", "0"}:
+        return []
+    if value.lower() == "default":
+        return list(DEFAULT_ENV_LANDMARK_LABELS)
+    labels = [item.strip() for item in value.split(",")]
+    return [label for label in labels if label]
+
+
+def dedupe_labels(labels: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for label in labels:
+        key = label.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(label.strip())
+    return out
+
+
+def configure_landmark_perception(
+    agent: ConfTopoGOATAgent,
+    first_goal: GoalNode | None,
+    encoder: ClipRuntimeEncoder | None,
+    env_landmark_labels: list[str],
+) -> list[str]:
+    goal_lm_names = landmark_names(first_goal.landmarks) if isinstance(first_goal, GoalNode) else []
+    all_labels = dedupe_labels(goal_lm_names + env_landmark_labels)
+    agent.set_environment_landmark_labels(env_landmark_labels)
+    if not all_labels or encoder is None:
+        return all_labels
+
+    embeds_by_label: dict[str, np.ndarray] = {}
+    if isinstance(first_goal, GoalNode) and goal_lm_names:
+        goal_embeds = first_goal.landmark_embeddings
+        if goal_embeds is None:
+            goal_embeds = encoder.encode_text(goal_lm_names)
+        for label, embed in zip(goal_lm_names, goal_embeds):
+            embeds_by_label[label.strip().lower()] = np.asarray(embed, dtype=np.float32)
+
+    missing = [label for label in all_labels if label.strip().lower() not in embeds_by_label]
+    if missing:
+        missing_embeds = encoder.encode_text(missing)
+        for label, embed in zip(missing, missing_embeds):
+            embeds_by_label[label.strip().lower()] = np.asarray(embed, dtype=np.float32)
+
+    all_embeds = np.asarray([embeds_by_label[label.strip().lower()] for label in all_labels], dtype=np.float32)
+    agent.perceiver.set_landmark_labels(all_labels, all_embeds)
+    return all_labels
 
 
 def current_goal_summary(ig) -> dict[str, Any]:
@@ -275,8 +347,29 @@ def main() -> None:
     parser.add_argument("--object-threshold", type=float, default=None)
     parser.add_argument("--room-threshold", type=float, default=None)
     parser.add_argument("--landmark-threshold", type=float, default=None)
+    parser.add_argument(
+        "--env-landmarks",
+        default="default",
+        help="Comma-separated scene landmark labels, 'default' for built-ins, or 'none' to disable.",
+    )
     parser.add_argument("--use-placeholder-embed", action="store_true")
+    parser.add_argument(
+        "--controller-mode",
+        choices=["pathfinder", "pretrained_pointnav"],
+        default="pathfinder",
+        help="Low-level controller backend.",
+    )
+    parser.add_argument(
+        "--pointnav-model-path",
+        default="ETPNav/data/ddppo-models/gibson-2plus-se-resneXt50-rgb.pth",
+        help="Checkpoint path for pretrained PointNav policy.",
+    )
+    parser.add_argument("--pointnav-input-type", choices=["rgb", "depth", "rgbd"], default="rgb")
+    parser.add_argument("--pointnav-resolution", type=int, default=256)
+    parser.add_argument("--pointnav-stop-radius", type=float, default=0.35)
+    parser.add_argument("--pointnav-gpu-id", type=int, default=0)
     args = parser.parse_args()
+    env_landmark_labels = parse_env_landmarks(args.env_landmarks)
 
     dataset_dir = ROOT / args.dataset_dir
     scene_path, episode = pick_episode(dataset_dir, args.split, args.scene, args.episode_index)
@@ -304,13 +397,9 @@ def main() -> None:
     if not args.use_placeholder_embed:
         encoder = ClipRuntimeEncoder(config.perception.clip_model, config.perception.clip_device)
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
-        if isinstance(first_goal, GoalNode):
-            lm_names = landmark_names(first_goal.landmarks)
-            if lm_names:
-                lm_embeds = first_goal.landmark_embeddings
-                if lm_embeds is None:
-                    lm_embeds = encoder.encode_text(lm_names)
-                agent.perceiver.set_landmark_labels(lm_names, lm_embeds)
+        active_landmark_labels = configure_landmark_perception(agent, first_goal, encoder, env_landmark_labels)
+    else:
+        active_landmark_labels = []
 
     frame_dir = ROOT / args.frame_dir if args.frame_dir else None
     if frame_dir:
@@ -332,6 +421,20 @@ def main() -> None:
     nav_executor = PathfinderExecutor()
     collision_tracker = CollisionLikeTracker()
     previous_low_action = None
+    pointnav_controller = None
+    if args.controller_mode == "pretrained_pointnav":
+        if not args.pointnav_model_path:
+            raise ValueError("--pointnav-model-path is required when --controller-mode=pretrained_pointnav")
+        model_path = Path(args.pointnav_model_path)
+        if not model_path.is_absolute():
+            model_path = ROOT / model_path
+        pointnav_controller = PretrainedPointNavController(
+            model_path=str(model_path),
+            input_type=args.pointnav_input_type,
+            resolution=args.pointnav_resolution,
+            stop_radius=args.pointnav_stop_radius,
+            pth_gpu_id=args.pointnav_gpu_id,
+        )
 
     trace: dict[str, Any] = {
         "split": args.split,
@@ -347,6 +450,8 @@ def main() -> None:
         "goal_type": ig.goal_type,
         **goal_modality_debug,
         "current_goal": current_goal_summary(ig),
+        "environment_landmarks": env_landmark_labels,
+        "active_landmark_labels": active_landmark_labels,
         "embedding_source": "placeholder" if args.use_placeholder_embed else f"clip:{args.clip_model}",
         "thresholds": {
             "object": config.perception.object_threshold,
@@ -354,6 +459,20 @@ def main() -> None:
             "landmark": config.perception.landmark_threshold,
         },
         "coordinate_frame": "episode_start_relative",
+        "pose_sources": {
+            "position": "episode_start_relative_from_gt_world",
+            "heading": "habitat_gt_heading",
+            "world_position": "habitat_gt_world_position",
+            "world_heading": "habitat_gt_heading",
+        },
+        "controller": {
+            "mode": args.controller_mode,
+            "pointnav_model_path": args.pointnav_model_path,
+            "pointnav_input_type": args.pointnav_input_type,
+            "pointnav_resolution": args.pointnav_resolution,
+            "pointnav_stop_radius": args.pointnav_stop_radius,
+            "pointnav_gpu_id": args.pointnav_gpu_id,
+        },
         "steps": [],
     }
 
@@ -380,7 +499,9 @@ def main() -> None:
                 "heading": quat_to_heading([state.rotation.real, *list(state.rotation.imag)]),
             }
             out = agent.step(conf_obs)
-            rel_position = np.asarray(state.position, dtype=np.float32) - origin
+            world_position = np.asarray(state.position, dtype=np.float32)
+            world_heading = float(conf_obs["heading"])
+            rel_position = world_position - origin
             collision_debug = collision_tracker.update(previous_low_action, rel_position)
             navigation_event = {}
             navigation_debug = {}
@@ -412,18 +533,26 @@ def main() -> None:
                 low_action = "stop"
                 navigation_debug = {"reachable": False, "reason": "no_target"}
             else:
-                low_action, navigation_debug = nav_executor.step(sim, np.asarray(target), origin, target_node_id=target_node_id)
-                if low_action == "unreachable":
-                    navigation_event = agent.on_navigation_event(target_node_id, navigation_debug.get("reason", "unreachable"))
-                    fallback = reachable_debug.get("selected")
-                    if fallback is not None and fallback.get("node_id") != target_node_id:
-                        node = agent.topo_map.get_node(fallback["node_id"])
-                        if node is not None:
-                            target_node_id = node.node_id
-                            target = node.position.copy()
-                            low_action, navigation_debug = nav_executor.step(sim, np.asarray(target), origin, target_node_id=target_node_id)
+                if args.controller_mode == "pretrained_pointnav":
+                    low_action, navigation_debug = pointnav_controller.step(
+                        rgb=rgb,
+                        target_rel=np.asarray(target, dtype=np.float32),
+                        agent_rel=rel_position,
+                        agent_heading=world_heading,
+                    )
+                else:
+                    low_action, navigation_debug = nav_executor.step(sim, np.asarray(target), origin, target_node_id=target_node_id)
                     if low_action == "unreachable":
-                        low_action = "turn_left"
+                        navigation_event = agent.on_navigation_event(target_node_id, navigation_debug.get("reason", "unreachable"))
+                        fallback = reachable_debug.get("selected")
+                        if fallback is not None and fallback.get("node_id") != target_node_id:
+                            node = agent.topo_map.get_node(fallback["node_id"])
+                            if node is not None:
+                                target_node_id = node.node_id
+                                target = node.position.copy()
+                                low_action, navigation_debug = nav_executor.step(sim, np.asarray(target), origin, target_node_id=target_node_id)
+                        if low_action == "unreachable":
+                            low_action = "turn_left"
                 if low_action == "target_reached":
                     target_dist = planar_distance(target, rel_position)
                     navigation_debug["final_target_distance"] = target_dist
@@ -466,7 +595,10 @@ def main() -> None:
                 "target_node_id": target_node_id,
                 "target_position": None if target is None else np.asarray(target).round(4).tolist(),
                 "position": rel_position.round(4).tolist(),
-                "heading": conf_obs["heading"],
+                "heading": world_heading,
+                "world_position": world_position.round(4).tolist(),
+                "world_heading": world_heading,
+                "rgb_embedding": np.asarray(rgb_embed, dtype=np.float32).round(6).tolist(),
                 "candidate_ids": candidate_ids,
                 "candidate_scores": candidate_scores,
                 "sticky_debug": sticky_debug,

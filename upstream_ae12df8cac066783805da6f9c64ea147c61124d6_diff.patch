@@ -1,0 +1,1297 @@
+diff --git a/.fuyaoignore b/.fuyaoignore
+index 212723e..6fb0cb5 100644
+--- a/.fuyaoignore
++++ b/.fuyaoignore
+@@ -1,40 +1,74 @@
+-# fuyao docker 构建上传忽略（part4 仅需 conftopo + habitat-lab 源码）
++# fuyao docker 上传忽略。
++# docker/Dockerfile.unified 只需要少量源码；其余目录会显著拖慢上传。
++
++# VCS / editor / cache
++.git/
++.github/
++.vscode/
++.hypothesis/
++.ipynb_checkpoints/
++**/__pycache__/
++*.pyc
++.conda/
++conftopo.egg-info/
++
++# Large model and dataset trees
+ data/
++dataa/
++Data/
+ models/
+-ETPNav/data/
++ETPNav/
+ goat-bench/
+-*.zip
+-*.tar.gz
+-*.pth
+-*.ckpt
+-*.safetensors
+-
+-**/__pycache__/
+-**/.git/
+-**/.ipynb_checkpoints/
+ work_dirs/
+ work_dirs_bak/
++
++# Historical outputs
+ bifrost-*/
+-.docker/
++fuyao_sh_*/
++collect_all.log
+ 
++# Unused repos for this image build
++ObjectNav/
+ PETR/
+-mmdetection3d/
+-mmdet3d_petr/
+ Semantic-MapNet111/
+-xrobot-vision/
+-map-cmp-vla/
+-tensorflow/
+-multi_agents/
+ Trans4Map/
+-ObjectNav/
+-mmcv_src/
+ ipm/
+-PETR/
+-ETPNav/data/
++map-cmp-vla/
++mmcv_src/
++mmdet3d_assets/
++mmdet3d_petr/
++mmdetection3d/
++multi_agents/
++tensorflow/
++xrobot-vision/
++
++# Archives / weights / notebooks
++*.zip
++*.tar
++*.tar.gz
++*.pth
++*.ckpt
++*.pt
++*.bin
++*.safetensors
++*.ipynb
+ Miniconda3-latest-Linux-x86_64.sh
+ thor-*.zip
++upstream_*.patch
+ 
+-# 大目录（保留 habitat-lab / conftopo / docker_build / Dockerfile*）
++# Misc files not needed by Dockerfile.unified
+ docs/
+-*.ipynb
+-collect_all.log
++environment.yaml
++environment-dev.yaml
++environment-vllm.yaml
++condaenv.q2l9fbeh.requirements.txt
++local_git_sha.txt
++upstream_git_info.txt
++fuyao_jupyter_params.txt
++
++# Keep these paths in upload context:
++#!setup.py
++#!conftopo/
++#!habitat-lab/
++#!docker/
++#!docker_build/
+diff --git a/conftopo/agents/goat_agent.py b/conftopo/agents/goat_agent.py
+index 7b3a4d0..445d773 100644
+--- a/conftopo/agents/goat_agent.py
++++ b/conftopo/agents/goat_agent.py
+@@ -17,7 +17,7 @@ Usage:
+             action = agent.step(obs)  # observe → update_memory → plan → act
+ """
+ 
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Set, Tuple
+ import numpy as np
+ 
+ from conftopo.config import ConfTopoConfig
+@@ -38,11 +38,13 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+     def __init__(self, config: Optional[ConfTopoConfig] = None):
+         super().__init__(config)
+         self.perceiver = LightPerceiver(
+-            room_labels=config.perception.room_labels if config else None,
++            room_labels=self.config.perception.room_labels,
+         )
+ 
+         # Agent state
++        # Topo memory stores episode-start-relative positions.
+         self._position: Optional[np.ndarray] = None
++        self._origin_position: Optional[np.ndarray] = None
+         self._heading: float = 0.0
+         self._prev_position: Optional[np.ndarray] = None
+         self._cur_vp_id: Optional[str] = None
+@@ -60,10 +62,22 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         self._goal_idx: int = 0
+         self._goals_completed: int = 0
+ 
++        # Planning stability state
++        self._sticky_target_id: Optional[str] = None
++        self._sticky_last_distance: Optional[float] = None
++        self._sticky_no_progress_steps: int = 0
++        self._sticky_release_reason: str = ""
++        self._consumed_frontier_ids: Set[str] = set()
++        self._blocked_target_until: Dict[str, int] = {}
++        self._last_skipped_candidates: List[Dict[str, Any]] = []
++        self._last_navigation_event: Dict[str, Any] = {}
++        self._last_plan_debug: Dict[str, Any] = {}
++
+     def reset(self):
+         """Full reset for new episode (clear memory)."""
+         super().reset()
+         self._position = None
++        self._origin_position = None
+         self._heading = 0.0
+         self._prev_position = None
+         self._cur_vp_id = None
+@@ -71,6 +85,15 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         self._cur_perception = None
+         self._goal_idx = 0
+         self._goals_completed = 0
++        self._sticky_target_id = None
++        self._sticky_last_distance = None
++        self._sticky_no_progress_steps = 0
++        self._sticky_release_reason = ""
++        self._consumed_frontier_ids = set()
++        self._blocked_target_until = {}
++        self._last_skipped_candidates = []
++        self._last_navigation_event = {}
++        self._last_plan_debug = {}
+ 
+     def set_new_goal(self, goal: GoalNode):
+         """Switch to a new goal within the same episode (memory preserved).
+@@ -78,6 +101,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         This is the key for multi-goal: DynamicTopoMap is NOT cleared.
+         """
+         self.reset_keep_memory()
++        self._clear_sticky("new_goal")
+ 
+         if self.instruction_graph is None:
+             self.instruction_graph = InstructionGraph(
+@@ -112,8 +136,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+             - 'heading': agent heading in radians
+             - 'depth' (optional): depth image
+         """
++        raw_position = np.array(obs['position'], dtype=np.float32)
++        if self._origin_position is None:
++            self._origin_position = raw_position.copy()
+         self._prev_position = self._position
+-        self._position = np.array(obs['position'], dtype=np.float32)
++        self._position = raw_position - self._origin_position
+         self._heading = obs.get('heading', 0.0)
+ 
+         # Visual embedding (CLIP)
+@@ -146,6 +173,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         # 1. Add/update visited waypoint
+         cur_vp = self._add_visited_waypoint()
+ 
++        self._consume_reached_frontiers(cur_vp)
++
+         # 2. Add semantic nodes (room, landmark detection)
+         self._add_semantic_nodes(cur_vp)
+ 
+@@ -198,29 +227,145 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         self._cur_vp_id = cur_vp
+         return cur_vp
+ 
++    def _clear_sticky(self, reason: str = "") -> None:
++        self._sticky_target_id = None
++        self._sticky_last_distance = None
++        self._sticky_no_progress_steps = 0
++        self._sticky_release_reason = reason
++
++    def _active_blocked_targets(self) -> Dict[str, int]:
++        expired = [nid for nid, until in self._blocked_target_until.items() if until <= self.topo_map.current_step]
++        for nid in expired:
++            self._blocked_target_until.pop(nid, None)
++            node = self.topo_map.get_node(nid)
++            if node is not None:
++                node.attributes.pop("blocked_reason", None)
++                node.attributes.pop("blocked_until_step", None)
++        return dict(self._blocked_target_until)
++
++    def _is_blocked_target(self, node_id: str) -> bool:
++        return node_id in self._active_blocked_targets()
++
++    def _block_target(self, node_id: str, reason: str, ttl: Optional[int] = None) -> None:
++        node = self.topo_map.get_node(node_id)
++        if node is None:
++            return
++        ttl = self.config.planning.blocked_target_ttl if ttl is None else ttl
++        until = self.topo_map.current_step + max(1, int(ttl))
++        self._blocked_target_until[node_id] = until
++        node.attributes["blocked_reason"] = reason
++        node.attributes["blocked_until_step"] = until
++        node.confidence = min(node.confidence, 0.1)
++
++    def _consume_or_block_target(self, node_id: str, reason: str) -> Dict[str, Any]:
++        node = self.topo_map.get_node(node_id)
++        event = {"target_node_id": node_id, "reason": reason, "action": "missing"}
++        if node is None:
++            self._last_navigation_event = event
++            return event
++        node.attributes["consume_reason"] = reason
++        node.attributes["consume_step"] = self.topo_map.current_step
++        if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
++            self._consumed_frontier_ids.add(node.node_id)
++            node.attributes["consumed"] = True
++            node.confidence = min(node.confidence, 0.05)
++            event["action"] = "consumed_frontier"
++        else:
++            self._block_target(node.node_id, reason)
++            event["action"] = "blocked_target"
++        if self._sticky_target_id == node_id:
++            self._clear_sticky(reason)
++        self._last_navigation_event = event
++        return event
++
++    def on_navigation_event(self, target_node_id: Optional[str], event: str) -> Dict[str, Any]:
++        if target_node_id is None:
++            out = {"target_node_id": None, "reason": event, "action": "ignored"}
++            self._last_navigation_event = out
++            return out
++        return self._consume_or_block_target(target_node_id, event)
++
++    def _consume_reached_frontiers(self, cur_vp: str) -> None:
++        radius = self.config.planning.frontier_consume_radius
++        for node in self.topo_map.find_nodes_within_radius(
++            self._position, radius=radius, node_type=NodeType.WAYPOINT_FRONTIER
++        ):
++            self._consume_or_block_target(node.node_id, "frontier_reached")
++
++    def _is_consumed_frontier(self, node) -> bool:
++        return (
++            node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE)
++            and (node.node_id in self._consumed_frontier_ids or node.attributes.get("consumed", False))
++        )
++
++    def _sticky_plan_if_valid(self, candidates, candidate_ids, scores) -> Optional[Dict[str, Any]]:
++        cfg = self.config.planning
++        if not cfg.sticky_target_enabled or self._sticky_target_id is None:
++            return None
++        if self._sticky_target_id not in candidate_ids:
++            self._clear_sticky("target_not_candidate")
++            return None
++        node = self.topo_map.get_node(self._sticky_target_id)
++        if node is None or self._is_consumed_frontier(node) or self._is_blocked_target(node.node_id):
++            self._clear_sticky("target_unavailable")
++            return None
++        dist = float(np.linalg.norm(node.position - self._position))
++        if dist <= cfg.sticky_reach_radius:
++            self._consume_or_block_target(node.node_id, "target_reached")
++            self._clear_sticky("target_reached")
++            return None
++        if self._sticky_last_distance is not None:
++            progress = self._sticky_last_distance - dist
++            if progress < cfg.sticky_min_progress:
++                self._sticky_no_progress_steps += 1
++            else:
++                self._sticky_no_progress_steps = 0
++        self._sticky_last_distance = dist
++        if self._sticky_no_progress_steps >= cfg.sticky_release_after_no_progress:
++            self._consume_or_block_target(node.node_id, "no_progress")
++            self._clear_sticky("no_progress")
++            return None
++        idx = candidate_ids.index(self._sticky_target_id)
++        self._last_plan_debug = {
++            "sticky_target_id": self._sticky_target_id,
++            "sticky_used": True,
++            "sticky_distance": dist,
++            "sticky_no_progress_steps": self._sticky_no_progress_steps,
++            "sticky_release_reason": "",
++            "consumed_frontiers": sorted(self._consumed_frontier_ids),
++            "blocked_targets": self._active_blocked_targets(),
++            "skipped_candidates": self._last_skipped_candidates,
++            "navigation_event": self._last_navigation_event,
++        }
++        return {
++            "target_node_id": node.node_id,
++            "target_position": node.position.copy(),
++            "is_exploration": node.node_type == NodeType.WAYPOINT_FRONTIER,
++            "scores": scores,
++            "candidate_ids": candidate_ids,
++            "sticky_debug": self._last_plan_debug,
++        }
++
+     def _add_semantic_nodes(self, cur_vp: str) -> None:
+         """Add room/landmark/object nodes from perception results."""
+         if not self._cur_perception:
+             return
+ 
++        pcfg = self.config.perception
++
+         # Room node
+         room_label = self._cur_perception.get("room_label", "unknown")
+-        room_conf = self._cur_perception.get("room_confidence", 0.0)
+-        if room_label != "unknown" and room_conf > 0.2:
+-            # Check if we already have a room node for this type nearby
++        room_conf = float(self._cur_perception.get("room_confidence", 0.0))
++        if room_label != "unknown" and room_conf >= pcfg.room_threshold:
+             existing_rooms = self.topo_map.find_nodes_within_radius(
+                 self._position, radius=5.0, node_type=NodeType.ROOM
+             )
+-            matched_room = None
+-            for r in existing_rooms:
+-                if r.label == room_label:
+-                    matched_room = r
+-                    break
+-
++            matched_room = next((r for r in existing_rooms if r.label == room_label), None)
+             if matched_room:
+-                # Update confidence
+-                matched_room.confidence = min(1.0, matched_room.confidence + 0.05)
++                matched_room.confidence = max(matched_room.confidence, room_conf)
+                 matched_room.step_id = self.topo_map.current_step
++                if self._cur_rgb_embed is not None:
++                    matched_room.embedding = self._cur_rgb_embed
+             else:
+                 room_id = self.topo_map.add_node(
+                     NodeType.ROOM,
+@@ -231,25 +376,53 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+                 )
+                 self.topo_map.add_edge(cur_vp, room_id, EdgeType.BELONGS_TO)
+ 
+-        # Goal object detection (high similarity = potential target)
+-        if self._cur_perception.get("best_goal_sim", 0) > 0.25:
+-            goal_scores = self._cur_perception.get("goal_scores", [])
+-            for label, sim in goal_scores:
+-                if sim > 0.25:
+-                    # Check if already detected nearby
+-                    existing = self.topo_map.find_nodes_within_radius(
+-                        self._position, radius=2.0, node_type=NodeType.OBJECT
+-                    )
+-                    already_found = any(o.label == label for o in existing)
+-                    if not already_found:
+-                        obj_id = self.topo_map.add_node(
+-                            NodeType.OBJECT,
+-                            position=self._position.copy(),
+-                            embedding=self._cur_rgb_embed,
+-                            confidence=float(sim),
+-                            label=label,
+-                        )
+-                        self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
++        # Goal object node
++        for label, sim in self._cur_perception.get("goal_scores", []):
++            sim = float(sim)
++            if sim < pcfg.object_threshold:
++                continue
++            existing = self.topo_map.find_nodes_within_radius(
++                self._position, radius=2.0, node_type=NodeType.OBJECT
++            )
++            matched = next((o for o in existing if o.label == label), None)
++            if matched:
++                matched.confidence = max(matched.confidence, sim)
++                matched.step_id = self.topo_map.current_step
++                if self._cur_rgb_embed is not None:
++                    matched.embedding = self._cur_rgb_embed
++            else:
++                obj_id = self.topo_map.add_node(
++                    NodeType.OBJECT,
++                    position=self._position.copy(),
++                    embedding=self._cur_rgb_embed,
++                    confidence=sim,
++                    label=label,
++                )
++                self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
++
++        # Landmark node
++        for label, sim in self._cur_perception.get("landmark_scores", []):
++            sim = float(sim)
++            if sim < pcfg.landmark_threshold:
++                continue
++            existing = self.topo_map.find_nodes_within_radius(
++                self._position, radius=3.0, node_type=NodeType.LANDMARK
++            )
++            matched = next((lm for lm in existing if lm.label == label), None)
++            if matched:
++                matched.confidence = max(matched.confidence, sim)
++                matched.step_id = self.topo_map.current_step
++                if self._cur_rgb_embed is not None:
++                    matched.embedding = self._cur_rgb_embed
++            else:
++                lm_id = self.topo_map.add_node(
++                    NodeType.LANDMARK,
++                    position=self._position.copy(),
++                    embedding=self._cur_rgb_embed,
++                    confidence=sim,
++                    label=label,
++                )
++                self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
+ 
+     def _generate_frontiers(self, cur_vp: str) -> None:
+         """Generate frontier-like nodes from unexplored directions.
+@@ -324,6 +497,34 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+             )
+             self.topo_map.add_edge(cur_vp, fid, EdgeType.NAVIGABLE)
+ 
++    def _candidate_skip_reason(self, node: SemanticNode) -> Optional[str]:
++        if node.node_id == self._cur_vp_id:
++            return "current"
++        if self._is_consumed_frontier(node):
++            return "consumed"
++        if self._is_blocked_target(node.node_id):
++            return "blocked"
++        if self._position is not None:
++            dist = float(np.linalg.norm(node.position - self._position))
++            if dist <= self.config.planning.target_too_close_radius:
++                if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
++                    self._consume_or_block_target(node.node_id, "too_close")
++                return "too_close"
++        return None
++
++    def _debug_plan_state(self) -> Dict[str, Any]:
++        return {
++            "sticky_target_id": self._sticky_target_id,
++            "sticky_used": False,
++            "sticky_distance": self._sticky_last_distance,
++            "sticky_no_progress_steps": self._sticky_no_progress_steps,
++            "sticky_release_reason": self._sticky_release_reason,
++            "consumed_frontiers": sorted(self._consumed_frontier_ids),
++            "blocked_targets": self._active_blocked_targets(),
++            "skipped_candidates": self._last_skipped_candidates,
++            "navigation_event": self._last_navigation_event,
++        }
++
+     def plan(self) -> Dict[str, Any]:
+         """Determine next target based on goal + memory.
+ 
+@@ -336,23 +537,31 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         if self.instruction_graph is None or self._cur_vp_id is None:
+             return {"target_node_id": None, "target_position": None, "is_exploration": True}
+ 
+-        # Get all candidate nodes (frontiers + unvisited waypoints + high-sim objects)
+-        candidates = []
+-        candidate_ids = []
++        self._last_navigation_event = {}
++        primary_candidates = []
++        primary_ids = []
++        fallback_candidates = []
++        fallback_ids = []
++        self._last_skipped_candidates = []
+ 
+         for node in self.topo_map._nodes.values():
+-            if node.node_id == self._cur_vp_id:
++            reason = self._candidate_skip_reason(node)
++            if reason is not None:
++                self._last_skipped_candidates.append({"node_id": node.node_id, "type": node.node_type.value, "reason": reason})
+                 continue
+-            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_VISITED):
+-                candidates.append(node)
+-                candidate_ids.append(node.node_id)
+-            elif node.node_type == NodeType.OBJECT:
+-                # Include high-similarity objects as direct targets
+-                candidates.append(node)
+-                candidate_ids.append(node.node_id)
++            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT):
++                primary_candidates.append(node)
++                primary_ids.append(node.node_id)
++            elif node.node_type == NodeType.WAYPOINT_VISITED:
++                fallback_candidates.append(node)
++                fallback_ids.append(node.node_id)
++
++        candidates = primary_candidates if primary_candidates else fallback_candidates
++        candidate_ids = primary_ids if primary_candidates else fallback_ids
+ 
+         if not candidates:
+-            return {"target_node_id": None, "target_position": None, "is_exploration": True}
++            self._last_plan_debug = self._debug_plan_state()
++            return {"target_node_id": None, "target_position": None, "is_exploration": True, "candidate_ids": [], "scores": [], "sticky_debug": self._last_plan_debug}
+ 
+         # Score candidates
+         scores = compute_semantic_bias(
+@@ -363,8 +572,27 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+             normalize=False,  # use raw scores for selection
+         )
+ 
++        sticky_plan = self._sticky_plan_if_valid(candidates, candidate_ids, scores)
++        if sticky_plan is not None:
++            return sticky_plan
++
+         best_idx = int(np.argmax(scores))
+         best_node = candidates[best_idx]
++        self._sticky_target_id = best_node.node_id if self.config.planning.sticky_target_enabled else None
++        self._sticky_last_distance = float(np.linalg.norm(best_node.position - self._position))
++        self._sticky_no_progress_steps = 0
++        self._last_plan_debug = {
++            "sticky_target_id": self._sticky_target_id,
++            "sticky_used": False,
++            "sticky_distance": self._sticky_last_distance,
++            "sticky_no_progress_steps": 0,
++            "sticky_release_reason": self._sticky_release_reason,
++            "consumed_frontiers": sorted(self._consumed_frontier_ids),
++            "blocked_targets": self._active_blocked_targets(),
++            "skipped_candidates": self._last_skipped_candidates,
++            "navigation_event": self._last_navigation_event,
++        }
++        self._sticky_release_reason = ""
+ 
+         return {
+             "target_node_id": best_node.node_id,
+@@ -372,6 +600,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+             "is_exploration": best_node.node_type == NodeType.WAYPOINT_FRONTIER,
+             "scores": scores,
+             "candidate_ids": candidate_ids,
++            "sticky_debug": self._last_plan_debug,
+         }
+ 
+     def act(self, plan_output: Dict[str, Any]) -> Dict[str, Any]:
+@@ -383,12 +612,23 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+         target_pos = plan_output.get("target_position")
+         if target_pos is None:
+             # No target: random exploration or stop
+-            return {"action": "stop"}
++            return {
++                "action": "stop",
++                "target_node_id": plan_output.get("target_node_id"),
++                "candidate_ids": plan_output.get("candidate_ids", []),
++                "scores": plan_output.get("scores", []),
++                "is_exploration": plan_output.get("is_exploration", True),
++                "sticky_debug": plan_output.get("sticky_debug", self._last_plan_debug),
++            }
+ 
+         return {
+             "action": "navigate",
+             "target_position": target_pos,
++            "target_node_id": plan_output.get("target_node_id"),
++            "candidate_ids": plan_output.get("candidate_ids", []),
++            "scores": plan_output.get("scores", []),
+             "is_exploration": plan_output.get("is_exploration", False),
++            "sticky_debug": plan_output.get("sticky_debug", self._last_plan_debug),
+         }
+ 
+     def on_goal_reached(self) -> bool:
+@@ -421,9 +661,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
+             "total_nodes": self.topo_map.num_nodes,
+             "visited_waypoints": len(self.topo_map.get_visited()),
+             "frontiers": len(self.topo_map.get_frontiers()),
++            "candidate_waypoints": len(self.topo_map.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)),
+             "objects": len(self.topo_map.get_nodes_by_type(NodeType.OBJECT)),
+             "rooms": len(self.topo_map.get_nodes_by_type(NodeType.ROOM)),
+             "landmarks": len(self.topo_map.get_nodes_by_type(NodeType.LANDMARK)),
+             "step": self._step_count,
+             "goals_completed": self._goals_completed,
++            "consumed_frontiers": len(self._consumed_frontier_ids),
++            "blocked_targets": len(self._active_blocked_targets()),
+         }
+diff --git a/conftopo/config.py b/conftopo/config.py
+index 1c822d8..e8a70bc 100644
+--- a/conftopo/config.py
++++ b/conftopo/config.py
+@@ -23,6 +23,10 @@ class PerceptionConfig:
+     heavy_interval: int = 5
+     heavy_on_frontier: bool = True
+     clip_model: str = "ViT-B/32"
++    clip_device: str = "auto"
++    object_threshold: float = 0.23
++    room_threshold: float = 0.20
++    landmark_threshold: float = 0.22
+     # 房间类型标签
+     room_labels: List[str] = field(default_factory=lambda: [
+         "kitchen", "living room", "bedroom", "bathroom",
+@@ -39,6 +43,13 @@ class PlanningConfig:
+     use_retrieval: bool = False
+     exploration_threshold: float = 0.3
+     retrieval_hidden_dim: int = 256
++    sticky_target_enabled: bool = True
++    sticky_reach_radius: float = 0.75
++    sticky_release_after_no_progress: int = 5
++    sticky_min_progress: float = 0.05
++    frontier_consume_radius: float = 0.75
++    target_too_close_radius: float = 0.45
++    blocked_target_ttl: int = 20
+ 
+ 
+ @dataclass
+diff --git a/conftopo/core/dynamic_topo_map.py b/conftopo/core/dynamic_topo_map.py
+index d735e93..c932fa4 100644
+--- a/conftopo/core/dynamic_topo_map.py
++++ b/conftopo/core/dynamic_topo_map.py
+@@ -10,6 +10,7 @@ import networkx as nx
+ class NodeType(Enum):
+     WAYPOINT_VISITED = "waypoint_visited"
+     WAYPOINT_FRONTIER = "waypoint_frontier"
++    WAYPOINT_CANDIDATE = "waypoint_candidate"
+     LANDMARK = "landmark"
+     OBJECT = "object"
+     ROOM = "room"
+@@ -169,6 +170,9 @@ class DynamicTopoMap:
+     def get_frontiers(self) -> List[SemanticNode]:
+         return self.get_nodes_by_type(NodeType.WAYPOINT_FRONTIER)
+ 
++    def get_candidates(self) -> List[SemanticNode]:
++        return self.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)
++
+     def get_visited(self) -> List[SemanticNode]:
+         return self.get_nodes_by_type(NodeType.WAYPOINT_VISITED)
+ 
+@@ -252,17 +256,67 @@ class DynamicTopoMap:
+ 
+     # ==================== Memory Management ====================
+ 
++    def add_candidate_waypoint(
++        self,
++        position: np.ndarray,
++        label: str = "",
++        confidence: float = 0.35,
++        source: str = "ghost",
++    ) -> str:
++        """Add an ETPNav-style candidate/ghost waypoint."""
++        return self.add_node(
++            NodeType.WAYPOINT_CANDIDATE,
++            position,
++            confidence=confidence,
++            label=label,
++            attributes={
++                "source": source,
++                "consumed": False,
++                "blocked": False,
++                "state": "candidate",
++            },
++        )
++
+     def promote_frontier_to_visited(self, node_id: str):
+-        """When agent visits a frontier, promote it to visited waypoint."""
++        """When agent visits a frontier/candidate, promote it to visited waypoint."""
+         if node_id in self._nodes:
+             node = self._nodes[node_id]
+-            if node.node_type == NodeType.WAYPOINT_FRONTIER:
++            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
++                promoted_from = "candidate" if node.node_type == NodeType.WAYPOINT_CANDIDATE else "frontier"
+                 node.node_type = NodeType.WAYPOINT_VISITED
+                 node.visit_count += 1
+                 node.confidence = min(1.0, node.confidence + 0.3)
+                 node.step_id = self._current_step
++                node.attributes["promoted_from"] = promoted_from
++                node.attributes["state"] = "visited"
++                node.attributes["consumed"] = False
++                node.attributes["blocked"] = False
+                 self.graph.nodes[node_id]["node_type"] = NodeType.WAYPOINT_VISITED.value
+ 
++    def consume_node(self, node_id: str, reason: str):
++        """Mark a candidate/frontier target as consumed so planning will skip it."""
++        node = self._nodes.get(node_id)
++        if node is None:
++            return
++        node.attributes["consumed"] = True
++        node.attributes["consume_reason"] = reason
++        node.attributes["state"] = "consumed"
++        node.step_id = self._current_step
++        if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
++            node.confidence = max(0.0, node.confidence - 0.25)
++
++    def block_node(self, node_id: str, reason: str, until_step: Optional[int] = None):
++        """Temporarily block a problematic target from target selection."""
++        node = self._nodes.get(node_id)
++        if node is None:
++            return
++        node.attributes["blocked"] = True
++        node.attributes["blocked_reason"] = reason
++        node.attributes["blocked_until_step"] = until_step
++        node.attributes["state"] = "blocked"
++        node.step_id = self._current_step
++        node.confidence = max(0.0, node.confidence - 0.15)
++
+     def merge_nearby_nodes(self, node_type: Optional[NodeType] = None):
+         """Merge nodes of same type that are too close together."""
+         nodes = list(self._nodes.values())
+diff --git a/conftopo/core/instruction_graph.py b/conftopo/core/instruction_graph.py
+index 10164aa..7cf6549 100644
+--- a/conftopo/core/instruction_graph.py
++++ b/conftopo/core/instruction_graph.py
+@@ -209,11 +209,26 @@ class InstructionGraph:
+                     Relation(r["relation_type"], r["reference"])
+                     for r in gn_data.get("relations", [])
+                 ]
++                target_embedding = gn_data.get("target_embedding")
++                if target_embedding is not None:
++                    target_embedding = np.asarray(target_embedding, dtype=np.float32)
++
++                room_prior_embeddings = gn_data.get("room_prior_embeddings")
++                if room_prior_embeddings is not None:
++                    room_prior_embeddings = np.asarray(room_prior_embeddings, dtype=np.float32)
++
++                landmark_embeddings = gn_data.get("landmark_embeddings")
++                if landmark_embeddings is not None:
++                    landmark_embeddings = np.asarray(landmark_embeddings, dtype=np.float32)
++
+                 ig.goal_nodes.append(GoalNode(
+                     target_object=gn_data["target_object"],
++                    target_embedding=target_embedding,
+                     attributes=gn_data.get("attributes", []),
+                     room_prior=gn_data.get("room_prior", []),
++                    room_prior_embeddings=room_prior_embeddings,
+                     landmarks=gn_data.get("landmarks", []),
++                    landmark_embeddings=landmark_embeddings,
+                     relations=relations,
+                     goal_type=gn_data.get("goal_type", "category"),
+                     confidence=gn_data.get("confidence", 1.0),
+diff --git a/conftopo/perception/__init__.py b/conftopo/perception/__init__.py
+index 8b12f23..b1fabd1 100644
+--- a/conftopo/perception/__init__.py
++++ b/conftopo/perception/__init__.py
+@@ -1,5 +1,6 @@
+ """ConfTopo perception modules."""
+ 
+ from conftopo.perception.light_perceiver import LightPerceiver
++from conftopo.perception.clip_runtime import ClipRuntimeEncoder
+ 
+-__all__ = ["LightPerceiver"]
++__all__ = ["LightPerceiver", "ClipRuntimeEncoder"]
+diff --git a/conftopo/tests/test_core.py b/conftopo/tests/test_core.py
+index 8548653..104a71d 100644
+--- a/conftopo/tests/test_core.py
++++ b/conftopo/tests/test_core.py
+@@ -220,6 +220,31 @@ def test_instruction_graph_serialization():
+     print("  [PASS] instruction graph serialization")
+ 
+ 
++def test_instruction_graph_deserialize_embeddings():
++    """GoalGraph JSON embeddings survive from_dict()."""
++    data = {
++        "goal_type": "object_goal",
++        "goal_nodes": [{
++            "target_object": "rack",
++            "target_embedding": [1.0, 0.0, 0.0],
++            "room_prior": ["bedroom"],
++            "room_prior_embeddings": [[0.0, 1.0, 0.0]],
++            "landmarks": ["bed"],
++            "landmark_embeddings": [[0.0, 0.0, 1.0]],
++        }],
++    }
++    ig = InstructionGraph.from_dict(data)
++    goal = ig.goal_nodes[0]
++    assert goal.target_embedding is not None
++    assert goal.target_embedding.dtype == np.float32
++    assert goal.target_embedding.shape == (3,)
++    assert goal.room_prior_embeddings is not None
++    assert goal.room_prior_embeddings.shape == (1, 3)
++    assert goal.landmark_embeddings is not None
++    assert goal.landmark_embeddings.shape == (1, 3)
++    print("  [PASS] instruction graph embedding deserialization")
++
++
+ def test_confidence_system():
+     """Test confidence computation."""
+     factors = ConfidenceFactors(
+@@ -308,6 +333,7 @@ if __name__ == "__main__":
+     test_instruction_graph_route()
+     test_instruction_graph_object_goal()
+     test_instruction_graph_serialization()
++    test_instruction_graph_deserialize_embeddings()
+     test_confidence_system()
+     test_rule_scorer()
+     print("\nAll tests passed!")
+diff --git a/conftopo/tests/test_phase2.py b/conftopo/tests/test_phase2.py
+index 0493bd8..4e0742c 100644
+--- a/conftopo/tests/test_phase2.py
++++ b/conftopo/tests/test_phase2.py
+@@ -231,6 +231,75 @@ def test_goat_agent_multi_goal():
+     print(f"  ✓ multi-goal memory reuse: {nodes_after_goal1} → {nodes_after_goal2} nodes")
+ 
+ 
++def test_goat_agent_semantic_node_creation():
++    """High-similarity perception creates object/room/landmark nodes."""
++    config = ConfTopoConfig()
++    config.perception.object_threshold = 0.1
++    config.perception.room_threshold = 0.1
++    config.perception.landmark_threshold = 0.1
++    agent = ConfTopoGOATAgent(config)
++
++    D = 512
++    embed = np.zeros(D, dtype=np.float32)
++    embed[0] = 1.0
++    goal = GoalNode(
++        target_object="sink",
++        target_embedding=embed.copy(),
++        room_prior=["kitchen"],
++        landmarks=["door"],
++        landmark_embeddings=embed[np.newaxis, :].copy(),
++    )
++    agent.set_new_goal(goal)
++    agent.perceiver.room_labels = ["kitchen"]
++    agent.perceiver.room_text_embeds = embed[np.newaxis, :].copy()
++
++    action = agent.step({
++        "position": [0, 0, 0],
++        "heading": 0.0,
++        "rgb_embed": embed.copy(),
++    })
++    stats = agent.memory_stats
++    assert stats["objects"] >= 1
++    assert stats["rooms"] >= 1
++    assert stats["landmarks"] >= 1
++    assert action.get("target_node_id") is not None
++    assert len(action.get("candidate_ids", [])) > 0
++    print(f"  ✓ semantic nodes: {stats}")
++
++
++
++def test_phase2_auto_threshold():
++    """Auto threshold is stable and honors the configured floor."""
++    from conftopo.acceptance.phase2 import auto_threshold
++    assert abs(auto_threshold([0.10, 0.20], min_threshold=0.045, ratio=0.85) - 0.17) < 1e-6
++    assert abs(auto_threshold([0.01], min_threshold=0.045, ratio=0.85) - 0.045) < 1e-6
++    assert abs(auto_threshold([], min_threshold=0.045, ratio=0.85) - 0.045) < 1e-6
++    print("  ✓ auto threshold")
++
++
++def test_goat_agent_sticky_target_and_frontier_consume():
++    """Sticky target prevents target flicker and consumed frontiers are skipped."""
++    config = ConfTopoConfig()
++    config.planning.sticky_target_enabled = True
++    config.planning.sticky_release_after_no_progress = 100
++    agent = ConfTopoGOATAgent(config)
++    D = 512
++    embed = np.zeros(D, dtype=np.float32)
++    embed[0] = 1.0
++    goal = GoalNode(target_object="sink", target_embedding=embed.copy())
++    agent.set_new_goal(goal)
++    first = agent.step({"position": [0, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
++    second = agent.step({"position": [0.05, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
++    assert first.get("target_node_id") == second.get("target_node_id")
++    frontier = agent.topo_map.get_frontiers()[0]
++    agent._consumed_frontier_ids.add(frontier.node_id)
++    frontier.attributes["consumed"] = True
++    agent._clear_sticky("test_consume")
++    plan = agent.plan()
++    assert frontier.node_id not in plan.get("candidate_ids", [])
++    print("  ✓ sticky target + frontier consume")
++
++
+ if __name__ == "__main__":
+     print("=== Phase 2 Integration Tests ===\n")
+ 
+@@ -255,4 +324,92 @@ if __name__ == "__main__":
+     print("\n[7] GOAT Agent multi-goal memory reuse")
+     test_goat_agent_multi_goal()
+ 
++    print("\n[8] GOAT Agent semantic node creation")
++    test_goat_agent_semantic_node_creation()
++
++    print("\n[9] Auto threshold")
++    test_phase2_auto_threshold()
++
++    print("\n[10] Sticky target/frontier consume")
++    test_goat_agent_sticky_target_and_frontier_consume()
++
+     print("\n=== All Phase 2 tests passed! ===")
++
++
++
++def test_goat_frontier_target_reached_consumed():
++    """Reached frontier is consumed and not selected again."""
++    config = ConfTopoConfig()
++    agent = ConfTopoGOATAgent(config)
++    D = 512
++    embed = np.zeros(D, dtype=np.float32)
++    embed[0] = 1.0
++    goal = GoalNode(target_object="sink", target_embedding=embed.copy())
++    agent.set_new_goal(goal)
++    agent.step({"position": [0, 0, 0], "heading": 0.0, "rgb_embed": embed.copy()})
++
++    frontier = next(iter(agent.topo_map.get_frontiers()))
++    event = agent.on_navigation_event(frontier.node_id, "target_reached")
++    assert event["action"] == "consumed_frontier"
++    assert frontier.attributes["consumed"] is True
++
++    out = agent.plan()
++    assert frontier.node_id not in (out.get("candidate_ids") or [])
++    skipped = out.get("sticky_debug", {}).get("skipped_candidates", [])
++    assert any(row["node_id"] == frontier.node_id and row["reason"] == "consumed" for row in skipped)
++    print("  ✓ frontier target_reached -> consumed and skipped")
++
++
++def test_goat_no_progress_blocks_sticky_target():
++    """Sticky no-progress releases and blocks a target for a short TTL."""
++    config = ConfTopoConfig()
++    config.planning.sticky_release_after_no_progress = 1
++    config.planning.sticky_min_progress = 0.05
++    agent = ConfTopoGOATAgent(config)
++    agent._position = np.zeros(3, dtype=np.float32)
++    wid = agent.topo_map.add_node(NodeType.WAYPOINT_VISITED, position=np.array([2, 0, 0], dtype=np.float32))
++    node = agent.topo_map.get_node(wid)
++    agent._sticky_target_id = wid
++    agent._sticky_last_distance = 2.0
++    agent._sticky_no_progress_steps = 0
++
++    result = agent._sticky_plan_if_valid([node], [wid], np.array([1.0], dtype=np.float32))
++    assert result is None
++    assert agent._is_blocked_target(wid)
++    assert node.attributes["blocked_reason"] == "no_progress"
++    assert agent._sticky_target_id is None
++    assert agent._sticky_release_reason == "no_progress"
++    print("  ✓ no-progress -> sticky release and target blocked")
++
++
++def test_goat_candidate_filter_skips_consumed_blocked_too_close():
++    """Candidate filter reports consumed, blocked, and too-close skip reasons."""
++    config = ConfTopoConfig()
++    config.planning.target_too_close_radius = 0.5
++    agent = ConfTopoGOATAgent(config)
++    agent._position = np.zeros(3, dtype=np.float32)
++
++    consumed_id = agent.topo_map.add_node(NodeType.WAYPOINT_FRONTIER, position=np.array([2, 0, 0], dtype=np.float32))
++    consumed = agent.topo_map.get_node(consumed_id)
++    consumed.attributes["consumed"] = True
++    agent._consumed_frontier_ids.add(consumed_id)
++
++    blocked_id = agent.topo_map.add_node(NodeType.WAYPOINT_VISITED, position=np.array([3, 0, 0], dtype=np.float32))
++    blocked = agent.topo_map.get_node(blocked_id)
++    agent._block_target(blocked_id, "unit_test")
++
++    close_id = agent.topo_map.add_node(NodeType.OBJECT, position=np.array([0.1, 0, 0], dtype=np.float32))
++    close = agent.topo_map.get_node(close_id)
++
++    assert agent._candidate_skip_reason(consumed) == "consumed"
++    assert agent._candidate_skip_reason(blocked) == "blocked"
++    assert agent._candidate_skip_reason(close) == "too_close"
++    print("  ✓ candidate filter skips consumed/blocked/too_close")
++
++
++if __name__ == "__main__":
++    print("\n[11] Navigation target lifecycle")
++    test_goat_frontier_target_reached_consumed()
++    test_goat_no_progress_blocks_sticky_target()
++    test_goat_candidate_filter_skips_consumed_blocked_too_close()
++    print("\n=== Navigation stability tests passed! ===")
+diff --git a/docker/Dockerfile.part4 b/docker/Dockerfile.part4
+index 77d6af5..198f229 100644
+--- a/docker/Dockerfile.part4
++++ b/docker/Dockerfile.part4
+@@ -78,7 +78,10 @@ RUN conda run -n etpnav pip install --no-cache-dir \
+ # ============================================================================
+ RUN git clone --depth 1 --branch ${HABITAT_SIM_TAG} ${HABITAT_SIM_GIT} /tmp/habitat-sim && \
+     conda run -n etpnav pip install --no-cache-dir -r /tmp/habitat-sim/requirements.txt && \
++    git -C /tmp/habitat-sim submodule update --init --depth 1 src/deps/pybind11 && \
++    python -c "from pathlib import Path; p = Path('/tmp/habitat-sim/src/deps/pybind11/include/pybind11/attr.h'); t = p.read_text(); p.write_text(t if '#include <cstdint>' in t else t.replace('#include \\\"cast.h\\\"\\n', '#include \\\"cast.h\\\"\\n#include <cstdint>\\n', 1))" && \
+     cd /tmp/habitat-sim && \
++    CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
+     conda run -n etpnav python setup.py install --headless --with-cuda && \
+     rm -rf /tmp/habitat-sim
+ 
+@@ -102,10 +105,19 @@ RUN env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n etpnav pip install
+ RUN mkdir -p \
+       /opt/conda/envs/etpnav/etc/conda/activate.d \
+       /opt/conda/envs/etpnav/etc/conda/deactivate.d && \
+-    cp -f /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
+-          /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh && \
+-    cp -f /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh \
+-          /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh
++        printf '%s\n' \
++            '#!/bin/bash' \
++            'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
++            'unset LD_LIBRARY_PATH' \
++            > /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh && \
++        printf '%s\n' \
++            '#!/bin/bash' \
++            'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
++            'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
++            > /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh && \
++        chmod +x \
++            /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh \
++            /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh
+ 
+ # ============================================================================
+ # F. 构建验证
+@@ -113,8 +125,7 @@ RUN mkdir -p \
+ COPY docker_build/verify-envs.sh /opt/conftopo-env/bin/verify-envs.sh
+ RUN chmod +x /opt/conftopo-env/bin/verify-envs.sh
+ 
+-RUN /opt/conftopo-env/bin/verify-envs.sh || \
+-    (echo "WARN: verify-envs failed at build time; re-run: verify-envs" && true)
++RUN VERIFY_ONLY=vlnce /opt/conftopo-env/bin/verify-envs.sh
+ 
+ WORKDIR ${WORKSPACE}
+ 
+diff --git a/docker/dockerfile b/docker/dockerfile
+index d7ba578..f065908 100644
+--- a/docker/dockerfile
++++ b/docker/dockerfile
+@@ -229,7 +229,8 @@ LABEL org.opencontainers.image.description="backfill fixes + habitat-lab + conft
+ ENV DEBIAN_FRONTEND=noninteractive
+ ENV MAX_JOBS=1
+ ENV WORKSPACE=/workspace/tangyx7@xiaopeng.com
+-ENV CONFTopo_MAIN_PYTHON=/usr/bin/python3
++ENV CONFTopo_MAIN_ENV=conftopo-main
++ENV CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python
+ ENV MAGNUM_LOG=quiet
+ ENV GLOG_minloglevel=2
+ ENV NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display
+@@ -250,6 +251,8 @@ RUN mkdir -p /usr/share/glvnd/egl_vendor.d && \
+ 
+ # A2. conda 激活时清除 LD_LIBRARY_PATH（避免主环境 PyTorch 3.12 污染 goat/vlnce）
+ RUN mkdir -p \
++    /opt/conda/envs/conftopo-main/etc/conda/activate.d \
++    /opt/conda/envs/conftopo-main/etc/conda/deactivate.d \
+       /opt/conda/envs/vlnce/etc/conda/activate.d \
+       /opt/conda/envs/vlnce/etc/conda/deactivate.d \
+       /opt/conda/envs/goat/etc/conda/activate.d \
+@@ -258,6 +261,18 @@ RUN mkdir -p \
+       '#!/bin/bash' \
+       'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+       'unset LD_LIBRARY_PATH' \
++            > /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh && \
++        printf '%s\n' \
++            '#!/bin/bash' \
++            'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
++            'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
++            > /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
++        chmod +x /opt/conda/envs/conftopo-main/etc/conda/activate.d/unset_ld_path.sh \
++                         /opt/conda/envs/conftopo-main/etc/conda/deactivate.d/restore_ld_path.sh && \
++        printf '%s\n' \
++            '#!/bin/bash' \
++            'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
++            'unset LD_LIBRARY_PATH' \
+       > /opt/conda/envs/vlnce/etc/conda/activate.d/unset_ld_path.sh && \
+     printf '%s\n' \
+       '#!/bin/bash' \
+@@ -275,7 +290,8 @@ RUN mkdir -p \
+ RUN printf '%s\n' \
+       '# ConfTopo runtime defaults (Stage 4 backfill)' \
+       'export WORKSPACE=/workspace/tangyx7@xiaopeng.com' \
+-      'export CONFTopo_MAIN_PYTHON=/usr/bin/python3' \
++    'export CONFTopo_MAIN_ENV=conftopo-main' \
++    'export CONFTopo_MAIN_PYTHON=/opt/conda/envs/conftopo-main/bin/python' \
+       'export MAGNUM_LOG=quiet' \
+       'export GLOG_minloglevel=2' \
+       'export NVIDIA_DRIVER_CAPABILITIES=compute,graphics,utility,video,display' \
+@@ -288,7 +304,7 @@ RUN mkdir -p /opt/conftopo-env/bin && \
+       '' \
+       '# CONFTOPO_ENV_MARKER' \
+       'source /etc/profile.d/conftopo-env.sh' \
+-      'alias conftopo-main="${CONFTopo_MAIN_PYTHON}"' \
++    'alias conftopo-main="conda activate conftopo-main"' \
+       'alias start-vllm="/opt/conftopo-env/bin/start-vllm.sh"' \
+       'alias verify-envs="/opt/conftopo-env/bin/verify-envs.sh"' \
+       '[ -f /opt/conda/etc/profile.d/conda.sh ] && source /opt/conda/etc/profile.d/conda.sh' \
+@@ -307,6 +323,20 @@ RUN chmod +x /opt/conftopo-env/bin/*.sh
+ 
+ RUN mkdir -p ${WORKSPACE}
+ 
++RUN conda create -n conftopo-main python=3.12 pip -y && \
++        conda run -n conftopo-main pip install --no-cache-dir ${PIP_OPTIONS} \
++            "setuptools<75" "packaging>=24.2" \
++            numpy==1.26.4 scipy scikit-learn matplotlib==3.9.4 \
++            pillow tqdm pyyaml networkx==3.2.1 \
++            imageio imageio-ffmpeg h5py lmdb numba \
++            opencv-python-headless \
++            gym==0.26.2 hydra-core omegaconf yacs jsonlines \
++            msgpack msgpack-numpy numpy-quaternion \
++            'transformers>=4.40' timm==1.0.27 \
++            open_clip_torch==3.3.0 ftfy regex \
++            openai safetensors huggingface_hub gdown requests \
++            tensorboardX easydict natsort
++
+ # 主环境: conftopo editable
+ RUN ${CONFTopo_MAIN_PYTHON} -m pip install --no-cache-dir -e /opt/conftopo-src ${PIP_OPTIONS}
+ 
+diff --git a/docker_build/.dockerignore b/docker_build/.dockerignore
+index 05605c1..3790819 100644
+--- a/docker_build/.dockerignore
++++ b/docker_build/.dockerignore
+@@ -37,3 +37,7 @@ docs/
+ !docker_build/*.md
+ Dockerfile.part*.bak
+ docker_build/Dockerfile
++
++# Keep Habitat-Lab source for stage2-related builds.
++!habitat-lab-v0.2.3/
++!habitat-lab-v0.2.3/**
+diff --git a/docker_build/verify-envs.sh b/docker_build/verify-envs.sh
+index 57605db..766d135 100755
+--- a/docker_build/verify-envs.sh
++++ b/docker_build/verify-envs.sh
+@@ -1,33 +1,81 @@
+ #!/bin/bash
+-# Verify conftopo-dev / vllm / goat / etpnav after image build
++# Verify core / vllm / goat / etpnav environments after image build
+ set -euo pipefail
+ 
++MAIN_PY="${CONFTopo_MAIN_PYTHON:-/opt/conda/envs/conftopo-main/bin/python}"
+ DEV_PY="${CONFTopo_DEV_PYTHON:-/opt/conda/envs/conftopo-dev/bin/python}"
+ VLLM_PY="${CONFTopo_VLLM_PYTHON:-/opt/conda/envs/vllm/bin/python}"
+ CONDA="/opt/conda/bin/conda"
+ FAIL=0
++VERIFY_ONLY="${VERIFY_ONLY:-all}"
+ 
+ pass() { echo "  ✓ $*"; }
+ fail() { echo "  ✗ $*"; FAIL=1; }
+ skip() { echo "  ○ $* (not yet built)"; }
+ 
++run_conda_python_check() {
++    local env_name="$1"
++    local label="$2"
++    local code="$3"
++    local extra_ld_path="${4:-}"
++
++    echo "  - ${label}"
++    if [ -n "$extra_ld_path" ]; then
++        LD_LIBRARY_PATH="${extra_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
++            "$CONDA" run -n "$env_name" python -c "$code"
++    else
++        env -u LD_LIBRARY_PATH "$CONDA" run -n "$env_name" python -c "$code"
++    fi
++}
++
++get_habitat_sim_ext_dir() {
++    local env_name="$1"
++
++    "$CONDA" run -n "$env_name" python -c "import sysconfig; from pathlib import Path; print(Path(sysconfig.get_paths()['purelib']) / 'habitat_sim' / '_ext')" | tail -n 1
++}
++
++should_check() {
++    if [ "$VERIFY_ONLY" = "all" ]; then
++        return 0
++    fi
++    case ",${VERIFY_ONLY}," in
++        *",$1,"*) return 0 ;;
++        *) return 1 ;;
++    esac
++}
++
+ echo "========== ConfTopo Environment Verification =========="
+ echo ""
+ 
+-echo "[1] conftopo-dev (Core / 单测) — $DEV_PY"
+-if "$DEV_PY" -c "
++if should_check conftopo-main || should_check conftopo-dev; then
++CORE_ENV=""
++CORE_PY=""
++if "$CONDA" env list | awk '{print $1}' | grep -qx conftopo-main; then
++    CORE_ENV="conftopo-main"
++    CORE_PY="$MAIN_PY"
++elif "$CONDA" env list | awk '{print $1}' | grep -qx conftopo-dev; then
++    CORE_ENV="conftopo-dev"
++    CORE_PY="$DEV_PY"
++fi
++
++echo "[1] core (conftopo-main / conftopo-dev)"
++if [ -z "$CORE_ENV" ]; then
++    skip "conftopo-main / conftopo-dev"
++elif "$CORE_PY" -c "
+ import torch
+ from conftopo import ConfTopoConfig
+ print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
+ import openai
+ print('openai', openai.__version__)
+ " 2>/dev/null; then
+-    pass "conftopo-dev"
++    pass "$CORE_ENV"
+ else
+-    fail "conftopo-dev"
++    fail "$CORE_ENV"
+ fi
+ echo ""
++fi
+ 
++if should_check vllm; then
+ echo "[2] vllm (LLM 服务) — $VLLM_PY"
+ if ! "$CONDA" env list | awk '{print $1}' | grep -qx vllm; then
+     skip "vllm (run Dockerfile.part2)"
+@@ -40,7 +88,9 @@ else
+     fail "vllm environment"
+ fi
+ echo ""
++fi
+ 
++if should_check goat; then
+ echo "[3] goat — ConfTopo-GOAT / habitat-sim 0.2.4"
+ if ! "$CONDA" env list | awk '{print $1}' | grep -qx goat; then
+     skip "goat (run Dockerfile.part3)"
+@@ -59,23 +109,51 @@ else
+     fail "goat environment"
+ fi
+ echo ""
++fi
+ 
+-echo "[4] etpnav — ConfTopo-ETPNav / habitat-sim 0.1.7 + torch 2.8+cu128"
+-if ! "$CONDA" env list | awk '{print $1}' | grep -qx etpnav; then
+-    skip "etpnav (run Dockerfile.part4)"
+-elif env -u LD_LIBRARY_PATH "$CONDA" run -n etpnav python -c "
+-import torch, habitat_sim, gym, transformers
+-from conftopo import ConfTopoConfig
+-print('torch', torch.__version__, 'cuda', torch.cuda.is_available())
+-print('habitat_sim', habitat_sim.__version__, 'gym', gym.__version__)
++if should_check vlnce; then
++echo "[4] vlnce/etpnav — ConfTopo-ETPNav / habitat-sim 0.1.7 + torch 2.8+cu128"
++ETPNAV_ENV=""
++if "$CONDA" env list | awk '{print $1}' | grep -qx vlnce; then
++    ETPNAV_ENV="vlnce"
++elif "$CONDA" env list | awk '{print $1}' | grep -qx etpnav; then
++    ETPNAV_ENV="etpnav"
++fi
++
++if [ -z "$ETPNAV_ENV" ]; then
++    skip "vlnce / etpnav (run unified Dockerfile or Dockerfile.part4)"
++else
++    ETPNAV_EXT_DIR="$(get_habitat_sim_ext_dir "$ETPNAV_ENV")"
++    ETPNAV_EXTRA_LD=""
++    if [ -d "$ETPNAV_EXT_DIR" ]; then
++        ETPNAV_EXTRA_LD="${ETPNAV_EXT_DIR}:/opt/conda/envs/${ETPNAV_ENV}/lib"
++    fi
++
++    if run_conda_python_check "$ETPNAV_ENV" "torch" "
++import torch
++print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'torch_cuda', torch.version.cuda)
++" && \
++        run_conda_python_check "$ETPNAV_ENV" "habitat_sim" "
++import habitat_sim
++print('habitat_sim', habitat_sim.__version__)
++" "$ETPNAV_EXTRA_LD" && \
++        run_conda_python_check "$ETPNAV_ENV" "habitat" "
+ import habitat
+ print('habitat', habitat.__version__)
+-" 2>/dev/null; then
+-    pass "etpnav environment"
+-else
+-    fail "etpnav environment"
++" "$ETPNAV_EXTRA_LD" && \
++        run_conda_python_check "$ETPNAV_ENV" "conftopo + gym + transformers" "
++import gym, transformers
++from conftopo import ConfTopoConfig
++print('gym', gym.__version__, 'transformers', transformers.__version__)
++print('conftopo', ConfTopoConfig.__name__)
++" "$ETPNAV_EXTRA_LD"; then
++        pass "$ETPNAV_ENV environment"
++    else
++        fail "$ETPNAV_ENV environment"
++    fi
+ fi
+ echo ""
++fi
+ 
+ if [ "$FAIL" -eq 0 ]; then
+     echo "========== All required environments OK =========="
+diff --git a/scripts/fuyao-docker-part1.sh b/scripts/fuyao-docker-part1.sh
+index 4dc1564..9df1ffd 100755
+--- a/scripts/fuyao-docker-part1.sh
++++ b/scripts/fuyao-docker-part1.sh
+@@ -25,7 +25,15 @@ echo "Dockerfile:    $DOCKERFILE"
+ echo "Site:          $SITE"
+ echo ""
+ 
+-printf 'y\n' | fuyao docker --push \
+-  --dockerfile="$DOCKERFILE" \
+-  --site="$SITE" \
+-  "${@:2}"
++# fuyao 危险目录提示从 TTY 读入，管道 echo y 无效，用 expect 自动确认
++expect <<EOF
++set timeout -1
++spawn fuyao docker --push --dockerfile=$DOCKERFILE --site=$SITE
++expect {
++  "Do you want to continue?" {
++    send "y\r"
++    exp_continue
++  }
++  eof
++}
++EOF

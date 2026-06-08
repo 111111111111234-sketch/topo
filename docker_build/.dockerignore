@@ -37,3 +37,7 @@ docs/
 !docker_build/*.md
 Dockerfile.part*.bak
 docker_build/Dockerfile
+
+# Keep Habitat-Lab source for stage2-related builds.
+!habitat-lab-v0.2.3/
+!habitat-lab-v0.2.3/**

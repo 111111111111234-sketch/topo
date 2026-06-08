@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import imageio.v2 as imageio
 import numpy as np
 
 from run_goat_minimal import ROOT, find_scene_file, make_sim, normalize_quat
@@ -54,18 +55,28 @@ def run_step(
     previous_action,
     use_placeholder,
     record_topo: bool,
+    frame_dir: Path | None = None,
+    step_index: int = 0,
 ):
     obs = sim.get_sensor_observations()
     state = sim_agent.get_state()
     rgb = obs.get("color_sensor")
+    rgb_save = rgb[..., :3] if rgb is not None and rgb.shape[-1] == 4 else rgb
+    frame_rel = None
+    if frame_dir is not None and rgb_save is not None:
+        frame_path = frame_dir / f"rgb_{step_index:04d}.png"
+        imageio.imwrite(frame_path, rgb_save)
+        frame_rel = str(frame_path.relative_to(ROOT))
     rgb_embed = rgb_to_embedding(rgb) if use_placeholder else encoder.encode_image(rgb)
+    world_position = np.asarray(state.position, dtype=np.float32)
+    world_heading = quat_to_heading([state.rotation.real, *list(state.rotation.imag)])
     out = agent.step({
         "rgb": rgb,
         "rgb_embed": rgb_embed,
-        "position": np.array(state.position, dtype=np.float32),
-        "heading": quat_to_heading([state.rotation.real, *list(state.rotation.imag)]),
+        "position": world_position,
+        "heading": world_heading,
     })
-    rel_position = np.asarray(state.position, dtype=np.float32) - origin
+    rel_position = world_position - origin
     collision = tracker.update(previous_action, rel_position)
     target = out.get("target_position")
     target_id = out.get("target_node_id")
@@ -101,10 +112,17 @@ def run_step(
     if action not in ("stop", "target_reached", "unreachable"):
         sim.step(action)
     rec = {
+        "step": int(step_index),
+        "rgb_frame": frame_rel,
+        "agent_action": "navigate",
         "low_action": action,
         "target_node_id": target_id,
         "target_position": np.asarray(target).round(4).tolist() if target is not None else None,
         "position": rel_position.round(4).tolist(),
+        "heading": float(world_heading),
+        "world_position": world_position.round(4).tolist(),
+        "world_heading": float(world_heading),
+        "rgb_embedding": np.asarray(rgb_embed, dtype=np.float32).round(6).tolist(),
         "navigation_debug": nav,
         "collision_like": bool(collision.get("collision_like")),
         "memory": agent.memory_stats,
@@ -153,6 +171,14 @@ def long_stuck_targets(steps: list[dict[str, Any]], min_steps: int = 20) -> list
                 "displacement": displacement,
             })
     return stuck
+
+
+def planar_target_distance(position: list[float] | None, target: list[float] | None) -> float | None:
+    if position is None or target is None:
+        return None
+    pos = np.asarray(position, dtype=np.float32)
+    tgt = np.asarray(target, dtype=np.float32)
+    return float(np.linalg.norm((pos - tgt)[[0, 2]]))
 
 
 def build_multigoal_acceptance_report(
@@ -240,6 +266,7 @@ def main():
     ap.add_argument("--goal-graph-dir", default="data/goal_graphs/goat")
     ap.add_argument("--output", default="data/logs/goat_topo/multigoal_acceptance/topo_trace_multigoal.json")
     ap.add_argument("--report", default="data/logs/goat_topo/multigoal_acceptance/multigoal_acceptance_report.json")
+    ap.add_argument("--frame-dir", default=None)
     ap.add_argument("--clip-model", default="ViT-B/32")
     ap.add_argument("--clip-device", default="auto")
     ap.add_argument("--object-threshold", type=float, default=None)
@@ -255,6 +282,8 @@ def main():
     ap.add_argument("--viz", action="store_true", help="Run visualize_goat_topo_trace after trace is saved")
     ap.add_argument("--viz-stride", type=int, default=4)
     ap.add_argument("--viz-fps", type=int, default=6)
+    ap.add_argument("--block-stuck-target-after", type=int, default=24)
+    ap.add_argument("--block-stuck-target-min-progress", type=float, default=0.25)
     args = ap.parse_args()
 
     scene_path, episode = pick_episode(ROOT / args.dataset_dir, args.split, args.scene, args.episode_index)
@@ -291,6 +320,9 @@ def main():
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
 
     scene_file = find_scene_file(episode["scene_id"], ROOT / args.scene_root)
+    frame_dir = ROOT / args.frame_dir if args.frame_dir else None
+    if frame_dir is not None:
+        frame_dir.mkdir(parents=True, exist_ok=True)
     sim = make_sim(scene_file)
     sim_agent = sim.initialize_agent(0)
     state = set_start_state(sim_agent, episode)
@@ -308,6 +340,9 @@ def main():
             semantic_before = semantic_node_ids(agent)
             agent.set_new_goal(goal)
             start = len(steps)
+            monitor_target_id = None
+            monitor_start_step = len(steps)
+            monitor_best_distance = None
             memory_reuse_hits = 0
             semantic_reuse_hits = 0
             repeated_goal_reuse_hits = 0
@@ -323,6 +358,8 @@ def main():
                     previous,
                     args.use_placeholder_embed,
                     args.record_topo or args.viz,
+                    frame_dir=frame_dir,
+                    step_index=len(steps),
                 )
                 rec["task_index"] = idx
                 rec["goal"] = {
@@ -340,6 +377,34 @@ def main():
                 if idx == 3 and task0_semantic_nodes and target_id in task0_semantic_nodes:
                     repeated_goal_reuse_hits += 1
                     rec["repeated_goal_reuse"] = True
+                target_distance = planar_target_distance(rec.get("position"), rec.get("target_position"))
+                rec["target_distance"] = target_distance
+                if target_id is None or rec["low_action"] in ("stop", "target_reached"):
+                    monitor_target_id = None
+                    monitor_best_distance = None
+                    monitor_start_step = len(steps)
+                elif target_id != monitor_target_id:
+                    monitor_target_id = target_id
+                    monitor_start_step = len(steps)
+                    monitor_best_distance = target_distance
+                elif target_distance is not None:
+                    best = target_distance if monitor_best_distance is None else monitor_best_distance
+                    if target_distance < best - args.block_stuck_target_min_progress:
+                        monitor_start_step = len(steps)
+                        monitor_best_distance = target_distance
+                    elif len(steps) - monitor_start_step + 1 >= args.block_stuck_target_after:
+                        event = agent.on_navigation_event(target_id, "no_progress_multigoal")
+                        rec["blocked_stuck_target"] = {
+                            "target_node_id": target_id,
+                            "steps": int(len(steps) - monitor_start_step + 1),
+                            "best_distance": float(best),
+                            "current_distance": float(target_distance),
+                            "min_progress": float(args.block_stuck_target_min_progress),
+                            "event": event,
+                        }
+                        monitor_target_id = None
+                        monitor_best_distance = None
+                        monitor_start_step = len(steps)
                 steps.append(rec)
                 if rec["low_action"] == "stop":
                     break
@@ -374,6 +439,13 @@ def main():
         "episode_id": episode["episode_id"],
         "origin_world": origin.round(4).tolist(),
         "start_rotation": episode["start_rotation"],
+        "pose_sources": {
+            "position": "episode_start_relative_from_gt_world",
+            "heading": "habitat_gt_heading",
+            "world_position": "habitat_gt_world_position",
+            "world_heading": "habitat_gt_heading",
+        },
+        "rgb_frame_dir": None if frame_dir is None else str(frame_dir.relative_to(ROOT)),
         "thresholds": {
             "object": config.perception.object_threshold,
             "room": config.perception.room_threshold,

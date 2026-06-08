@@ -78,7 +78,10 @@ RUN conda run -n etpnav pip install --no-cache-dir \
 # ============================================================================
 RUN git clone --depth 1 --branch ${HABITAT_SIM_TAG} ${HABITAT_SIM_GIT} /tmp/habitat-sim && \
     conda run -n etpnav pip install --no-cache-dir -r /tmp/habitat-sim/requirements.txt && \
+    git -C /tmp/habitat-sim submodule update --init --depth 1 src/deps/pybind11 && \
+    python -c "from pathlib import Path; p = Path('/tmp/habitat-sim/src/deps/pybind11/include/pybind11/attr.h'); t = p.read_text(); p.write_text(t if '#include <cstdint>' in t else t.replace('#include \\\"cast.h\\\"\\n', '#include \\\"cast.h\\\"\\n#include <cstdint>\\n', 1))" && \
     cd /tmp/habitat-sim && \
+    CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" \
     conda run -n etpnav python setup.py install --headless --with-cuda && \
     rm -rf /tmp/habitat-sim
 
@@ -102,10 +105,19 @@ RUN env -u PIP_CONSTRAINT env -u LD_LIBRARY_PATH conda run -n etpnav pip install
 RUN mkdir -p \
       /opt/conda/envs/etpnav/etc/conda/activate.d \
       /opt/conda/envs/etpnav/etc/conda/deactivate.d && \
-    cp -f /opt/conda/envs/conftopo-dev/etc/conda/activate.d/unset_ld_path.sh \
-          /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh && \
-    cp -f /opt/conda/envs/conftopo-dev/etc/conda/deactivate.d/restore_ld_path.sh \
-          /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export _CONFTOPO_SAVED_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"' \
+            'unset LD_LIBRARY_PATH' \
+            > /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh && \
+        printf '%s\n' \
+            '#!/bin/bash' \
+            'export LD_LIBRARY_PATH="${_CONFTOPO_SAVED_LD_LIBRARY_PATH:-}"' \
+            'unset _CONFTOPO_SAVED_LD_LIBRARY_PATH' \
+            > /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh && \
+        chmod +x \
+            /opt/conda/envs/etpnav/etc/conda/activate.d/unset_ld_path.sh \
+            /opt/conda/envs/etpnav/etc/conda/deactivate.d/restore_ld_path.sh
 
 # ============================================================================
 # F. 构建验证
@@ -113,8 +125,7 @@ RUN mkdir -p \
 COPY docker_build/verify-envs.sh /opt/conftopo-env/bin/verify-envs.sh
 RUN chmod +x /opt/conftopo-env/bin/verify-envs.sh
 
-RUN /opt/conftopo-env/bin/verify-envs.sh || \
-    (echo "WARN: verify-envs failed at build time; re-run: verify-envs" && true)
+RUN VERIFY_ONLY=vlnce /opt/conftopo-env/bin/verify-envs.sh
 
 WORKDIR ${WORKSPACE}
 
