@@ -29,9 +29,9 @@ class MemoryConfig:
     mid_prune_distance: float = 6.0
     mid_prune_threshold: float = 0.12
     # Relaxed room_level trigger conditions
-    room_level_min_distance: float = 8.0
-    room_level_confidence_max: float = 0.55
-    room_level_detail_max: float = 0.45
+    room_level_min_distance: float = 6.0
+    room_level_confidence_max: float = 0.65
+    room_level_detail_max: float = 0.55
     # Bottom-layer spatial graph: connect nearby room summaries
     room_link_max_distance: float = 12.0
     # Distant waypoint compression (navigation layer)
@@ -45,7 +45,7 @@ class MemoryConfig:
 class PerceptionConfig:
     light_every_step: bool = True
     heavy_enabled: bool = False
-    heavy_interval: int = 5
+    heavy_interval: int = 7
     heavy_on_frontier: bool = True
     heavy_goal_warmup_steps: int = 1
     heavy_goal_sim_threshold: float = 0.35
@@ -53,6 +53,17 @@ class PerceptionConfig:
     # Summary-context heavy perception: separate cooldown and label budget
     heavy_summary_cooldown: int = 8
     heavy_summary_max_labels: int = 12
+    # Phase 3.7: tighten heavy labels with the planner's structure target.
+    # When the planner has chosen a structure target (room / portal /
+    # structural landmark), heavy detection prefers labels relevant to
+    # that anchor:
+    #   * room target  -> contains_labels + goal labels (drops the broad
+    #                     default vocabulary)
+    #   * portal /     -> structural label vocabulary + goal labels
+    #     structural
+    # If False, heavy labels are always derived from goal + perception +
+    # default vocabulary (legacy behaviour).
+    heavy_align_with_structure_target: bool = True
     heavy_backend: str = "groundingdino"
     groundingdino_config: Optional[str] = None
     groundingdino_checkpoint: Optional[str] = None
@@ -60,8 +71,8 @@ class PerceptionConfig:
     groundingdino_text_threshold: float = 0.25
     clip_model: str = "ViT-B/32"
     clip_device: str = "auto"
-    object_threshold: float = 0.23
-    object_detection_threshold: float = 0.25
+    object_threshold: float = 0.28
+    object_detection_threshold: float = 0.40
     room_threshold: float = 0.20
     landmark_threshold: float = 0.22
     # 房间类型标签
@@ -87,6 +98,18 @@ class PlanningConfig:
     frontier_consume_radius: float = 0.75
     target_too_close_radius: float = 0.45
     blocked_target_ttl: int = 20
+    # --- Phase 3: two-stage room-centric planning -----------------------
+    # When enabled, plan() first picks a structure target (room / portal /
+    # structural landmark) and then expands navigation candidates anchored
+    # to that target. Falls back to the legacy single-stage behaviour when
+    # no structure target clears the score threshold.
+    two_stage_enabled: bool = True
+    structure_target_score_threshold: float = 0.05
+    structure_anchor_radius: float = 6.0
+    structure_anchor_bonus: float = 0.25
+    # Far semantic objects (not the goal object) are pruned when a
+    # structure target is active and they sit outside the anchor radius.
+    far_object_skip_when_anchored: bool = True
 
 
 @dataclass

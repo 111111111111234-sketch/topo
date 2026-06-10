@@ -7,6 +7,11 @@ import numpy as np
 import networkx as nx
 
 from conftopo.core.confidence import ConfidenceFactors, compute_semantic_confidence
+from conftopo.core.landmark_roles import (
+    can_promote_object_to_landmark,
+    classify_landmark_role,
+    is_structural_label,
+)
 from conftopo.core.region_rooms import (
     normalize_region_label,
     region_instances_from_waypoints,
@@ -642,6 +647,10 @@ class DynamicTopoMap:
         attrs["viewpoints"] = [obs["viewpoint_id"] for obs in observations if obs.get("viewpoint_id")]
         attrs["granularity"] = "landmark"
         attrs["folded"] = False
+        # Tag with structural/semantic role so downstream consumers (skeleton,
+        # persistence, planner) can treat structural anchors differently from
+        # room-interior props.
+        attrs["landmark_role"] = classify_landmark_role(node.label, attrs)
         self._set_node_type(node, NodeType.LANDMARK)
 
     def _fuse_object_to_landmark(self, node: SemanticNode) -> Optional[str]:
@@ -675,8 +684,34 @@ class DynamicTopoMap:
 
         has_bbox = bool(attrs.get("bbox_observations"))
         has_heavy = attrs.get("source") in ("groundingdino", "heavy")
-        if has_bbox or has_heavy or float(attrs.get("target_relevance", 0.0)) > 0:
+        target_relevance = float(attrs.get("target_relevance", 0.0))
+        multi_view = int(
+            attrs.get("multi_view_count")
+            or attrs.get("history_view_count")
+            or len(attrs.get("viewpoints", []))
+            or max(1, int(node.visit_count))
+        )
+        allowed, role, reason = can_promote_object_to_landmark(
+            label=node.label,
+            confidence=float(node.confidence),
+            multi_view_count=multi_view,
+            target_relevance=target_relevance,
+            source=str(attrs.get("source", "")),
+            has_bbox=has_bbox,
+        )
+        attrs["promotion_check"] = {
+            "allowed": allowed,
+            "role": role,
+            "reason": reason,
+            "confidence": float(node.confidence),
+            "multi_view": multi_view,
+            "target_relevance": target_relevance,
+        }
+        if allowed:
             self._promote_object_to_landmark_node(node)
+            # promote_check wrote landmark_role; double-check using the
+            # final attrs in case label changed.
+            attrs["landmark_role"] = role
             return node.node_id
         return None
 
@@ -751,15 +786,27 @@ class DynamicTopoMap:
                     merged.add(node_b.node_id)
 
     def _is_persistent_structure_node(self, node: SemanticNode) -> bool:
-        """Bottom-layer spatial anchors that should survive long-range navigation."""
+        """Bottom-layer spatial anchors that should survive long-range navigation.
+
+        Only ROOM summaries and **structural** landmarks (door / corridor /
+        stair / ...) are unconditionally persistent. Semantic landmarks
+        (chair, tv, ...) survive only when they remain task-relevant; this
+        keeps the long-term skeleton focused on room-to-room anchors.
+        """
         if node.node_type == NodeType.ROOM:
             return node.attributes.get("summary_type") == "room_region"
-        if node.node_type == NodeType.LANDMARK:
-            source = node.attributes.get("landmark_source", "")
-            return source in ("goal_hint", "promoted_object") or bool(
+        if node.node_type != NodeType.LANDMARK:
+            return False
+        source = node.attributes.get("landmark_source", "")
+        if source == "goal_hint":
+            return True
+        role = classify_landmark_role(node.label, node.attributes)
+        if role == "structural":
+            return source in ("promoted_object", "environment", "goal_hint") or bool(
                 node.attributes.get("promoted_from_object")
             )
-        return False
+        # semantic landmark: only persist while task-relevant
+        return float(node.attributes.get("target_relevance", 0.0)) > 0.0
 
     def prune_low_confidence(self, agent_pos: Optional[np.ndarray] = None):
         """Remove nodes with confidence below distance-aware thresholds."""
@@ -1026,6 +1073,145 @@ class DynamicTopoMap:
         ]
         return nodes, edges
 
+    # ------------------------------------------------------------------
+    # Double-layer views (Phase 2)
+    # ------------------------------------------------------------------
+    # We do NOT split the underlying graph. Instead, we expose read-only
+    # views that select node/edge subsets relevant to each layer:
+    #
+    #   * navigation layer  -> waypoints (visited / frontier / candidate)
+    #                          + NAVIGABLE edges
+    #   * structure layer   -> rooms + portals + structural landmarks
+    #                          + ADJACENT_TO / BELONGS_TO edges between them
+    #
+    # Consumers (planner, viz, debug) should prefer these views over
+    # touching ``self.graph`` directly so that future storage refactors do
+    # not ripple through the codebase.
+
+    _NAV_NODE_TYPES = (
+        NodeType.WAYPOINT_VISITED,
+        NodeType.WAYPOINT_FRONTIER,
+        NodeType.WAYPOINT_CANDIDATE,
+    )
+
+    def _is_structural_landmark_node(self, node: SemanticNode) -> bool:
+        if node.node_type != NodeType.LANDMARK:
+            return False
+        attrs = node.attributes
+        if attrs.get("synthetic_portal") or attrs.get("structure_role") == "portal":
+            return True
+        if attrs.get("landmark_source") == "environment" or attrs.get("source") == "environment":
+            return False
+        return classify_landmark_role(node.label, attrs) == "structural"
+
+    def navigation_layer_nodes(self) -> List[SemanticNode]:
+        """Return the navigation layer node set (waypoints only)."""
+        return [
+            node for node in self._nodes.values()
+            if node.node_type in self._NAV_NODE_TYPES
+        ]
+
+    def navigation_layer_edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Return NAVIGABLE edges between waypoint nodes."""
+        nav_ids = {node.node_id for node in self.navigation_layer_nodes()}
+        edges: List[Tuple[str, str, Dict[str, Any]]] = []
+        for node_a, node_b, data in self.graph.edges(data=True):
+            if data.get("edge_type") != EdgeType.NAVIGABLE.value:
+                continue
+            if node_a in nav_ids and node_b in nav_ids:
+                edges.append((node_a, node_b, dict(data)))
+        return edges
+
+    def structure_layer_nodes(self) -> List[SemanticNode]:
+        """Rooms + portals + structural landmarks that form the skeleton."""
+        out: List[SemanticNode] = []
+        for node in self._nodes.values():
+            if node.node_type == NodeType.ROOM and node.attributes.get("summary_type") == "room_region":
+                out.append(node)
+            elif self._is_structural_landmark_node(node):
+                out.append(node)
+        return out
+
+    def structure_layer_edges(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """ADJACENT_TO / BELONGS_TO edges within the structure layer."""
+        struct_ids = {node.node_id for node in self.structure_layer_nodes()}
+        wanted = (EdgeType.ADJACENT_TO.value, EdgeType.BELONGS_TO.value)
+        edges: List[Tuple[str, str, Dict[str, Any]]] = []
+        for node_a, node_b, data in self.graph.edges(data=True):
+            if data.get("edge_type") not in wanted:
+                continue
+            if node_a in struct_ids and node_b in struct_ids:
+                edges.append((node_a, node_b, dict(data)))
+        return edges
+
+    def cross_layer_waypoint_room_edges(self) -> List[Tuple[str, str]]:
+        """Cross-layer BELONGS_TO edges binding waypoints to rooms."""
+        rooms = {
+            node.node_id for node in self._nodes.values()
+            if node.node_type == NodeType.ROOM
+            and node.attributes.get("summary_type") == "room_region"
+        }
+        waypoints = {node.node_id for node in self.navigation_layer_nodes()}
+        out: List[Tuple[str, str]] = []
+        for node_a, node_b, data in self.graph.edges(data=True):
+            if data.get("edge_type") != EdgeType.BELONGS_TO.value:
+                continue
+            if node_a in waypoints and node_b in rooms:
+                out.append((node_a, node_b))
+            elif node_b in waypoints and node_a in rooms:
+                out.append((node_b, node_a))
+        return out
+
+    def get_navigation_view(self) -> Dict[str, Any]:
+        """Snapshot of the navigation layer (waypoints + navigable edges)."""
+        nodes = self.navigation_layer_nodes()
+        edges = self.navigation_layer_edges()
+        return {
+            "layer": "navigation",
+            "nodes": [
+                {
+                    "id": n.node_id,
+                    "type": n.node_type.value,
+                    "position": n.position.tolist(),
+                    "label": n.label,
+                    "attributes": dict(n.attributes),
+                }
+                for n in nodes
+            ],
+            "edges": [
+                {"source": a, "target": b, "type": data.get("edge_type", ""),
+                 "weight": float(data.get("weight", 1.0))}
+                for a, b, data in edges
+            ],
+        }
+
+    def get_structure_view(self) -> Dict[str, Any]:
+        """Snapshot of the structural skeleton layer."""
+        nodes = self.structure_layer_nodes()
+        edges = self.structure_layer_edges()
+        cross = self.cross_layer_waypoint_room_edges()
+        return {
+            "layer": "structure",
+            "nodes": [
+                {
+                    "id": n.node_id,
+                    "type": n.node_type.value,
+                    "position": n.position.tolist(),
+                    "label": n.label,
+                    "attributes": dict(n.attributes),
+                }
+                for n in nodes
+            ],
+            "edges": [
+                {"source": a, "target": b, "type": data.get("edge_type", ""),
+                 "weight": float(data.get("weight", 1.0))}
+                for a, b, data in edges
+            ],
+            "waypoint_room_bindings": [
+                {"waypoint_id": wp, "room_id": room} for wp, room in cross
+            ],
+        }
+
     def _room_for_transition(
         self,
         position: np.ndarray,
@@ -1276,11 +1462,27 @@ class DynamicTopoMap:
         self.add_edge(node_a, node_b, edge_type, weight=float(weight))
 
     def _nav_landmarks(self) -> List[SemanticNode]:
-        return [
-            node for node in self.get_nodes_by_type(NodeType.LANDMARK)
-            if node.attributes.get("landmark_source") != "environment"
-            and node.attributes.get("source") != "environment"
-        ]
+        """Landmarks eligible for the long-term spatial structure skeleton.
+
+        Only **structural** landmarks (door / corridor / stair / window /
+        synthetic portals) participate in room-portal-room skeleton building.
+        Semantic landmarks (sofa / tv / vase) stay in the local semantic
+        layer and never become portals or hubs.
+        """
+        result = []
+        for node in self.get_nodes_by_type(NodeType.LANDMARK):
+            attrs = node.attributes
+            if attrs.get("landmark_source") == "environment" or attrs.get("source") == "environment":
+                continue
+            if attrs.get("synthetic_portal") or attrs.get("structure_role") == "portal":
+                result.append(node)
+                continue
+            role = classify_landmark_role(node.label, attrs)
+            attrs["landmark_role"] = role
+            if role != "structural":
+                continue
+            result.append(node)
+        return result
 
     def _nearest_nav_landmark(
         self,
@@ -1418,6 +1620,7 @@ class DynamicTopoMap:
                         "structure_anchor": True,
                         "structure_role": "portal",
                         "synthetic_portal": True,
+                        "landmark_role": "structural",
                         "structure_room_pairs": [list(pair_key)],
                         "portal_ref": ref_portal.node_id if ref_portal else None,
                         "structure_pair_labels": [
@@ -1649,6 +1852,66 @@ class DynamicTopoMap:
                 best = room
                 best_dist = dist
         return best
+
+    def assign_waypoint_to_room(
+        self,
+        waypoint_id: str,
+        view_room_label: Optional[str] = None,
+    ) -> Optional[str]:
+        """Bind a visited waypoint to its room summary explicitly.
+
+        Returns the room summary id if a binding was created/updated, else
+        ``None``. The binding lives both as ``waypoint.attributes["room_id"]``
+        (cheap reads) and as a ``BELONGS_TO`` edge (so debug / viz code that
+        traverses edges sees a consistent picture).
+        """
+        wp = self._nodes.get(waypoint_id)
+        if wp is None or wp.node_type != NodeType.WAYPOINT_VISITED:
+            return None
+
+        rooms = self._room_region_summaries()
+        if not rooms:
+            wp.attributes.pop("room_id", None)
+            wp.attributes.pop("room_label", None)
+            return None
+
+        label_key = None
+        if view_room_label is None:
+            view_room_label = wp.attributes.get("view_room_label")
+        if view_room_label and str(view_room_label).strip().lower() != "unknown":
+            label_key = normalize_region_label(str(view_room_label)) or str(view_room_label).strip().lower()
+
+        labelled: List[SemanticNode] = []
+        if label_key:
+            for room in rooms:
+                room_key = normalize_region_label(room.label) or str(room.label or "").strip().lower()
+                if room_key == label_key:
+                    labelled.append(room)
+
+        candidate_pool = labelled or rooms
+        room = min(
+            candidate_pool,
+            key=lambda r: float(np.linalg.norm(r.position - wp.position)),
+        )
+        dist = float(np.linalg.norm(room.position - wp.position))
+        # Be lenient: a waypoint should bind even slightly outside the
+        # summary_radius if it's the nearest matching room.
+        if dist > self.summary_radius * 2.0 and not labelled:
+            wp.attributes.pop("room_id", None)
+            wp.attributes.pop("room_label", None)
+            return None
+
+        prev_room_id = wp.attributes.get("room_id")
+        wp.attributes["room_id"] = room.node_id
+        wp.attributes["room_label"] = room.label
+        wp.attributes["room_distance"] = dist
+
+        if prev_room_id and prev_room_id != room.node_id and self.graph.has_edge(waypoint_id, prev_room_id):
+            edge = self.graph.edges[waypoint_id, prev_room_id]
+            if edge.get("edge_type") == EdgeType.BELONGS_TO.value:
+                self.graph.remove_edge(waypoint_id, prev_room_id)
+        self.add_edge(waypoint_id, room.node_id, EdgeType.BELONGS_TO)
+        return room.node_id
 
     def mark_recovered_from_summary(
         self,

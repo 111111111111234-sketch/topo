@@ -18,6 +18,7 @@ from conftopo.core.gt_room_regions import (
     room_for_waypoint_gt,
     rooms_from_gt_regions,
 )
+from conftopo.core.landmark_roles import classify_landmark_role, is_structural_label
 from conftopo.core.region_rooms import (
     normalize_region_label,
     room_for_labeled_waypoint,
@@ -89,26 +90,53 @@ def is_navigation_landmark(node: dict) -> bool:
     return node.get("type") == "landmark" and not is_environment_landmark(node)
 
 
-def is_structure_anchor_landmark(node: dict) -> bool:
+def is_structural_landmark_node(node: dict) -> bool:
+    """Structural anchors: portals + door/corridor/stair-like landmarks.
+
+    Mirrors :func:`conftopo.core.dynamic_topo_map.DynamicTopoMap._is_structural_landmark_node`
+    so viz filters and structure-layer skeleton stay in lock-step.
+    """
     if not is_navigation_landmark(node):
         return False
     attrs = node.get("attributes") or {}
-    return attrs.get("structure_role") == "portal"
+    if attrs.get("synthetic_portal") or attrs.get("structure_role") == "portal":
+        return True
+    explicit = attrs.get("landmark_role")
+    if explicit in ("structural", "semantic"):
+        return explicit == "structural"
+    return is_structural_label(node.get("label"))
+
+
+def is_structure_anchor_landmark(node: dict) -> bool:
+    """Backward-compat alias kept for existing viz code paths."""
+    return is_structural_landmark_node(node)
 
 
 def is_portal_landmark(node: dict) -> bool:
-    return is_structure_anchor_landmark(node)
+    if not is_navigation_landmark(node):
+        return False
+    attrs = node.get("attributes") or {}
+    return attrs.get("structure_role") == "portal" or bool(attrs.get("synthetic_portal"))
 
 
 def is_persistent_structure_node(node: dict) -> bool:
-    """Bottom-layer room/landmark anchors that persist across waypoint motion."""
+    """Bottom-layer room/landmark anchors that persist across waypoint motion.
+
+    Aligned with the core ``_is_persistent_structure_node``: ROOM summaries
+    and structural landmarks are unconditional; semantic landmarks need a
+    positive ``target_relevance`` to count.
+    """
     if is_room_summary_node(node):
         return True
     if not is_navigation_landmark(node):
         return False
+    if is_structural_landmark_node(node):
+        return True
     attrs = node.get("attributes") or {}
-    source = attrs.get("landmark_source", "")
-    return source in ("goal_hint", "promoted_object") or bool(attrs.get("promoted_from_object"))
+    try:
+        return float(attrs.get("target_relevance", 0.0)) > 0.0
+    except (TypeError, ValueError):
+        return False
 
 
 def node_distance_to_agent(node: dict, agent_pos: np.ndarray) -> float:
@@ -420,6 +448,9 @@ def filter_topo_nodes(
       object_only   - object granularity nodes near agent
       summary_only  - room_region summaries only
       near_only     - nodes within near_radius
+      navigation_view - waypoints only (mirrors core get_navigation_view)
+      structure_view  - room summaries + structural landmarks (mirrors
+                        core get_structure_view)
     """
     if mode == "full":
         out = []
@@ -551,6 +582,28 @@ def filter_topo_nodes(
                 if dist <= near_radius * 2:
                     out.append(n)
             elif not (n.get("attributes") or {}).get("folded") and dist <= near_radius:
+                out.append(n)
+        return out
+    elif mode == "navigation_view":
+        # Mirrors DynamicTopoMap.get_navigation_view: waypoint layer only.
+        return [
+            n for n in nodes
+            if n.get("type") in (
+                "waypoint_visited",
+                "waypoint_frontier",
+                "waypoint_candidate",
+            )
+        ]
+    elif mode == "structure_view":
+        # Mirrors DynamicTopoMap.get_structure_view: room summaries +
+        # structural landmarks (including synthetic portals). Semantic
+        # landmarks, objects, and waypoints are excluded.
+        out = []
+        for n in nodes:
+            if is_room_summary_node(n):
+                out.append(n)
+                continue
+            if is_structural_landmark_node(n):
                 out.append(n)
         return out
     return nodes

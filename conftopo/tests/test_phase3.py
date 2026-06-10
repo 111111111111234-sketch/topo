@@ -548,6 +548,139 @@ def test_room_summary_is_plan_candidate():
     assert plan.get("target_node_id") == summary_id
 
 
+def test_two_stage_planner_picks_goal_relevant_room_as_structure_target():
+    """Stage 1 should pick the kitchen (contains sink) as structure target."""
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+
+    agent._position = np.zeros(3, dtype=np.float32)
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
+    agent._cur_vp_id = cur_vp
+
+    kitchen_id = agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]})
+    agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([10.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="bedroom",
+        attributes={"summary_type": "room_region", "contains_labels": ["bed"]})
+
+    plan = agent.plan()
+    assert plan.get("structure_target_id") == kitchen_id
+
+
+def test_two_stage_planner_prefers_anchored_waypoint_over_far_object():
+    """Frontier inside chosen room should outrank a stray far object."""
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+
+    agent._position = np.zeros(3, dtype=np.float32)
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
+    agent._cur_vp_id = cur_vp
+
+    # Kitchen with the goal object label as structure target.
+    kitchen_id = agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]})
+    # Frontier waypoint inside the kitchen anchor radius.
+    frontier_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_FRONTIER,
+        position=np.array([4.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.4,
+        attributes={"room_id": kitchen_id},
+    )
+    # An unrelated stray semantic object far away from the kitchen.
+    far_chair = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([0.0, 0.0, 20.0], dtype=np.float32),
+        confidence=0.6, label="chair",
+        attributes={"granularity": "object"},
+    )
+    agent.topo_map.add_edge(cur_vp, frontier_id, EdgeType.NAVIGABLE)
+
+    plan = agent.plan()
+    assert plan.get("structure_target_id") == kitchen_id
+    assert plan.get("target_node_id") in (frontier_id, kitchen_id)
+    assert plan.get("target_node_id") != far_chair
+    skipped_ids = {item["node_id"] for item in agent._last_skipped_candidates}
+    assert far_chair in skipped_ids
+
+
+def test_two_stage_planner_disabled_falls_back_to_legacy():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    config.planning.two_stage_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+
+    agent._position = np.zeros(3, dtype=np.float32)
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
+    agent._cur_vp_id = cur_vp
+
+    summary_id = agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]})
+    agent.topo_map.add_edge(cur_vp, summary_id, EdgeType.NAVIGABLE)
+
+    plan = agent.plan()
+    assert plan.get("structure_target_id") is None
+    assert plan.get("target_node_id") == summary_id
+
+
+def test_two_stage_planner_keeps_goal_object_anchored():
+    """Direct hit of the goal object should not be filtered by anchored skip."""
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+
+    agent._position = np.zeros(3, dtype=np.float32)
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
+    agent._cur_vp_id = cur_vp
+
+    kitchen_id = agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]})
+    # Far goal-object hit: should NOT be filtered even though outside anchor.
+    sink_id = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([0.0, 0.0, 20.0], dtype=np.float32),
+        confidence=0.9, label="sink",
+        embedding=embed.copy(),
+        attributes={"granularity": "object"},
+    )
+
+    agent.plan()
+    skipped_ids = {item["node_id"] for item in agent._last_skipped_candidates}
+    assert sink_id not in skipped_ids
+    assert agent._last_structure_target_id == kitchen_id
+
+
 def test_heavy_summary_labels_exclude_vocabulary():
     from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
     config = ConfTopoConfig()
@@ -571,6 +704,322 @@ def test_heavy_summary_labels_exclude_vocabulary():
     for vocab_word in DEFAULT_HEAVY_OBJECT_VOCABULARY:
         if vocab_word not in ("sink",):
             assert vocab_word not in labels, f"{vocab_word} should not be in summary-context labels"
+
+
+def test_heavy_labels_align_with_room_structure_target():
+    """Room structure target replaces broad vocab with its contains_labels."""
+    from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_perception = {}
+
+    room = agent.topo_map._nodes.setdefault(
+        "kitchen_room",
+        agent.topo_map.get_node(
+            agent.topo_map.add_node(
+                NodeType.ROOM,
+                position=np.array([2.0, 0.0, 0.0], dtype=np.float32),
+                confidence=0.7,
+                label="kitchen",
+                attributes={
+                    "summary_type": "room_region",
+                    "contains_labels": ["sink", "faucet"],
+                },
+            )
+        ),
+    )
+
+    labels = agent._heavy_labels(reason="interval", structure_target=room)
+    assert "sink" in labels
+    assert "faucet" in labels
+    # Broad vocab is suppressed in favor of the room's own labels.
+    suppressed = [v for v in DEFAULT_HEAVY_OBJECT_VOCABULARY if v not in ("sink",)]
+    for vocab_word in suppressed:
+        assert vocab_word not in labels
+
+
+def test_heavy_labels_align_with_portal_structure_target():
+    """Portal/structural-landmark target injects structural vocabulary."""
+    from conftopo.agents.goat_agent import (
+        DEFAULT_HEAVY_OBJECT_VOCABULARY,
+        DEFAULT_STRUCTURAL_HEAVY_VOCABULARY,
+    )
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_perception = {}
+
+    portal_id = agent.topo_map.add_node(
+        NodeType.LANDMARK,
+        position=np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="door",
+        attributes={
+            "structure_role": "portal",
+            "synthetic_portal": True,
+            "structure_pair_labels": ["kitchen", "hallway"],
+        },
+    )
+    portal = agent.topo_map.get_node(portal_id)
+    labels = agent._heavy_labels(reason="interval", structure_target=portal)
+    assert "sink" in labels  # goal label always kept
+    assert any(w in labels for w in DEFAULT_STRUCTURAL_HEAVY_VOCABULARY)
+    assert "hallway" in labels  # paired room label injected
+    # broad vocabulary suppressed (except items that overlap with the
+    # structural vocab like "door").
+    suppressed = [
+        v for v in DEFAULT_HEAVY_OBJECT_VOCABULARY
+        if v not in ("sink", "door")
+    ]
+    for vocab_word in suppressed:
+        assert vocab_word not in labels
+
+
+def test_heavy_align_with_structure_target_disabled_uses_default_vocab():
+    from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    config.perception.heavy_align_with_structure_target = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_perception = {}
+
+    room_id = agent.topo_map.add_node(
+        NodeType.ROOM,
+        position=np.array([2.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]},
+    )
+    room = agent.topo_map.get_node(room_id)
+    labels = agent._heavy_labels(reason="interval", structure_target=room)
+    # With alignment disabled, default vocab still injected.
+    for vocab_word in DEFAULT_HEAVY_OBJECT_VOCABULARY:
+        assert vocab_word in labels
+
+
+def test_heavy_detection_boosts_structural_label_relevance():
+    """Structural detections (door) get a relevance bump even when not the goal."""
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    config.perception.heavy_interval = 1
+    config.perception.heavy_goal_warmup_steps = 99
+    agent = ConfTopoGOATAgent(config)
+    agent.set_heavy_perceiver(
+        HeavyPerceiver(FakeGroundingDINOBackend([
+            {"label": "door", "bbox": [0.4, 0.4, 0.6, 0.6], "confidence": 0.7},
+        ]), min_confidence=0.2)
+    )
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_perception = {}
+    agent._goal_local_step = 1
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
+    agent._cur_vp_id = cur_vp
+
+    agent._add_heavy_object_nodes(cur_vp, room_label="kitchen")
+    door_nodes = [
+        n for n in agent.topo_map.get_nodes_by_type(NodeType.OBJECT)
+        if n.label == "door"
+    ]
+    assert door_nodes, "expected a door OBJECT node from heavy perception"
+    relevance = float(door_nodes[0].attributes.get("target_relevance", 0.0))
+    assert relevance > 0.0, "structural label should receive relevance boost"
+
+
+# -----------------------------------------------------------------------
+# RoomClassifier tests
+# -----------------------------------------------------------------------
+
+def test_room_classifier_temporal_smoothing():
+    """Single-frame observation must NOT confirm a room; needs K consistent frames."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=5, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.30, transition_min_displacement=0.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # One bedroom frame: should not confirm yet
+    r = clf.update("bedroom", 0.45, position=pos)
+    assert r.confirmed_label is None, "single frame must not confirm"
+    # Three more bedroom frames: now 4/5 window → should confirm
+    for _ in range(3):
+        r = clf.update("bedroom", 0.45, position=pos)
+    assert r.confirmed_label == "bedroom"
+def test_room_classifier_temporal_smoothing():
+    """Single-frame observation must NOT confirm a room; needs K consistent frames.
+
+    With vote_window=4, half=2 frames are required before the first
+    confirmation can fire (see room_classifier.py window_full_enough logic).
+    """
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=4, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.30, transition_min_displacement=0.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # One bedroom frame: window has 1 item, half=2 so NOT yet confirmed
+    r = clf.update("bedroom", 0.45, position=pos)
+    assert r.confirmed_label is None, "single frame must not confirm (window not half full)"
+    # Second frame: window has 2 items (half=2), fraction=1.0 ≥ 0.6 → confirmed
+    r = clf.update("bedroom", 0.45, position=pos)
+    assert r.confirmed_label == "bedroom", "two consistent frames should confirm"
+
+
+def test_room_classifier_score_distribution():
+    """scores dict must contain all observed labels and sum ~1."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=5, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.25, transition_min_displacement=0.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    for lbl, conf in [("bedroom", 0.40), ("hallway", 0.35), ("bedroom", 0.42), ("bedroom", 0.38)]:
+        clf.update(lbl, conf, position=pos)
+    r = clf.update("bedroom", 0.41, position=pos)
+    assert "bedroom" in r.scores
+    assert "hallway" in r.scores
+    assert r.scores["bedroom"] > r.scores["hallway"]
+    total = sum(r.scores.values())
+    assert abs(total - 1.0) < 0.05, f"scores should sum ~1, got {total}"
+
+
+def test_room_classifier_transition_requires_displacement():
+    """No transition should fire if agent hasn't moved enough."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=3, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.25,
+                               transition_min_displacement=2.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # Confirm bedroom first with no movement
+    for _ in range(3):
+        clf.update("bedroom", 0.45, position=pos)
+    # Now switch to living_room frames, same position
+    transitions = []
+    for _ in range(3):
+        r = clf.update("living room", 0.45, position=pos)
+        transitions.append(r.is_transition)
+    assert not any(transitions), "transition should not fire without displacement"
+    # Same switch but with displacement > threshold
+    far_pos = np.array([5.0, 0.0, 0.0], dtype=np.float32)
+    clf2 = RoomClassifier(cfg)
+    for _ in range(3):
+        clf2.update("bedroom", 0.45, position=pos)
+    found = False
+    for _ in range(3):
+        r = clf2.update("living room", 0.45, position=far_pos)
+        if r.is_transition:
+            found = True
+            break
+    assert found, "transition should fire with sufficient displacement"
+def test_room_classifier_transition_requires_displacement():
+    """No transition should fire if agent hasn't moved enough."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=4, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.25,
+                               transition_min_displacement=2.0,
+                               transition_holdoff_steps=0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # Confirm bedroom first (need ≥2 frames since half=2)
+    for _ in range(4):
+        clf.update("bedroom", 0.45, position=pos)
+    assert clf._confirmed == "bedroom"
+    # Switch to living_room at same position — must NOT transition
+    transitions = []
+    for _ in range(4):
+        r = clf.update("living room", 0.45, position=pos)
+        transitions.append(r.is_transition)
+    assert not any(transitions), "transition should not fire without displacement"
+    # Same switch but with displacement > threshold
+    far_pos = np.array([5.0, 0.0, 0.0], dtype=np.float32)
+    clf2 = RoomClassifier(cfg)
+    for _ in range(4):
+        clf2.update("bedroom", 0.45, position=pos)
+    assert clf2._confirmed == "bedroom"
+    found = False
+    for _ in range(4):
+        r = clf2.update("living room", 0.45, position=far_pos)
+        if r.is_transition:
+            found = True
+            break
+    assert found, "transition should fire with sufficient displacement"
+
+
+def test_room_classifier_object_prior_boosts_room():
+    """Detected 'bed' should boost bedroom over competing rooms."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=3, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.25, transition_min_displacement=0.0,
+                               object_prior_weight=1.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # Feed ambiguous frames with a bed detection
+    for _ in range(3):
+        clf.update("bedroom", 0.30, position=pos, object_labels=["bed", "wardrobe"])
+    r = clf.update("hallway", 0.30, position=pos, object_labels=["bed"])
+    assert r.scores.get("bedroom", 0) > r.scores.get("hallway", 0), \
+        "object prior should keep bedroom above hallway"
+
+
+def test_room_classifier_noise_frame_ignored():
+    """Frames below min_raw_confidence must not affect the vote window."""
+    from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
+    cfg = RoomClassifierConfig(vote_window=5, confirm_vote_fraction=0.60,
+                               min_raw_confidence=0.32, transition_min_displacement=0.0)
+    clf = RoomClassifier(cfg)
+    pos = np.zeros(3, dtype=np.float32)
+    # Four bedroom frames above threshold
+    for _ in range(4):
+        clf.update("bedroom", 0.45, position=pos)
+    # Two very low-confidence hallway frames (should be ignored)
+    for _ in range(2):
+        clf.update("hallway", 0.20, position=pos)
+    r = clf.update("bedroom", 0.45, position=pos)
+    assert r.confirmed_label == "bedroom", "low-conf frames must not displace bedroom"
+
+
+def test_agent_waypoint_stores_room_scores():
+    """After update_memory, cur_vp should have room_scores attribute."""
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._heading = 0.0
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_perception = {
+        "room_label": "bedroom",
+        "room_confidence": 0.45,
+        "goal_scores": [],
+        "landmark_scores": [],
+    }
+    # Run enough steps to get 5 consistent bedroom frames
+    for _ in range(5):
+        agent.update_memory()
+    wp = agent.topo_map.get_node(agent._cur_vp_id)
+    assert wp is not None
+    scores = wp.attributes.get("room_scores")
+    assert isinstance(scores, dict) and len(scores) > 0, \
+        "waypoint should store room_scores distribution"
 
 
 def test_heavy_summary_respects_cooldown():
@@ -649,6 +1098,26 @@ def test_environment_landmark_not_created_as_map_node():
 
 
 def test_object_promotes_to_landmark_at_mid_distance():
+    """Structural label (door) under heavy detection promotes cheaply."""
+    topo = DynamicTopoMap()
+    obj_id, _ = topo.upsert_object_observation(
+        label="door",
+        bbox=[0, 0, 10, 10],
+        confidence=0.55,
+        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        view_heading=0.0,
+        source="groundingdino",
+    )
+    topo.step()
+    topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
+    node = topo.get_node(obj_id)
+    assert node.node_type == NodeType.LANDMARK
+    assert node.attributes.get("promoted_from_object") is True
+    assert node.attributes.get("landmark_role") == "structural"
+
+
+def test_semantic_object_not_auto_promoted():
+    """Semantic label with low confidence / single view stays as object."""
     topo = DynamicTopoMap()
     obj_id, _ = topo.upsert_object_observation(
         label="rack",
@@ -661,8 +1130,267 @@ def test_object_promotes_to_landmark_at_mid_distance():
     topo.step()
     topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
     node = topo.get_node(obj_id)
+    assert node.node_type == NodeType.OBJECT
+    check = node.attributes.get("promotion_check") or {}
+    assert check.get("allowed") is False
+    assert check.get("role") == "semantic"
+
+
+def test_semantic_object_promoted_when_task_relevant():
+    """Semantic label with strong task relevance + high confidence promotes."""
+    topo = DynamicTopoMap()
+    obj_id, _ = topo.upsert_object_observation(
+        label="tv",
+        bbox=[0, 0, 10, 10],
+        confidence=0.75,
+        position=np.array([7.0, 0.0, 0.0], dtype=np.float32),
+        view_heading=0.0,
+        source="groundingdino",
+        target_relevance=0.5,
+    )
+    topo.step()
+    topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
+    node = topo.get_node(obj_id)
     assert node.node_type == NodeType.LANDMARK
-    assert node.attributes.get("promoted_from_object") is True
+    assert node.attributes.get("landmark_role") == "semantic"
+
+
+def test_persistent_structure_only_for_structural_landmark():
+    """Promoted semantic landmark is no longer unconditionally persistent."""
+    topo = DynamicTopoMap()
+    structural_id = topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="door",
+        attributes={
+            "landmark_source": "promoted_object",
+            "promoted_from_object": True,
+            "landmark_role": "structural",
+        },
+    )
+    semantic_id = topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="vase",
+        attributes={
+            "landmark_source": "promoted_object",
+            "promoted_from_object": True,
+            "landmark_role": "semantic",
+        },
+    )
+    assert topo._is_persistent_structure_node(topo.get_node(structural_id)) is True
+    assert topo._is_persistent_structure_node(topo.get_node(semantic_id)) is False
+
+
+def test_assign_waypoint_to_room_binds_explicit_room_id():
+    """Visited waypoint should get an explicit room_id + BELONGS_TO edge."""
+    topo = DynamicTopoMap()
+    room_id = topo.add_node(
+        NodeType.ROOM,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="kitchen",
+        attributes={
+            "summary_type": "room_region",
+            "contains_labels": ["sink"],
+        },
+    )
+    wp_id = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        attributes={"view_room_label": "kitchen"},
+    )
+    bound = topo.assign_waypoint_to_room(wp_id, view_room_label="kitchen")
+    assert bound == room_id
+    wp = topo.get_node(wp_id)
+    assert wp.attributes.get("room_id") == room_id
+    assert wp.attributes.get("room_label") == "kitchen"
+    assert topo.graph.has_edge(wp_id, room_id)
+    assert topo.graph.edges[wp_id, room_id]["edge_type"] == EdgeType.BELONGS_TO.value
+
+
+def test_assign_waypoint_to_room_prefers_matching_label():
+    """When two rooms exist, label match wins over pure distance."""
+    topo = DynamicTopoMap()
+    far_kitchen = topo.add_node(
+        NodeType.ROOM,
+        position=np.array([4.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]},
+    )
+    near_bedroom = topo.add_node(
+        NodeType.ROOM,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="bedroom",
+        attributes={"summary_type": "room_region", "contains_labels": ["bed"]},
+    )
+    wp_id = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        attributes={"view_room_label": "kitchen"},
+    )
+    bound = topo.assign_waypoint_to_room(wp_id)
+    assert bound == far_kitchen
+    assert topo.get_node(wp_id).attributes.get("room_id") == far_kitchen
+    assert not topo.graph.has_edge(wp_id, near_bedroom)
+
+
+def test_navigation_view_only_returns_waypoints():
+    topo = DynamicTopoMap()
+    wp1 = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+    )
+    wp2 = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+    )
+    frontier = topo.add_node(
+        NodeType.WAYPOINT_FRONTIER,
+        position=np.array([2.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.5,
+    )
+    topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="door",
+        attributes={"landmark_role": "structural"},
+    )
+    topo.add_edge(wp1, wp2, EdgeType.NAVIGABLE)
+    topo.add_edge(wp2, frontier, EdgeType.NAVIGABLE)
+
+    view = topo.get_navigation_view()
+    types = {node["type"] for node in view["nodes"]}
+    assert types <= {
+        NodeType.WAYPOINT_VISITED.value,
+        NodeType.WAYPOINT_FRONTIER.value,
+        NodeType.WAYPOINT_CANDIDATE.value,
+    }
+    assert len(view["nodes"]) == 3
+    assert all(edge["type"] == EdgeType.NAVIGABLE.value for edge in view["edges"])
+
+
+def test_structure_view_excludes_semantic_landmarks():
+    topo = DynamicTopoMap()
+    room_id = topo.add_node(
+        NodeType.ROOM,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["door"]},
+    )
+    structural_id = topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([1.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="door",
+        attributes={"landmark_role": "structural"},
+    )
+    semantic_id = topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6,
+        label="vase",
+        attributes={"landmark_role": "semantic"},
+    )
+    topo.add_edge(structural_id, room_id, EdgeType.ADJACENT_TO)
+    topo.add_edge(semantic_id, room_id, EdgeType.BELONGS_TO)
+
+    view = topo.get_structure_view()
+    ids = {node["id"] for node in view["nodes"]}
+    assert room_id in ids
+    assert structural_id in ids
+    assert semantic_id not in ids
+    edge_keys = {
+        (tuple(sorted((e["source"], e["target"]))), e["type"])
+        for e in view["edges"]
+    }
+    assert (tuple(sorted((structural_id, room_id))), EdgeType.ADJACENT_TO.value) in edge_keys
+    # Edge from semantic landmark is filtered out because semantic_id is not
+    # part of the structure layer.
+    for e in view["edges"]:
+        assert semantic_id not in (e["source"], e["target"])
+
+
+def test_structure_view_includes_waypoint_room_bindings():
+    topo = DynamicTopoMap()
+    room_id = topo.add_node(
+        NodeType.ROOM,
+        position=np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": []},
+    )
+    wp_id = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        attributes={"view_room_label": "kitchen"},
+    )
+    topo.assign_waypoint_to_room(wp_id, view_room_label="kitchen")
+    view = topo.get_structure_view()
+    bindings = view["waypoint_room_bindings"]
+    assert {"waypoint_id": wp_id, "room_id": room_id} in bindings
+
+
+def test_skeleton_skips_semantic_landmark_as_portal():
+    """Portal candidate selection should ignore semantic landmarks."""
+    topo = DynamicTopoMap()
+    wp_a = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        attributes={"view_room_label": "kitchen"},
+    )
+    wp_b = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([6.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        attributes={"view_room_label": "bedroom"},
+    )
+    topo.add_edge(wp_a, wp_b, EdgeType.NAVIGABLE)
+    # Semantic landmark sitting right at the midpoint - tempting for a
+    # naive portal picker but should be rejected.
+    semantic_landmark = topo.add_node(
+        NodeType.LANDMARK,
+        position=np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="vase",
+        attributes={
+            "landmark_role": "semantic",
+            "landmark_source": "promoted_object",
+        },
+    )
+    # Run the skeleton maintenance via adaptive_granularity. Need room
+    # summaries first - create them directly to make the test hermetic.
+    topo.add_node(
+        NodeType.ROOM,
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": []},
+    )
+    topo.add_node(
+        NodeType.ROOM,
+        position=np.array([6.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7,
+        label="bedroom",
+        attributes={"summary_type": "room_region", "contains_labels": []},
+    )
+    topo._maintain_spatial_structure_graph()
+    sem_node = topo.get_node(semantic_landmark)
+    assert sem_node is not None
+    assert sem_node.attributes.get("structure_role") != "portal"
+    assert sem_node.attributes.get("structure_anchor") is not True
 
 
 def test_room_summary_position_stable_on_repeat_update():
@@ -817,6 +1545,118 @@ def test_spatial_structure_filter_keeps_only_anchors():
     assert "anchor" in ids
     assert "extra" not in ids
     assert "env" not in ids
+
+
+def test_viz_navigation_view_mode_keeps_only_waypoints():
+    from conftopo.viz.memory_trace_viz import filter_topo_nodes
+
+    nodes = [
+        {"id": "wp", "type": "waypoint_visited", "position": [0, 0, 0], "attributes": {}},
+        {"id": "fr", "type": "waypoint_frontier", "position": [1, 0, 0], "attributes": {}},
+        {"id": "ca", "type": "waypoint_candidate", "position": [2, 0, 0], "attributes": {}},
+        {"id": "room", "type": "room", "position": [5, 0, 0],
+         "label": "kitchen", "attributes": {"summary_type": "room_region"}},
+        {"id": "door", "type": "landmark", "position": [4, 0, 0],
+         "label": "door", "attributes": {"landmark_role": "structural"}},
+        {"id": "obj", "type": "object", "position": [3, 0, 0],
+         "label": "chair", "attributes": {}},
+    ]
+    out = filter_topo_nodes(nodes, "navigation_view")
+    ids = {n["id"] for n in out}
+    assert ids == {"wp", "fr", "ca"}
+
+
+def test_viz_structure_view_drops_semantic_landmarks_and_waypoints():
+    from conftopo.viz.memory_trace_viz import filter_topo_nodes
+
+    nodes = [
+        {"id": "wp", "type": "waypoint_visited", "position": [0, 0, 0], "attributes": {}},
+        {"id": "room", "type": "room", "position": [5, 0, 0],
+         "label": "kitchen", "attributes": {"summary_type": "room_region"}},
+        {"id": "portal", "type": "landmark", "position": [3, 0, 0],
+         "label": "door", "attributes": {"structure_role": "portal",
+                                          "synthetic_portal": True}},
+        {"id": "struct_door", "type": "landmark", "position": [4, 0, 0],
+         "label": "door", "attributes": {"landmark_source": "promoted_object",
+                                          "landmark_role": "structural"}},
+        {"id": "sem_vase", "type": "landmark", "position": [4.5, 0, 0],
+         "label": "vase", "attributes": {"landmark_source": "promoted_object",
+                                          "landmark_role": "semantic"}},
+        {"id": "obj", "type": "object", "position": [3, 0, 0],
+         "label": "chair", "attributes": {}},
+    ]
+    out = filter_topo_nodes(nodes, "structure_view")
+    ids = {n["id"] for n in out}
+    assert ids == {"room", "portal", "struct_door"}
+
+
+def test_trace_view_separates_navigation_and_structure_layers():
+    """End-to-end smoke check that the two viz views are disjoint and
+    consistent with the core get_navigation_view / get_structure_view.
+
+    This is the trace-level human-readable sanity check from the plan:
+    given the topo map, navigation_view stays in the waypoint layer and
+    structure_view stays in the room+structural layer with no overlap.
+    """
+    from conftopo.viz.memory_trace_viz import filter_topo_nodes
+
+    topo = DynamicTopoMap()
+    cur_vp = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9, attributes={"view_room_label": "kitchen"},
+    )
+    far_vp = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([6.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9, attributes={"view_room_label": "bedroom"},
+    )
+    topo.add_edge(cur_vp, far_vp, EdgeType.NAVIGABLE)
+    kitchen = topo.add_node(
+        NodeType.ROOM, position=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7, label="kitchen",
+        attributes={"summary_type": "room_region", "contains_labels": ["sink"]},
+    )
+    bedroom = topo.add_node(
+        NodeType.ROOM, position=np.array([6.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.7, label="bedroom",
+        attributes={"summary_type": "room_region", "contains_labels": ["bed"]},
+    )
+    topo.add_node(
+        NodeType.LANDMARK, position=np.array([3.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="door",
+        attributes={"landmark_role": "structural",
+                    "landmark_source": "promoted_object"},
+    )
+    topo.add_node(
+        NodeType.LANDMARK, position=np.array([0.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.6, label="vase",
+        attributes={"landmark_role": "semantic"},
+    )
+    topo._maintain_spatial_structure_graph()
+
+    # Snapshot via the core API and re-filter via the viz API.
+    core_nav = {n["id"] for n in topo.get_navigation_view()["nodes"]}
+    core_struct = {n["id"] for n in topo.get_structure_view()["nodes"]}
+    snapshot_nodes, _ = topo._topo_dict_snapshot()
+
+    viz_nav = {n["id"] for n in filter_topo_nodes(snapshot_nodes, "navigation_view")}
+    viz_struct = {n["id"] for n in filter_topo_nodes(snapshot_nodes, "structure_view")}
+
+    # Core and viz layer views agree exactly.
+    assert viz_nav == core_nav
+    assert viz_struct == core_struct
+    # Navigation and structure layers are disjoint at the node level.
+    assert viz_nav.isdisjoint(viz_struct)
+    # Both waypoints survive in the navigation view.
+    assert cur_vp in viz_nav and far_vp in viz_nav
+    # At least one room summary survives in the structure view.
+    snapshot_by_id = {n["id"]: n for n in snapshot_nodes}
+    room_ids_in_struct = {
+        nid for nid in viz_struct
+        if snapshot_by_id[nid]["type"] == "room"
+    }
+    assert len(room_ids_in_struct) >= 1
 
 
 def test_traversable_skeleton_skips_proximity_only_rooms():

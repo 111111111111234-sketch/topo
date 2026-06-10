@@ -24,6 +24,11 @@ from conftopo.config import ConfTopoConfig
 from conftopo.agents.base_agent import ConfTopoBaseAgent
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType, EdgeType, SemanticNode
 from conftopo.core.instruction_graph import InstructionGraph, GoalNode
+from conftopo.core.landmark_roles import (
+    STRUCTURAL_LANDMARK_LABEL_TOKENS,
+    is_structural_label,
+)
+from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
 from conftopo.core.rule_scorer import compute_semantic_bias
 from conftopo.perception.light_perceiver import LightPerceiver
 from conftopo.perception.heavy_perceiver import GroundingDINOBackend, HeavyPerceiver, ObjectObservation
@@ -46,6 +51,21 @@ DEFAULT_HEAVY_OBJECT_VOCABULARY = [
     "fridge",
     "tv",
     "plant",
+]
+
+# Vocabulary used when the planner's structure target is a portal or a
+# structural landmark — keep ONLY visually grounded object-like words that
+# GroundingDINO can reliably detect.  Spatial-concept words (hallway,
+# corridor, stair, entrance, opening...) are NOT objects; they produce
+# near-zero-confidence noise detections and must NOT appear here.
+DEFAULT_STRUCTURAL_HEAVY_VOCABULARY = [
+    "door",
+    "doorway",
+    "window",
+    "arch",
+    "archway",
+    "counter",
+    "gate",
 ]
 
 
@@ -75,6 +95,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_rgb_embed: Optional[np.ndarray] = None
         self._cur_perception: Optional[Dict] = None
         self._cur_heavy_observations: List[ObjectObservation] = []
+        # Temporally-smoothed room classifier (replaces raw single-frame label).
+        self._room_clf = RoomClassifier(RoomClassifierConfig())
         self.heavy_perceiver: Optional[HeavyPerceiver] = (
             HeavyPerceiver(
                 GroundingDINOBackend(
@@ -130,6 +152,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_rgb_embed = None
         self._cur_perception = None
         self._cur_heavy_observations = []
+        self._room_clf.reset()
         self._goal_idx = 0
         self._goals_completed = 0
         self._sticky_target_id = None
@@ -142,6 +165,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates = []
         self._last_navigation_event = {}
         self._last_plan_debug = {}
+        self._last_structure_target_id: Optional[str] = None
         self._goal_local_step = 0
         self._last_heavy_step = None
         self._last_heavy_summary_step = None
@@ -258,6 +282,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self.topo_map.prune_low_confidence(self._position)
         if self.topo_map.num_nodes > self.config.memory.max_nodes:
             self.topo_map.prune_low_confidence(self._position)
+
+        # 5. Explicit waypoint->room binding. Done after adaptive_granularity
+        # so room summaries created/refreshed this step are visible.
+        self.topo_map.assign_waypoint_to_room(cur_vp, view_room_label=room_label)
 
     def _add_visited_waypoint(self) -> str:
         """Add current position as visited waypoint, connect to previous."""
@@ -434,6 +462,29 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         node.attributes["view_room_confidence"] = float(room_conf)
         node.step_id = self.topo_map.current_step
 
+    def _record_view_context_smoothed(
+        self,
+        cur_vp: str,
+        room_label: str,
+        room_conf: float,
+        room_scores: Dict[str, float],
+        is_transition: bool,
+    ) -> None:
+        """Store smoothed room classification on the waypoint.
+
+        Writes both top-1 ``view_room_label`` (for backward-compat) and the
+        full ``room_scores`` distribution so consumers can read the posterior.
+        """
+        node = self.topo_map.get_node(cur_vp)
+        if node is None:
+            return
+        node.attributes["view_room_label"] = room_label
+        node.attributes["view_room_confidence"] = float(room_conf)
+        node.attributes["room_scores"] = {k: round(v, 4) for k, v in room_scores.items()}
+        if is_transition:
+            node.attributes["room_transition"] = True
+        node.step_id = self.topo_map.current_step
+
     def _record_scene_vocabulary(self, cur_vp: str, label: str, confidence: float) -> None:
         """Store environment vocabulary hits on the waypoint (not map landmarks)."""
         node = self.topo_map.get_node(cur_vp)
@@ -468,6 +519,39 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         room_conf = float(self._cur_perception.get("room_confidence", 0.0))
         if room_label != "unknown" and room_conf >= pcfg.room_threshold:
             self._record_view_context(cur_vp, room_label, room_conf)
+        if not self._cur_perception:
+            return None
+
+        pcfg = self.config.perception
+        raw_label = self._cur_perception.get("room_label", "unknown")
+        raw_conf = float(self._cur_perception.get("room_confidence", 0.0))
+
+        # Collect object labels from latest heavy detections for object-prior boost.
+        recent_obj_labels = [obs.label for obs in (self._cur_heavy_observations or [])]
+
+        # --- Temporally-smoothed room classification ---
+        clf_result = self._room_clf.update(
+            raw_label=raw_label,
+            raw_confidence=raw_conf,
+            position=self._position,
+            object_labels=recent_obj_labels,
+        )
+        room_label = clf_result.confirmed_label or "unknown"
+        room_conf = clf_result.top_confidence
+
+        # Always write distribution; only write confirmed label when threshold met.
+        if room_label != "unknown" and room_conf >= pcfg.room_threshold:
+            self._record_view_context_smoothed(
+                cur_vp, room_label, room_conf,
+                clf_result.scores, clf_result.is_transition,
+            )
+        elif clf_result.scores:
+            # Below threshold but we still persist the distribution for debug.
+            node = self.topo_map.get_node(cur_vp)
+            if node is not None:
+                node.attributes["room_scores"] = {
+                    k: round(v, 4) for k, v in clf_result.scores.items()
+                }
 
         # Goal object node
         for label, sim in self._cur_perception.get("goal_scores", []):
@@ -611,7 +695,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if room not in rooms:
             rooms.append(room)
 
-    def _heavy_labels(self, reason: str = "", summary=None) -> List[str]:
+    def _heavy_labels(
+        self,
+        reason: str = "",
+        summary=None,
+        structure_target: Optional[SemanticNode] = None,
+    ) -> List[str]:
         labels: List[str] = []
         goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
         if goal is not None and getattr(goal, "target_object", None):
@@ -621,10 +710,32 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         for label, sim in (self._cur_perception or {}).get("goal_scores", []):
             if float(sim) >= self.config.perception.object_threshold:
                 labels.append(str(label))
+
+        align = bool(getattr(self.config.perception, "heavy_align_with_structure_target", True))
+        used_structure_vocab = False
+        if align and structure_target is not None:
+            attrs = structure_target.attributes
+            if structure_target.node_type == NodeType.ROOM:
+                contains = attrs.get("contains_labels", [])
+                if contains:
+                    labels.extend(str(lbl) for lbl in contains if lbl)
+                    used_structure_vocab = True
+            elif structure_target.node_type == NodeType.LANDMARK and (
+                attrs.get("structure_role") == "portal"
+                or attrs.get("synthetic_portal")
+                or is_structural_label(structure_target.label)
+            ):
+                labels.extend(DEFAULT_STRUCTURAL_HEAVY_VOCABULARY)
+                # Pull in target room labels if portal recorded them.
+                for room_label in attrs.get("structure_pair_labels", []) or []:
+                    if room_label:
+                        labels.append(str(room_label))
+                used_structure_vocab = True
+
         if reason == "coarse_summary_context" and summary is not None:
             contains = summary.attributes.get("contains_labels", [])
             labels.extend(str(lbl) for lbl in contains if lbl)
-        else:
+        elif not used_structure_vocab:
             labels.extend(DEFAULT_HEAVY_OBJECT_VOCABULARY)
         seen = set()
         result = [x for x in labels if not (x in seen or seen.add(x))]
@@ -694,7 +805,14 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if reason == "coarse_summary_context" and self._position is not None:
             summary = self.topo_map.find_nearby_room_summary(
                 self._position, radius=self.config.memory.summary_radius)
-        labels = self._heavy_labels(reason=reason, summary=summary)
+        # Phase 3.7: align heavy-detection labels with the planner's
+        # currently chosen structure target (room / portal / structural
+        # landmark) when available.
+        structure_target = None
+        struct_target_id = getattr(self, "_last_structure_target_id", None)
+        if struct_target_id:
+            structure_target = self.topo_map.get_node(struct_target_id)
+        labels = self._heavy_labels(reason=reason, summary=summary, structure_target=structure_target)
         if not labels:
             self._last_heavy_debug = {"ran": False, "reason": "no_labels", "detections": 0}
             return
@@ -721,6 +839,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         merges = 0
         for obs in observations:
             target_relevance = 1.0 if goal is not None and obs.label == getattr(goal, "target_object", None) else 0.0
+            # Structural detections are valuable as room anchors even when
+            # they're not the goal: give them a small relevance so the
+            # Phase 1 promotion gate can lift them into landmarks.
+            if target_relevance <= 0.0 and is_structural_label(obs.label):
+                target_relevance = max(target_relevance, 0.25)
             room_prior_score = 1.0 if room_label in room_priors else 0.0
             object_position = self._object_position_from_bbox(obs.bbox, obs.view_heading)
             obj_id, merged = self.topo_map.upsert_object_observation(
@@ -753,6 +876,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "detections": len(observations),
             "labels": labels,
             "merged": merges,
+            "structure_target_id": struct_target_id,
         }
 
     def _generate_frontiers(self, cur_vp: str) -> None:
@@ -856,21 +980,155 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "blocked_targets": self._active_blocked_targets(),
             "skipped_candidates": self._last_skipped_candidates,
             "navigation_event": self._last_navigation_event,
+            "structure_target_id": getattr(self, "_last_structure_target_id", None),
         }
+
+    # ------------------------------------------------------------------
+    # Phase 3: two-stage room-centric planner
+    # ------------------------------------------------------------------
+    def _select_structure_target(self) -> Optional[str]:
+        """Stage 1: pick the most goal-relevant structure-layer node.
+
+        Returns the node id of a ROOM (room_region) / structural LANDMARK /
+        synthetic portal that scores highest under
+        :func:`compute_semantic_bias`, provided the score clears
+        ``planning.structure_target_score_threshold``.
+
+        When room summaries are sparse (contains_labels mostly empty) the
+        semantic scorer gives near-zero scores to all structure nodes.  To
+        keep two-stage planning active in early exploration we add a small
+        distance-gradient bonus: the nearest structure node gets +0.1 which
+        is typically enough to clear the default threshold of 0.05.
+        Returns ``None`` when no structural anchor is informative enough.
+        """
+        if self.instruction_graph is None:
+            return None
+        struct_nodes = self.topo_map.structure_layer_nodes()
+        if not struct_nodes:
+            return None
+        ids = [node.node_id for node in struct_nodes]
+        scores = compute_semantic_bias(
+            goal_graph=self.instruction_graph,
+            topo_map=self.topo_map,
+            candidate_node_ids=ids,
+            agent_position=self._position,
+            normalize=False,
+        )
+        if scores.size == 0:
+            return None
+        # Distance-gradient bonus: gives a slight nudge toward the nearest
+        # structure node so exploration stays anchored even before room
+        # summaries accumulate contains_labels.
+        if self._position is not None:
+            max_dist = max(
+                float(np.linalg.norm(n.position - self._position))
+                for n in struct_nodes
+            ) or 1.0
+            for i, node in enumerate(struct_nodes):
+                d = float(np.linalg.norm(node.position - self._position))
+                scores[i] = float(scores[i]) + 0.1 * (1.0 - d / max_dist)
+        best_idx = int(np.argmax(scores))
+        if float(scores[best_idx]) < self.config.planning.structure_target_score_threshold:
+            return None
+        return ids[best_idx]
+
+    def _is_goal_object_node(self, node: SemanticNode) -> bool:
+        if self.instruction_graph is None:
+            return False
+        goal = self.instruction_graph.get_current_goal()
+        target_label = getattr(goal, "target_object", None) if goal is not None else None
+        if target_label is None:
+            return False
+        return node.node_type == NodeType.OBJECT and node.label == target_label
+
+    def _candidate_anchored_skip_reason(
+        self,
+        node: SemanticNode,
+        structure_target_id: Optional[str],
+    ) -> Optional[str]:
+        """Stage 2 filter: drop far semantic objects when anchored."""
+        if structure_target_id is None:
+            return None
+        if not self.config.planning.far_object_skip_when_anchored:
+            return None
+        if node.node_type != NodeType.OBJECT:
+            return None
+        if self._is_goal_object_node(node):
+            return None
+        if float(node.attributes.get("target_relevance", 0.0)) > 0.0:
+            return None
+        anchor = self.topo_map.get_node(structure_target_id)
+        if anchor is None:
+            return None
+        dist = float(np.linalg.norm(node.position - anchor.position))
+        if dist > self.config.planning.structure_anchor_radius:
+            return "far_semantic_object_outside_anchor"
+        return None
+
+    def _apply_structure_anchor_bonus(
+        self,
+        candidates: List[SemanticNode],
+        scores: np.ndarray,
+        structure_target_id: Optional[str],
+    ) -> np.ndarray:
+        """Boost candidates anchored to (or inside) the structure target."""
+        if structure_target_id is None or scores.size == 0:
+            return scores
+        anchor = self.topo_map.get_node(structure_target_id)
+        if anchor is None:
+            return scores
+        bonus = float(self.config.planning.structure_anchor_bonus)
+        radius = float(self.config.planning.structure_anchor_radius)
+        if bonus <= 0 or radius <= 0:
+            return scores
+        boosted = scores.astype(np.float32).copy()
+        for idx, node in enumerate(candidates):
+            if node.node_id == structure_target_id:
+                boosted[idx] += bonus
+                continue
+            if node.node_type not in (
+                NodeType.WAYPOINT_FRONTIER,
+                NodeType.WAYPOINT_CANDIDATE,
+                NodeType.WAYPOINT_VISITED,
+            ):
+                continue
+            room_id = node.attributes.get("room_id")
+            if room_id == structure_target_id:
+                boosted[idx] += bonus
+                continue
+            dist = float(np.linalg.norm(node.position - anchor.position))
+            if dist <= radius:
+                # Linear falloff from full bonus at 0 to 0 at radius.
+                boosted[idx] += bonus * max(0.0, 1.0 - dist / radius)
+        return boosted
 
     def plan(self) -> Dict[str, Any]:
         """Determine next target based on goal + memory.
+
+        Two-stage when ``planning.two_stage_enabled``: first picks a
+        structure target (room/portal/structural landmark) using the
+        structure-layer view, then expands navigation candidates anchored
+        to it. Falls back to the legacy single-stage candidate set when no
+        structure target clears the score threshold.
 
         Returns dict with:
             - target_node_id: best node to navigate to
             - target_position: 3D position of target
             - is_exploration: whether this is frontier exploration
             - scores: all node scores
+            - structure_target_id: chosen structure-layer anchor (or None)
         """
         if self.instruction_graph is None or self._cur_vp_id is None:
             return {"target_node_id": None, "target_position": None, "is_exploration": True}
 
         self._last_navigation_event = {}
+
+        # Stage 1: structure-layer anchor (optional).
+        structure_target_id: Optional[str] = None
+        if self.config.planning.two_stage_enabled:
+            structure_target_id = self._select_structure_target()
+        self._last_structure_target_id = structure_target_id
+
         primary_candidates = []
         primary_ids = []
         fallback_candidates = []
@@ -879,6 +1137,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         for node in self.topo_map._nodes.values():
             reason = self._candidate_skip_reason(node)
+            if reason is None:
+                reason = self._candidate_anchored_skip_reason(node, structure_target_id)
             if reason is not None:
                 self._last_skipped_candidates.append({"node_id": node.node_id, "type": node.node_type.value, "reason": reason})
                 continue
@@ -896,9 +1156,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         if not candidates:
             self._last_plan_debug = self._debug_plan_state()
-            return {"target_node_id": None, "target_position": None, "is_exploration": True, "candidate_ids": [], "scores": [], "sticky_debug": self._last_plan_debug}
+            return {"target_node_id": None, "target_position": None, "is_exploration": True, "candidate_ids": [], "scores": [], "sticky_debug": self._last_plan_debug, "structure_target_id": structure_target_id}
 
-        # Score candidates
+        # Stage 2: score candidates and apply structure anchor bonus.
         scores = compute_semantic_bias(
             goal_graph=self.instruction_graph,
             topo_map=self.topo_map,
@@ -906,9 +1166,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             agent_position=self._position,
             normalize=False,  # use raw scores for selection
         )
+        scores = self._apply_structure_anchor_bonus(candidates, scores, structure_target_id)
 
         sticky_plan = self._sticky_plan_if_valid(candidates, candidate_ids, scores)
         if sticky_plan is not None:
+            sticky_plan["structure_target_id"] = structure_target_id
             return sticky_plan
 
         best_idx = int(np.argmax(scores))
@@ -927,6 +1189,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "blocked_targets": self._active_blocked_targets(),
             "skipped_candidates": self._last_skipped_candidates,
             "navigation_event": self._last_navigation_event,
+            "structure_target_id": structure_target_id,
         }
         self._sticky_release_reason = ""
 
@@ -937,6 +1200,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "scores": scores,
             "candidate_ids": candidate_ids,
             "sticky_debug": self._last_plan_debug,
+            "structure_target_id": structure_target_id,
         }
 
     def act(self, plan_output: Dict[str, Any]) -> Dict[str, Any]:
