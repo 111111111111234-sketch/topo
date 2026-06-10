@@ -218,3 +218,7 @@ class ConfTopoETPNavAdapter:
                 scores[idx] = valid_scores[valid_idx]
                 valid_idx += 1
         return scores * self.alpha
+
+
+# Backward-compatible public name used by tests and package exports.
+ConfTopoETPNavAgent = ConfTopoETPNavAdapter

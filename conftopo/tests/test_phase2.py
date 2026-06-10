@@ -260,8 +260,11 @@ def test_goat_agent_semantic_node_creation():
     })
     stats = agent.memory_stats
     assert stats["objects"] >= 1
-    assert stats["rooms"] >= 1
     assert stats["landmarks"] >= 1
+    visited = agent.topo_map.get_visited()
+    assert visited, "expected at least one visited waypoint"
+    assert visited[0].attributes.get("view_room_label") == "kitchen"
+    assert stats["rooms"] == 0, "clip room nodes should live on waypoint context only"
     assert action.get("target_node_id") is not None
     assert len(action.get("candidate_ids", [])) > 0
     print(f"  ✓ semantic nodes: {stats}")

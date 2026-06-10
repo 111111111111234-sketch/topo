@@ -100,9 +100,11 @@ class GroundingDINOBackend:
             from groundingdino.util.inference import predict
             self._predict_fn = predict
         caption = " . ".join(str(label) for label in labels)
+        image_array = np.asarray(image)
+        image_tensor = self._prepare_image(image_array)
         boxes, logits, phrases = self._predict_fn(
             model=self.model,
-            image=np.asarray(image),
+            image=image_tensor,
             caption=caption,
             box_threshold=self.box_threshold,
             text_threshold=self.text_threshold,
@@ -110,7 +112,7 @@ class GroundingDINOBackend:
         )
         boxes_np = _as_numpy(boxes)
         logits_np = _as_numpy(logits)
-        height, width = np.asarray(image).shape[:2]
+        height, width = image_array.shape[:2]
         rows = []
         for box, score, phrase in zip(boxes_np, logits_np, phrases):
             rows.append({
@@ -120,6 +122,43 @@ class GroundingDINOBackend:
                 "source": "groundingdino",
             })
         return rows
+
+    def _prepare_image(self, image: Any) -> Any:
+        """Convert RGB arrays to the normalized tensor GroundingDINO expects."""
+        try:
+            from importlib import import_module
+            import torch
+            from PIL import Image
+            T = import_module("groundingdino.datasets.transforms")
+        except ImportError as exc:
+            raise RuntimeError("GroundingDINO image preprocessing dependencies are not installed") from exc
+
+        if isinstance(image, torch.Tensor):
+            return image
+
+        arr = np.asarray(image)
+        if arr.dtype != np.uint8:
+            if arr.size > 0 and float(arr.max()) <= 1.0:
+                arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+            else:
+                arr = arr.clip(0, 255).astype(np.uint8)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected image with shape [H,W,C], got {arr.shape}")
+        if arr.shape[-1] == 4:
+            arr = arr[:, :, :3]
+        if arr.shape[-1] != 3:
+            raise ValueError(f"Expected RGB/RGBA image, got shape {arr.shape}")
+
+        transform = T.Compose([
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        image_pil = Image.fromarray(arr).convert("RGB")
+        image_tensor, _ = transform(image_pil, None)
+        return image_tensor
 
 
 def _as_numpy(value: Any) -> np.ndarray:

@@ -420,6 +420,7 @@ def main() -> None:
                 "position": np.array(state.position, dtype=np.float32),
                 "heading": quat_to_heading([state.rotation.real, *list(state.rotation.imag)]),
             }
+            agent.topo_map.step()
             agent.observe(conf_obs)
             agent.update_memory()
 

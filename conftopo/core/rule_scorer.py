@@ -104,6 +104,14 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
                     for rpe in goal.room_prior_embeddings]
             score += 0.3 * max(sims) if sims else 0.0
 
+    # Room/region summary: weak match if summary contains target object label
+    if (node.node_type == NodeType.ROOM
+            and node.attributes.get("summary_type") == "room_region"):
+        contains = node.attributes.get("contains_labels", [])
+        target = getattr(goal, "target_object", None)
+        if target and target in contains:
+            score += 0.25
+
     # Landmark proximity
     if goal.landmark_embeddings is not None and node.embedding is not None:
         sims = [cosine_similarity(node.embedding, le)
@@ -111,12 +119,14 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
         if sims:
             score += 0.2 * max(sims)
 
-    # Nodes that have related semantic nodes nearby get a bonus
+    # Nodes that have related semantic nodes nearby get a bonus (skip folded)
     if node.node_type in (NodeType.WAYPOINT_VISITED, NodeType.WAYPOINT_FRONTIER):
         neighbors = topo_map.get_neighbors(node.node_id)
         for neighbor_id in neighbors:
             neighbor = topo_map.get_node(neighbor_id)
             if neighbor and neighbor.node_type == NodeType.OBJECT:
+                if neighbor.attributes.get("folded"):
+                    continue
                 if goal.target_embedding is not None and neighbor.embedding is not None:
                     sim = cosine_similarity(goal.target_embedding, neighbor.embedding)
                     if sim > 0.5:

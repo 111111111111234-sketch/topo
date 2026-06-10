@@ -33,6 +33,22 @@ def _angle_delta(a: float, b: float) -> float:
     return float((a - b + np.pi) % (2 * np.pi) - np.pi)
 
 
+DEFAULT_HEAVY_OBJECT_VOCABULARY = [
+    "rack",
+    "chair",
+    "table",
+    "door",
+    "sofa",
+    "bed",
+    "sink",
+    "toilet",
+    "cabinet",
+    "fridge",
+    "tv",
+    "plant",
+]
+
+
 class ConfTopoGOATAgent(ConfTopoBaseAgent):
     """Complete ConfTopo agent for GOAT-Bench.
 
@@ -97,6 +113,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._environment_landmark_labels: Set[str] = set()
         self._goal_local_step: int = 0
         self._last_heavy_step: Optional[int] = None
+        self._last_heavy_summary_step: Optional[int] = None
         self._heavy_perception_calls: int = 0
         self._object_merge_count: int = 0
         self._last_heavy_debug: Dict[str, Any] = {}
@@ -127,6 +144,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_plan_debug = {}
         self._goal_local_step = 0
         self._last_heavy_step = None
+        self._last_heavy_summary_step = None
         self._heavy_perception_calls = 0
         self._object_merge_count = 0
         self._last_heavy_debug = {}
@@ -217,7 +235,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if self._position is None:
             return
 
-        self.topo_map.step()
         self._goal_local_step += 1
 
         # 1. Add/update visited waypoint
@@ -226,10 +243,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._consume_reached_frontiers(cur_vp)
 
         # 2. Add semantic nodes (room, landmark detection)
-        room_id = self._add_semantic_nodes(cur_vp)
+        room_label = self._add_semantic_nodes(cur_vp)
 
         # 2b. Add object-level heavy detections when triggered
-        self._add_heavy_object_nodes(cur_vp, room_id)
+        self._add_heavy_object_nodes(cur_vp, room_label)
 
         # 3. Generate frontier-like nodes
         self._generate_frontiers(cur_vp)
@@ -238,8 +255,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self.topo_map.decay_all_confidences()
         self.topo_map.merge_nearby_nodes(NodeType.WAYPOINT_FRONTIER)
         self.topo_map.adaptive_granularity(self._position)
+        self.topo_map.prune_low_confidence(self._position)
         if self.topo_map.num_nodes > self.config.memory.max_nodes:
-            self.topo_map.prune_low_confidence()
+            self.topo_map.prune_low_confidence(self._position)
 
     def _add_visited_waypoint(self) -> str:
         """Add current position as visited waypoint, connect to previous."""
@@ -407,37 +425,49 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "sticky_debug": self._last_plan_debug,
         }
 
+    def _record_view_context(self, cur_vp: str, room_label: str, room_conf: float) -> None:
+        """Store CLIP room/view tags on the waypoint instead of spawning clip_room nodes."""
+        node = self.topo_map.get_node(cur_vp)
+        if node is None:
+            return
+        node.attributes["view_room_label"] = room_label
+        node.attributes["view_room_confidence"] = float(room_conf)
+        node.step_id = self.topo_map.current_step
+
+    def _record_scene_vocabulary(self, cur_vp: str, label: str, confidence: float) -> None:
+        """Store environment vocabulary hits on the waypoint (not map landmarks)."""
+        node = self.topo_map.get_node(cur_vp)
+        if node is None:
+            return
+        tags = node.attributes.setdefault("scene_vocabulary", [])
+        tags.append({"label": label, "confidence": float(confidence), "step": self.topo_map.current_step})
+        if len(tags) > 12:
+            del tags[:-12]
+
+    def _link_semantic_to_room_summary(self, node_id: str, room_label: Optional[str]) -> None:
+        if not room_label or room_label in ("unknown", ""):
+            return
+        if self._position is None:
+            return
+        summary = self.topo_map.find_nearby_room_summary(self._position, label=room_label)
+        if summary is not None:
+            self.topo_map.add_edge(node_id, summary.node_id, EdgeType.BELONGS_TO)
+
     def _add_semantic_nodes(self, cur_vp: str) -> Optional[str]:
-        """Add room/landmark/object nodes from perception results."""
+        """Add navigation landmarks / light objects from perception.
+
+        Environment CLIP tags and instantaneous room labels are stored on the
+        current waypoint as context, not as spatial map nodes. Distant room
+        summaries are created later by DynamicTopoMap.adaptive_granularity().
+        """
         if not self._cur_perception:
             return None
 
         pcfg = self.config.perception
-        room_id = None
-
-        # Room node
         room_label = self._cur_perception.get("room_label", "unknown")
         room_conf = float(self._cur_perception.get("room_confidence", 0.0))
         if room_label != "unknown" and room_conf >= pcfg.room_threshold:
-            existing_rooms = self.topo_map.find_nodes_within_radius(
-                self._position, radius=5.0, node_type=NodeType.ROOM
-            )
-            matched_room = next((r for r in existing_rooms if r.label == room_label), None)
-            if matched_room:
-                matched_room.confidence = max(matched_room.confidence, room_conf)
-                matched_room.step_id = self.topo_map.current_step
-                if self._cur_rgb_embed is not None:
-                    matched_room.embedding = self._cur_rgb_embed
-                room_id = matched_room.node_id
-            else:
-                room_id = self.topo_map.add_node(
-                    NodeType.ROOM,
-                    position=self._position.copy(),
-                    embedding=self._cur_rgb_embed,
-                    confidence=room_conf,
-                    label=room_label,
-                )
-                self.topo_map.add_edge(cur_vp, room_id, EdgeType.BELONGS_TO)
+            self._record_view_context(cur_vp, room_label, room_conf)
 
         # Goal object node
         for label, sim in self._cur_perception.get("goal_scores", []):
@@ -447,10 +477,17 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             existing = self.topo_map.find_nodes_within_radius(
                 self._position, radius=2.0, node_type=NodeType.OBJECT
             )
-            matched = next((o for o in existing if o.label == label), None)
+            matched = next(
+                (
+                    o for o in existing
+                    if o.label == label and self._object_room_compatible(o, room_label)
+                ),
+                None,
+            )
             if matched:
                 matched.confidence = max(matched.confidence, sim)
                 matched.step_id = self.topo_map.current_step
+                self._update_object_room_context(matched, room_label)
                 if self._cur_rgb_embed is not None:
                     matched.embedding = self._cur_rgb_embed
             else:
@@ -460,13 +497,18 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     embedding=self._cur_rgb_embed,
                     confidence=sim,
                     label=label,
+                    attributes=self._object_room_attributes(room_label, "light_clip"),
                 )
                 self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+                self._link_semantic_to_room_summary(obj_id, room_label)
 
-        # Landmark node
+        # Navigation landmark: only goal/instruction hints, not environment vocabulary.
         for label, sim in self._cur_perception.get("landmark_scores", []):
             sim = float(sim)
             if sim < pcfg.landmark_threshold:
+                continue
+            if label in self._environment_landmark_labels:
+                self._record_scene_vocabulary(cur_vp, label, sim)
                 continue
             existing = self.topo_map.find_nodes_within_radius(
                 self._position, radius=3.0, node_type=NodeType.LANDMARK
@@ -475,6 +517,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             if matched:
                 matched.confidence = max(matched.confidence, sim)
                 matched.step_id = self.topo_map.current_step
+                self._update_landmark_history(matched, cur_vp, sim)
                 if self._cur_rgb_embed is not None:
                     matched.embedding = self._cur_rgb_embed
             else:
@@ -484,16 +527,91 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     embedding=self._cur_rgb_embed,
                     confidence=sim,
                     label=label,
-                    attributes={
-                        "landmark_source": "environment"
-                        if label in self._environment_landmark_labels
-                        else "goal_hint"
-                    },
+                    attributes=self._new_landmark_attributes(label, cur_vp, sim),
                 )
                 self.topo_map.add_edge(cur_vp, lm_id, EdgeType.VISIBLE_FROM)
-        return room_id
+                self._link_semantic_to_room_summary(lm_id, room_label)
+        return room_label if room_label != "unknown" else None
 
-    def _heavy_labels(self) -> List[str]:
+    def _new_landmark_attributes(self, label: str, viewpoint_id: str, confidence: float) -> Dict[str, Any]:
+        source = "environment" if label in self._environment_landmark_labels else "goal_hint"
+        obs = {
+            "viewpoint_id": viewpoint_id,
+            "confidence": float(confidence),
+            "step_id": self.topo_map.current_step,
+            "source": source,
+        }
+        return {
+            "landmark_source": source,
+            "observations": [obs],
+            "viewpoints": [viewpoint_id],
+            "first_seen_step": self.topo_map.current_step,
+            "last_seen_step": self.topo_map.current_step,
+            "multi_view_count": 1,
+            "granularity": "landmark",
+        }
+
+    def _update_landmark_history(self, node: SemanticNode, viewpoint_id: str, confidence: float) -> None:
+        source = node.attributes.get("landmark_source", "goal_hint")
+        obs = {
+            "viewpoint_id": viewpoint_id,
+            "confidence": float(confidence),
+            "step_id": self.topo_map.current_step,
+            "source": source,
+        }
+        node.attributes.setdefault("observations", []).append(obs)
+        if viewpoint_id not in node.attributes.setdefault("viewpoints", []):
+            node.attributes["viewpoints"].append(viewpoint_id)
+        node.attributes.setdefault("first_seen_step", self.topo_map.current_step)
+        node.attributes["last_seen_step"] = self.topo_map.current_step
+        node.attributes["multi_view_count"] = max(
+            1,
+            len(node.attributes.get("viewpoints", [])),
+            len(node.attributes.get("observations", [])),
+        )
+
+    @staticmethod
+    def _normalized_room_label(room_label: Optional[str]) -> Optional[str]:
+        if room_label is None:
+            return None
+        room = str(room_label).strip()
+        if not room or room == "unknown":
+            return None
+        return room
+
+    def _object_room_attributes(self, room_label: Optional[str], source: str) -> Dict[str, Any]:
+        room = self._normalized_room_label(room_label)
+        return {
+            "room_context": room,
+            "room_contexts": [room] if room is not None else [],
+            "source": source,
+        }
+
+    def _object_room_compatible(self, node: SemanticNode, room_label: Optional[str]) -> bool:
+        room = self._normalized_room_label(room_label)
+        if room is None:
+            return True
+        known = node.attributes.get("room_contexts")
+        if known is None:
+            previous = node.attributes.get("room_context")
+            known = [previous] if previous is not None else []
+        known_rooms = {
+            str(value).strip()
+            for value in known
+            if value is not None and self._normalized_room_label(str(value))
+        }
+        return not known_rooms or room in known_rooms
+
+    def _update_object_room_context(self, node: SemanticNode, room_label: Optional[str]) -> None:
+        room = self._normalized_room_label(room_label)
+        if room is None:
+            return
+        node.attributes["room_context"] = room
+        rooms = node.attributes.setdefault("room_contexts", [])
+        if room not in rooms:
+            rooms.append(room)
+
+    def _heavy_labels(self, reason: str = "", summary=None) -> List[str]:
         labels: List[str] = []
         goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
         if goal is not None and getattr(goal, "target_object", None):
@@ -503,8 +621,15 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         for label, sim in (self._cur_perception or {}).get("goal_scores", []):
             if float(sim) >= self.config.perception.object_threshold:
                 labels.append(str(label))
+        if reason == "coarse_summary_context" and summary is not None:
+            contains = summary.attributes.get("contains_labels", [])
+            labels.extend(str(lbl) for lbl in contains if lbl)
+        else:
+            labels.extend(DEFAULT_HEAVY_OBJECT_VOCABULARY)
         seen = set()
-        return [x for x in labels if not (x in seen or seen.add(x))]
+        result = [x for x in labels if not (x in seen or seen.add(x))]
+        max_labels = int(self.config.perception.heavy_summary_max_labels)
+        return result[:max_labels]
 
     def _should_run_heavy_perception(self) -> Tuple[bool, str]:
         pcfg = self.config.perception
@@ -517,6 +642,16 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return False, "cooldown"
         if self._last_heavy_step is None and self._goal_local_step <= max(1, int(pcfg.heavy_goal_warmup_steps)):
             return True, "goal_warmup"
+        if self._position is not None:
+            summary = self.topo_map.find_nearby_room_summary(
+                self._position,
+                radius=self.config.memory.summary_radius,
+            )
+            if summary is not None:
+                summary_cooldown = max(1, int(pcfg.heavy_summary_cooldown))
+                if (self._last_heavy_summary_step is None
+                        or self.topo_map.current_step - self._last_heavy_summary_step >= summary_cooldown):
+                    return True, "coarse_summary_context"
         if self.topo_map.current_step % interval == 0:
             return True, "interval"
         if float((self._cur_perception or {}).get("best_goal_sim", 0.0)) >= pcfg.heavy_goal_sim_threshold:
@@ -550,12 +685,16 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             self._position[2] - dist * np.cos(bearing),
         ], dtype=np.float32)
 
-    def _add_heavy_object_nodes(self, cur_vp: str, room_id: Optional[str]) -> None:
+    def _add_heavy_object_nodes(self, cur_vp: str, room_label: Optional[str]) -> None:
         should_run, reason = self._should_run_heavy_perception()
         self._last_heavy_debug = {"ran": False, "reason": reason, "detections": 0}
         if not should_run:
             return
-        labels = self._heavy_labels()
+        summary = None
+        if reason == "coarse_summary_context" and self._position is not None:
+            summary = self.topo_map.find_nearby_room_summary(
+                self._position, radius=self.config.memory.summary_radius)
+        labels = self._heavy_labels(reason=reason, summary=summary)
         if not labels:
             self._last_heavy_debug = {"ran": False, "reason": "no_labels", "detections": 0}
             return
@@ -572,6 +711,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return
 
         self._last_heavy_step = self.topo_map.current_step
+        if reason == "coarse_summary_context":
+            self._last_heavy_summary_step = self.topo_map.current_step
         self._heavy_perception_calls += 1
         self._cur_heavy_observations = observations
         goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
@@ -581,11 +722,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         for obs in observations:
             target_relevance = 1.0 if goal is not None and obs.label == getattr(goal, "target_object", None) else 0.0
             room_prior_score = 1.0 if room_label in room_priors else 0.0
+            object_position = self._object_position_from_bbox(obs.bbox, obs.view_heading)
             obj_id, merged = self.topo_map.upsert_object_observation(
                 label=obs.label,
                 bbox=obs.bbox,
                 confidence=obs.confidence,
-                position=self._object_position_from_bbox(obs.bbox, obs.view_heading),
+                position=object_position,
                 embedding=obs.embedding,
                 viewpoint_id=cur_vp,
                 view_heading=obs.view_heading,
@@ -594,8 +736,14 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 room_prior_score=room_prior_score,
                 source=obs.source,
             )
-            if room_id is not None:
-                self.topo_map.add_edge(obj_id, room_id, EdgeType.BELONGS_TO)
+            self._link_semantic_to_room_summary(obj_id, room_label)
+            summary_id = self.topo_map.mark_recovered_from_summary(
+                obj_id,
+                object_position,
+                label=obs.label,
+            )
+            if summary_id is not None:
+                self.topo_map.add_edge(obj_id, summary_id, EdgeType.BELONGS_TO)
             if merged:
                 merges += 1
                 self._object_merge_count += 1
@@ -683,6 +831,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     def _candidate_skip_reason(self, node: SemanticNode) -> Optional[str]:
         if node.node_id == self._cur_vp_id:
             return "current"
+        if node.attributes.get("folded"):
+            return "folded"
         if self._is_consumed_frontier(node):
             return "consumed"
         if self._is_blocked_target(node.node_id):
@@ -732,7 +882,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             if reason is not None:
                 self._last_skipped_candidates.append({"node_id": node.node_id, "type": node.node_type.value, "reason": reason})
                 continue
-            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT):
+            is_room_summary = (node.node_type == NodeType.ROOM
+                               and node.attributes.get("summary_type") == "room_region")
+            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT) or is_room_summary:
                 primary_candidates.append(node)
                 primary_ids.append(node.node_id)
             elif node.node_type == NodeType.WAYPOINT_VISITED:
@@ -842,7 +994,29 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
     def memory_stats(self) -> Dict[str, Any]:
         """Return memory statistics for analysis."""
         object_nodes = self.topo_map.get_nodes_by_type(NodeType.OBJECT)
+        landmark_nodes = self.topo_map.get_nodes_by_type(NodeType.LANDMARK)
         mean_object_conf = float(np.mean([n.confidence for n in object_nodes])) if object_nodes else 0.0
+        granularity_counts = {"object": 0, "landmark": 0, "room_level": 0}
+        folded_count = 0
+        for n in object_nodes:
+            g = n.attributes.get("granularity", "object")
+            granularity_counts[g] = granularity_counts.get(g, 0) + 1
+            if n.attributes.get("folded"):
+                folded_count += 1
+        for n in landmark_nodes:
+            g = n.attributes.get("granularity", "landmark")
+            granularity_counts[g] = granularity_counts.get(g, 0) + 1
+            if n.attributes.get("folded"):
+                folded_count += 1
+        room_summaries = sum(
+            1 for node in self.topo_map.get_nodes_by_type(NodeType.ROOM)
+            if node.attributes.get("summary_type") == "room_region"
+        )
+        visible_semantic = (
+            sum(1 for n in object_nodes if not n.attributes.get("folded"))
+            + sum(1 for n in landmark_nodes if not n.attributes.get("folded"))
+            + room_summaries
+        )
         return {
             "total_nodes": self.topo_map.num_nodes,
             "visited_waypoints": len(self.topo_map.get_visited()),
@@ -850,7 +1024,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "candidate_waypoints": len(self.topo_map.get_nodes_by_type(NodeType.WAYPOINT_CANDIDATE)),
             "objects": len(object_nodes),
             "rooms": len(self.topo_map.get_nodes_by_type(NodeType.ROOM)),
-            "landmarks": len(self.topo_map.get_nodes_by_type(NodeType.LANDMARK)),
+            "landmarks": len(landmark_nodes),
             "step": self._step_count,
             "goals_completed": self._goals_completed,
             "consumed_frontiers": len(self._consumed_frontier_ids),
@@ -858,5 +1032,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "heavy_perception_calls": self._heavy_perception_calls,
             "object_merge_count": self._object_merge_count,
             "mean_object_confidence": mean_object_conf,
+            "room_summaries": room_summaries,
+            "granularity_counts": granularity_counts,
+            "folded_nodes": folded_count,
+            "visible_semantic_nodes": visible_semantic,
             "last_heavy": self._last_heavy_debug,
         }

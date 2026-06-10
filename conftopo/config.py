@@ -15,6 +15,30 @@ class MemoryConfig:
     max_nodes: int = 500
     # 合并半径
     merge_radius: float = 1.0
+    # Room/region summary settings for coarse semantic memory
+    summary_radius: float = 5.0
+    summary_min_distance: float = 6.0
+    summary_low_detail_threshold: float = 0.35
+    summary_mid_detail_threshold: float = 0.65
+    summary_max_observations: int = 20
+    # Fold/visibility: distance beyond which compressed nodes are hidden from planning/viz
+    fold_distance: float = 3.0
+    # Distance-aware pruning thresholds
+    far_prune_distance: float = 10.0
+    far_prune_threshold: float = 0.18
+    mid_prune_distance: float = 6.0
+    mid_prune_threshold: float = 0.12
+    # Relaxed room_level trigger conditions
+    room_level_min_distance: float = 8.0
+    room_level_confidence_max: float = 0.55
+    room_level_detail_max: float = 0.45
+    # Bottom-layer spatial graph: connect nearby room summaries
+    room_link_max_distance: float = 12.0
+    # Distant waypoint compression (navigation layer)
+    waypoint_compress_enabled: bool = True
+    waypoint_compress_distance: float = 5.0
+    waypoint_compress_keep_near: float = 3.0
+    waypoint_compress_collinear_deg: float = 20.0
 
 
 @dataclass
@@ -26,6 +50,9 @@ class PerceptionConfig:
     heavy_goal_warmup_steps: int = 1
     heavy_goal_sim_threshold: float = 0.35
     heavy_low_object_confidence: float = 0.35
+    # Summary-context heavy perception: separate cooldown and label budget
+    heavy_summary_cooldown: int = 8
+    heavy_summary_max_labels: int = 12
     heavy_backend: str = "groundingdino"
     groundingdino_config: Optional[str] = None
     groundingdino_checkpoint: Optional[str] = None
