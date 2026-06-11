@@ -342,6 +342,7 @@ def main():
         frame_dir.mkdir(parents=True, exist_ok=True)
     sim = make_sim(scene_file)
     sim_agent = sim.initialize_agent(0)
+    # Load GT object positions from semantic scene for SR/SPL computation
     state = set_start_state(sim_agent, episode)
     origin = np.array(state.position, dtype=np.float32)
     executor = PathfinderExecutor()
@@ -360,6 +361,12 @@ def main():
             monitor_target_id = None
             monitor_start_step = len(steps)
             monitor_best_distance = None
+            # GT-based goal proximity tracking for SR/SPL
+            goal_object_name = goal.target_object.lower().strip()
+            goal_min_distance = float("inf")
+            goal_min_step = -1
+            goal_path_length = 0.0
+            goal_prev_world = None
             memory_reuse_hits = 0
             semantic_reuse_hits = 0
             repeated_goal_reuse_hits = 0
@@ -396,6 +403,24 @@ def main():
                     rec["repeated_goal_reuse"] = True
                 target_distance = planar_target_distance(rec.get("position"), rec.get("target_position"))
                 rec["target_distance"] = target_distance
+                # Memory-based goal proximity: check agent distance to goal-relevant object nodes
+                if rec.get("position") is not None:
+                    for node_id, node in list(agent.topo_map._nodes.items()):
+                        if node.node_type.name == "OBJECT" and node.label and node.label.lower() == goal_object_name:
+                            node_pos = node.position
+                            if node_pos is not None:
+                                d = float(np.linalg.norm(np.asarray(rec["position"], dtype=np.float32) - np.asarray(node_pos, dtype=np.float32)))
+                                if d < goal_min_distance:
+                                    goal_min_distance = d
+                                    goal_min_step = len(steps)
+                rec["goal_min_distance"] = goal_min_distance
+                # Path length tracking (world coordinates)
+                world_pos = rec.get("world_position")
+                if world_pos is not None:
+                    wp = np.asarray(world_pos, dtype=np.float32)
+                    if goal_prev_world is not None:
+                        goal_path_length += float(np.linalg.norm(wp - goal_prev_world))
+                    goal_prev_world = wp
                 if target_id is None or rec["low_action"] in ("stop", "target_reached"):
                     monitor_target_id = None
                     monitor_best_distance = None
@@ -426,6 +451,37 @@ def main():
                 if rec["low_action"] == "stop":
                     break
             after = agent.memory_stats.copy()
+            # Compute SPL: optimal geodesic distance / actual path length
+            goal_spl = None
+            goal_optimal_path = None
+            goal_success_bool = bool(goal_min_distance <= 1.0) if goal_min_distance != float("inf") else False
+            if goal_success_bool and goal_path_length > 0 and goal_min_distance != float("inf"):
+                # Find the closest goal object node in world coordinates for optimal path
+                best_node_world = None
+                best_dist = float("inf")
+                for node_id, node in list(agent.topo_map._nodes.items()):
+                    if node.node_type.name == "OBJECT" and node.label and node.label.lower() == goal_object_name:
+                        if node.position is not None:
+                            node_world = np.asarray(node.position, dtype=np.float32) + origin
+                            d2 = float(np.linalg.norm(np.asarray(rec["position"], dtype=np.float32) - np.asarray(node.position, dtype=np.float32)))
+                            if d2 < best_dist:
+                                best_dist = d2
+                                best_node_world = node_world
+                if best_node_world is not None and len(steps) > start:
+                    first_step = steps[start]
+                    start_world = np.asarray(first_step.get("world_position", first_step.get("position", [0,0,0])), dtype=np.float32)
+                    if start_world.shape == (3,):
+                        try:
+                            from habitat_sim.nav import ShortestPath
+                            sp = ShortestPath()
+                            sp.requested_start = start_world
+                            sp.requested_end = best_node_world
+                            if sim.pathfinder.find_path(sp):
+                                goal_optimal_path = float(sp.geodesic_distance)
+                        except Exception:
+                            pass
+            if goal_optimal_path is not None and goal_optimal_path > 0 and goal_path_length > 0:
+                goal_spl = round(goal_optimal_path / max(goal_path_length, goal_optimal_path), 4)
             if idx == 0:
                 task0_semantic_nodes = semantic_node_ids(agent)
             tasks.append({
@@ -443,6 +499,11 @@ def main():
                 "repeated_goal_reuse_hits": repeated_goal_reuse_hits,
                 "repeated_goal_semantic_reuse": repeated_goal_reuse_hits > 0,
                 "steps": len(steps) - start,
+                "goal_min_distance": float(goal_min_distance) if goal_min_distance != float("inf") else None,
+                "goal_success": bool(goal_min_distance <= 1.0) if goal_min_distance != float("inf") else None,
+                "goal_path_length": round(goal_path_length, 4),
+                "goal_optimal_path": round(goal_optimal_path, 4) if goal_optimal_path is not None else None,
+                "goal_spl": goal_spl,
             })
     finally:
         sim.close()
@@ -474,6 +535,13 @@ def main():
         "final_summary": {
             "episode_length": len(steps),
             "target_switch_count": len(goals) - 1,
+            "goals_total": len(goals),
+            "goals_success": sum(1 for t in tasks if t.get("goal_success")),
+            "goals_min_distances": [t.get("goal_min_distance") for t in tasks],
+            "goals_path_lengths": [t.get("goal_path_length") for t in tasks],
+            "goals_optimal_paths": [t.get("goal_optimal_path") for t in tasks],
+            "goals_spl": [t.get("goal_spl") for t in tasks],
+            "avg_spl": round(sum(t.get("goal_spl", 0) or 0 for t in tasks) / max(len(tasks), 1), 4),
             "memory_reuse_count": sum(t["memory_reuse_hits"] for t in tasks),
             "semantic_reuse_count": sum(t["semantic_reuse_hits"] for t in tasks),
             "semantic_node_count": agent.memory_stats["objects"] + agent.memory_stats["rooms"] + agent.memory_stats["landmarks"],

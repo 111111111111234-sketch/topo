@@ -48,8 +48,8 @@ def compute_semantic_confidence(factors: ConfidenceFactors) -> float:
     """
     multi_view_bonus = min(1.0, factors.multi_view_count / 3.0)
 
-    staleness_decay = factors.time_decay * (0.98 ** max(0, factors.staleness_steps))
-    penalty = 0.2 * min(1.0, factors.redundancy_penalty) + 0.35 * min(1.0, factors.conflict_penalty)
+    staleness_decay = factors.time_decay * (0.995 ** max(0, factors.staleness_steps))
+    penalty = 0.05 * min(1.0, factors.redundancy_penalty) + 0.1 * min(1.0, factors.conflict_penalty)
 
     base = (
         SEMANTIC_WEIGHTS["detection"] * factors.detection_score
