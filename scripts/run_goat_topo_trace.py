@@ -120,7 +120,11 @@ def snapshot_topo(agent: ConfTopoGOATAgent) -> dict[str, Any]:
         edge_type = data.get("edge_type", "")
         if hasattr(edge_type, "value"):
             edge_type = edge_type.value
-        edges.append({"source": u, "target": v, "type": edge_type, "weight": float(data.get("weight", 1.0))})
+        edge_entry = {"source": u, "target": v, "type": edge_type, "weight": float(data.get("weight", 1.0))}
+        for extra_key in ["distance_m", "traversability", "visited_count", "evidence", "directions", "description_type", "connected_rooms", "via_landmark", "passage_type", "confidence", "transitions"]:
+            if extra_key in data:
+                edge_entry[extra_key] = data[extra_key]
+        edges.append(edge_entry)
     return {"nodes": nodes, "edges": edges}
 
 

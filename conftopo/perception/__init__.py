@@ -8,6 +8,11 @@ from conftopo.perception.heavy_perceiver import (
     HeavyPerceiver,
     ObjectObservation,
 )
+from conftopo.perception.perception_report import PerceptionReport
+from conftopo.perception.clip_gdino_report_builder import ClipGdinoReportBuilder
+from conftopo.perception.perception_trigger import PerceptionTrigger, TriggerState
+from conftopo.perception.vlm_backend import FakeVLMBackend, VLMBackendBase
+from conftopo.perception.vlm_perceiver import VLMPerceiver
 
 __all__ = [
     "LightPerceiver",
@@ -16,4 +21,11 @@ __all__ = [
     "ObjectObservation",
     "GroundingDINOBackend",
     "FakeGroundingDINOBackend",
+    "PerceptionReport",
+    "ClipGdinoReportBuilder",
+    "PerceptionTrigger",
+    "TriggerState",
+    "VLMBackendBase",
+    "FakeVLMBackend",
+    "VLMPerceiver",
 ]

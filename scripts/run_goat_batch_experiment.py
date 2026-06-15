@@ -168,6 +168,12 @@ def run_multigoal(args, row: dict[str, Any]) -> dict[str, Any]:
         "--phase2-summary",
         args.phase2_summary,
     ]
+    cmd.extend(["--heavy-enabled"])
+    cmd.extend(["--heavy-interval", "7"])
+    cmd.extend(["--groundingdino-config", "third_party/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"])
+    cmd.extend(["--groundingdino-checkpoint", "third_party/GroundingDINO/weights/groundingdino_swint_ogc.pth"])
+    cmd.extend(["--groundingdino-device", "cuda"])
+    cmd.extend(["--record-topo"])
 
     started = time.time()
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)

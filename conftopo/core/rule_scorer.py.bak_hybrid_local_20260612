@@ -28,9 +28,7 @@ def compute_semantic_bias(
 ) -> np.ndarray:
     """Compute semantic bias scores for candidate nodes.
 
-    Local topo style: semantic relevance plus a small Euclidean distance
-    penalty.  The remote graph-distance penalty over-preferred nearby known
-    structure nodes and under-explored semantically promising objects.
+    Returns z-normalized scores (mean=0, std=1) if normalize=True.
     """
     current_goal = goal_graph.get_current_goal()
     if current_goal is None:
@@ -42,7 +40,7 @@ def compute_semantic_bias(
         if node is None:
             scores.append(0.0)
             continue
-        score = _score_node(current_goal, node, topo_map, agent_position)
+        score = _score_node(current_goal, node, topo_map, agent_position, current_node_id)
         scores.append(score)
 
     scores = np.array(scores, dtype=np.float32)
@@ -62,6 +60,7 @@ def _score_node(
     node: SemanticNode,
     topo_map: DynamicTopoMap,
     agent_pos: np.ndarray,
+    current_node_id: Optional[str] = None,
 ) -> float:
     """Score a single node against the current goal."""
     score = 0.0
@@ -71,27 +70,40 @@ def _score_node(
     else:
         score += _score_route_goal(goal, node, topo_map)
 
+    # Frontier exploration bonus (reduced to avoid dominating object matches)
     if node.node_type == NodeType.WAYPOINT_FRONTIER:
-        score += 0.2
+        score += 0.1
 
-    dist = np.linalg.norm(node.position - agent_pos)
-    score -= 0.05 * min(dist, 20.0) / 20.0
+    # Graph distance penalty via topo map shortest path
+    if current_node_id is not None:
+        from conftopo.core.dynamic_topo_map import EdgeType
+        topo_path = topo_map.shortest_path(current_node_id, node.node_id, EdgeType.NAVIGABLE)
+        graph_dist = float(len(topo_path)) if topo_path else 30.0
+        score -= 0.06 * min(graph_dist, 30) / 30.0
+    else:
+        dist = np.linalg.norm(node.position - agent_pos)
+        score -= 0.08 * min(dist, 20.0) / 20.0
 
+    # Visited penalty (avoid revisiting)
     if node.visit_count > 1:
         score -= 0.1 * min(node.visit_count, 5) / 5.0
 
+    # Confidence bonus (prefer high-confidence nodes)
     score += 0.1 * node.confidence
+
     return score
 
 
 def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopoMap) -> float:
-    """Score a node for object-goal task."""
+    """Score a node for object-goal task (GOAT/SOON)."""
     score = 0.0
 
+    # Target object match (boosted to dominate frontier exploration bonus)
     if node.node_type == NodeType.OBJECT and goal.target_embedding is not None:
         sim = cosine_similarity(goal.target_embedding, node.embedding)
-        score += 0.4 * sim
+        score += 0.55 * sim
 
+    # Room prior match
     if node.node_type == NodeType.ROOM and goal.room_prior:
         if node.label in goal.room_prior:
             score += 0.3
@@ -100,25 +112,28 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
                     for rpe in goal.room_prior_embeddings]
             score += 0.3 * max(sims) if sims else 0.0
 
+    # Room/region summary: weak match if summary contains target object label
     if (node.node_type == NodeType.ROOM
             and node.attributes.get("summary_type") == "room_region"):
-        contains = [str(c).lower() for c in node.attributes.get("contains_labels", [])]
+        contains = [c.lower() for c in node.attributes.get("contains_labels", [])]
         target = getattr(goal, "target_object", None)
         if target:
             target_parts = {target.lower()}
             if " and " in target:
-                target_parts.update(part.strip().lower() for part in target.split(" and ") if part.strip())
+                target_parts.update(p.strip().lower() for p in target.split(" and ") if p.strip())
             if " or " in target:
-                target_parts.update(part.strip().lower() for part in target.split(" or ") if part.strip())
+                target_parts.update(p.strip().lower() for p in target.split(" or ") if p.strip())
             if target_parts & set(contains):
                 score += 0.25
 
+    # Landmark proximity
     if goal.landmark_embeddings is not None and node.embedding is not None:
         sims = [cosine_similarity(node.embedding, le)
                 for le in goal.landmark_embeddings]
         if sims:
             score += 0.2 * max(sims)
 
+    # Nodes that have related semantic nodes nearby get a bonus (skip folded)
     if node.node_type in (NodeType.WAYPOINT_VISITED, NodeType.WAYPOINT_FRONTIER):
         neighbors = topo_map.get_neighbors(node.node_id)
         for neighbor_id in neighbors:

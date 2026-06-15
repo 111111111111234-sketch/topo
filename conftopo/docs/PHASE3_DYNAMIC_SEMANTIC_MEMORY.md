@@ -344,3 +344,178 @@ python scripts/visualize_phase3_memory_trace.py \
 ```text
 动态 TopoMap 不是无限保存所有细节，而是根据距离、时间和任务相关性动态调整语义粒度：近处展开 object，远处压缩成 landmark / room，重新靠近时再恢复细节。
 ```
+
+---
+
+## 附录：Phase 3 实验验证设定
+
+### 环境与数据集
+
+| 项目 | 配置 |
+|------|------|
+| 基准平台 | GOAT-Bench (hm3d/v1) |
+| 场景集 | HM3D val_seen，14 scenes |
+| 导航引擎 | Habitat-Sim + navmesh pathfinder |
+| 感知模型 | CLIP ViT-B/32 (light) + GroundingDINO SwinT OGC (heavy) |
+| 运动控制 | Habitat DD-PPO PointNav controller |
+
+### 14 场景列表
+
+```
+4ok3usBNeis  5cdEh9F2hJL  6s7QHgap2fW  7MXmsvcQjpJ
+BAbdmeyTvMZ  CrMo8WxCyVb  Dd4bFSTQ8gi  GLAQ4DNUx5U
+HY1NcmCgn3n  LT9Jq6dN3Ea  MHPLjHsuG27  Nfvxx8J5NCo
+QaLdnwvtxbs  TEEsavR23oF
+```
+
+### 实验参数
+
+#### 记忆参数
+
+| 参数 | 默认值 | 修改后 | 说明 |
+|------|--------|--------|------|
+| `near_radius` | 3.0 | — | 近处 object-level 细粒度半径 |
+| `far_radius` | 10.0 | — | 远距离折叠边界 |
+| `fold_distance` | 3.0 | — | 折叠触发距离 |
+| `room_level_min_distance` | 6.0 | **4.5** | 远距离压缩阈值（降低以匹配场景尺度） |
+| `summary_mid_detail_threshold` | 0.65 | — | detail_score 上限，超此值不压缩 |
+| `confidence_decay` | 0.95 | — | 每步置信度衰减率 |
+| `prune_threshold` | 0.1 | — | 低置信节点剪枝阈值 |
+| `max_nodes` | 500 | — | topo map 最大节点数 |
+| `merge_radius` | 1.0 | — | object 合并半径 |
+
+#### 感知参数
+
+| 参数 | 默认值 | 修改后 | 说明 |
+|------|--------|--------|------|
+| `heavy_enabled` | False | **True** | 开启 GroundingDINO heavy perception |
+| `heavy_interval` | 7 | — | GroundingDINO 触发间隔（步） |
+| `object_detection_threshold` | 0.40 | — | GroundingDINO 检测阈值 |
+| `groundingdino_text_threshold` | 0.25 | — | 文本匹配阈值 |
+| `heavy_low_object_confidence` | 0.35 | **0.18** | 低置信触发阈值（降低以匹配置信度天花板） |
+| `heavy_goal_warmup_steps` | 1 | — | 新目标前 N 步强制 heavy |
+| `heavy_on_frontier` | True | — | 靠近 frontier 时触发 heavy |
+| `heavy_summary_cooldown` | 8 | — | room summary heavy 冷却 |
+| `clip_model` | ViT-B/32 | — | CLIP 模型 |
+| `room_threshold` | 0.20 | — | CLIP 房间识别阈值 |
+| `object_threshold` | 0.28 | — | CLIP 物体检测阈值 |
+
+#### 规划参数
+
+| 参数 | 默认值 | 修改后 | 说明 |
+|------|--------|--------|------|
+| `two_stage_enabled` | True | — | 两阶段规划开关 |
+| `structure_anchor_bonus` | 0.25 | — | 结构锚点打分奖励 |
+| `structure_anchor_radius` | 6.0 | — | 锚点作用半径 |
+| `sticky_target_enabled` | True | — | 目标粘性跟踪 |
+| `sticky_reach_radius` | 0.75 | — | 目标到达判定距离 |
+| `global_graph_enabled` | False | — | 全局图规划（当前场景无效，默认关闭） |
+
+### 评估指标
+
+**SPL (Success weighted by Path Length)**：
+
+```
+SPL = success × geodesic(GT_start, GT_goal) / max(geodesic, agent_path_to_STOP)
+```
+
+其中：
+
+- `geodesic`: habitat navmesh 最短路径（GT object 位置）
+- `agent_path_to_STOP`: agent 从起点到 stop 位置的累计路径
+- `stop` 条件：`should_stop()` 返回 True（GroundingDINO 检测到目标 OR CLIP 相似度 >0.5 OR topo_map 距离 <0.8m）
+
+**SR (Success Rate)**：
+
+```
+goal_min_distance <= 1.0m → success
+```
+
+**其他**：collision_like_count、heavy_perception_calls、object_merge_count、mean_object_confidence
+
+### 评估协议
+
+- 每个 scene 最多 10 个目标
+- 每个目标最多 500 步
+- 多目标连续执行（topo map 不清空）
+- agent 自行决定 stop 时机
+
+### 关键改进汇总
+
+| # | 改进 | 类型 | 效果 |
+|---|------|------|------|
+| 1 | `room_level_min_distance` 6.0 → 4.5 | 参数调优 | 远距离 object 压缩触发提前 25% |
+| 2 | Staleness decay for mid-range objects | 方法 | 3+ 步未检测的 object 自动降 detail_score |
+| 3 | `_mark_node_folded_anchor / _mark_node_active_detail` | 方法 | 折叠时保留 anchor 位置 / 展开时不丢失 anchor |
+| 4 | `target_relevance` 在 set_new_goal 归零 | 修复 | 非当前目标 object 可正常折叠 |
+| 5 | `.copy()` → `.tolist()` + `get_object_anchor()` | 修复 | JSON 序列化 numpy array 问题 |
+| 6 | `heavy_low_object_confidence` 0.35 → 0.18 | 参数调优 | 降低 heavy 触发频率，打破反馈循环 |
+| 7 | Structure anchor bonus 扩展到 OBJECT | 修复 | folded goal object 获得 room 锚点加分 |
+| 8 | `should_stop()` 三路合并 | 方法 | GroundingDINO + CLIP + proximity 联合判定 |
+| 9 | GT geodesic (habitat semantic_scene) | 方法 | SPL 计算对齐 GOAT-Bench 标准 |
+| 10 | `GlobalGraphPlanner` + `_resolve_navigable_target` | 方法 | topo graph Dijkstra 全局路径（默认关闭） |
+
+### 运行指令
+
+```bash
+# 多目标评估
+cd /workspace/tangyx7@xiaopeng.com && \
+python scripts/run_goat_multigoal_acceptance.py \
+    --split val_seen --scene SCENE_NAME --episode-index 0 \
+    --max-goals 10 --steps-per-goal 500 \
+    --dataset-dir data/datasets/goat_bench/hm3d/v1 \
+    --scene-root data/scene_datasets/hm3d \
+    --goal-graph-dir data/goal_graphs/goat \
+    --output data/logs/goat_topo/final_14scenes/${scene}_multigoal.json \
+    --report data/logs/goat_topo/final_14scenes/${scene}_report.json \
+    --heavy-enabled --heavy-interval 7 \
+    --groundingdino-config third_party/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py \
+    --groundingdino-checkpoint third_party/GroundingDINO/weights/groundingdino_swint_ogc.pth \
+    --groundingdino-device cuda --record-topo
+
+# 结果汇总
+cd /workspace/tangyx7@xiaopeng.com && \
+python3 -c "
+import json, glob
+total_sr, total_spl, n = 0, 0, 0
+for rp in sorted(glob.glob('data/logs/goat_topo/final_14scenes/*_report.json')):
+    r = json.load(open(rp))
+    fs = r['final_summary']
+    s = fs['goals_success']; t = fs['goals_total']
+    sn = rp.split('/')[-1].replace('_report.json','')
+    print('{:25s}  SR={}/{} ({:3.0f}%)  SPL={:.4f}'.format(sn,s,t,100*s/t,fs['avg_spl']))
+    total_sr += s; total_spl += fs['avg_spl']*t; n += t
+print('{:25s}  SR={}/{} ({:.1f}%)  avg SPL={:.4f}'.format('TOTAL',total_sr,n,100*total_sr/n,total_spl/n if n else 0))
+"
+```
+
+### 结果表
+
+| 场景 | SR | SPL | heavy | coll |
+|------|----|-----|-------|------|
+| GLAQ4DNUx5U | 9/9 (100%) | 0.5508 | 70 | 0 |
+| LT9Jq6dN3Ea | 5/5 (100%) | 0.6281 | 83 | 0 |
+| Nfvxx8J5NCo | 6/7 (86%) | 0.5971 | 133 | 0 |
+| 6s7QHgap2fW | 6/6 (100%) | 0.4842 | 124 | 1 |
+| 7MXmsvcQjpJ | 7/7 (100%) | 0.3885 | 61 | 7 |
+| QaLdnwvtxbs | 8/10 (80%) | 0.3670 | — | — |
+| Dd4bFSTQ8gi | 7/9 (78%) | 0.3664 | 306 | 0 |
+| 4ok3usBNeis | 8/10 (80%) | 0.3566 | 247 | 19 |
+| TEEsavR23oF | 9/10 (90%) | 0.2780 | 196 | 10 |
+| MHPLjHsuG27 | 5/6 (83%) | 0.2225 | 247 | 17 |
+| BAbdmeyTvMZ | 5/8 (62%) | 0.1433 | — | — |
+| CrMo8WxCyVb | 4/8 (50%) | 0.1504 | — | — |
+| 5cdEh9F2hJL | 4/8 (50%) | 0.1392 | 416 | 1 |
+| HY1NcmCgn3n | 8/9 (89%) | 0.0123 | 115 | 1 |
+| **TOTAL** | **91/112 (81%)** | **0.3225** | — | — |
+
+### 中间故障处理记录
+
+| 故障 | 原因 | 修复 |
+|------|------|------|
+| JSON serialization error | `.copy()` 存 ndarray 到 attributes | `.copy()` → `.tolist()` |
+| `_bridge_waypoints` NameError | `sed shortest_path edge_type` 副作用 | 硬编码 `EdgeType.NAVIGABLE` |
+| `goal_min_distance` break 内联问题 | `sed a\` 多行插入拼接 | 用 Python 替换 |
+| `runner` 文件损坏 | `"\n".join(lines)` 双换行 | 本地 clean copy 覆盖 |
+| `_global_planner` AttributeError | 被插入到 `reset()` 而非 `__init__` | 移到 `__init__` |
+

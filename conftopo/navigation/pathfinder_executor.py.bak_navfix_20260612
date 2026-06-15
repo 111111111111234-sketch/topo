@@ -88,15 +88,6 @@ class PathfinderExecutor:
         start_world = np.asarray(state.position, dtype=np.float32)
         origin_world_arr = np.asarray(origin_world, dtype=np.float32)
         target_world = relative_to_world(target_relative_arr, origin_world_arr)
-        snapped_target_world = None
-        try:
-            snapped = np.asarray(sim.pathfinder.snap_point(target_world), dtype=np.float32)
-            if snapped.shape == (3,) and np.all(np.isfinite(snapped)):
-                snapped_target_world = snapped
-                target_world = snapped
-                target_relative_arr = world_to_relative(target_world, origin_world_arr)
-        except Exception:
-            snapped_target_world = None
         start_relative = world_to_relative(start_world, origin_world_arr)
 
         planar_dist = float(np.linalg.norm((target_relative_arr - start_relative)[[0, 2]]))
@@ -160,10 +151,6 @@ class PathfinderExecutor:
         probe = self.probe(sim, target_relative, origin_world, target_node_id=target_node_id)
         debug = probe.to_dict()
         debug["controller_mode"] = "pathfinder_next_waypoint"
-        debug["target_snapped_to_navmesh"] = (
-            probe.target_position_relative is not None
-            and not np.allclose(np.asarray(target_relative, dtype=np.float32), np.asarray(probe.target_position_relative, dtype=np.float32), atol=1e-3)
-        )
         if not probe.reachable:
             debug["low_action"] = "unreachable"
             return "unreachable", debug

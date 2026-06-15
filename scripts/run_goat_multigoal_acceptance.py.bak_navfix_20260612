@@ -169,10 +169,8 @@ def run_step(
         action = "stop"
         nav = {"reachable": False, "reason": out.get("stop_debug", {}).get("reason", "should_stop")}
     elif target is None:
-        # No semantic target should still explore.  Pure turning produced long
-        # no-target stalls, so alternate short forward probes with turns.
-        action = "move_forward" if (step_index % 3 == 0) else "turn_right"
-        nav = {"reachable": True, "reason": plan_action or "no_target", "controller_mode": "no_target_explore"}
+        action = "turn_right"
+        nav = {"reachable": False, "reason": plan_action or "no_target"}
     else:
         candidate_ids = out.get("candidate_ids") or []
         scores = np.asarray(out.get("scores", []), dtype=np.float32).tolist()
@@ -196,12 +194,8 @@ def run_step(
             node = agent.topo_map.get_node(selected["node_id"])
             if node is not None:
                 target_id = node.node_id
-                selected_target = selected.get("target_position")
-                if selected_target is not None:
-                    target = np.asarray(selected_target, dtype=np.float32)
-                else:
-                    target_pos, _ = agent._target_output_for_node(node)
-                    target = target_pos
+                target_pos, _ = agent._target_output_for_node(node)
+                target = target_pos
         action, nav = executor.step(sim, np.asarray(target), origin, target_node_id=target_id)
         if action == "target_reached":
             nav_event = agent.on_navigation_event(target_id, "target_reached")

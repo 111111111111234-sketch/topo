@@ -16,6 +16,7 @@ from conftopo.core.dynamic_topo_map import DynamicTopoMap, EdgeType, NodeType
 from conftopo.core.instruction_graph import GoalNode
 from conftopo.perception.heavy_perceiver import FakeGroundingDINOBackend, HeavyPerceiver
 from conftopo.perception.heavy_perceiver import GroundingDINOBackend
+from conftopo.perception.perception_report import PerceptionReport
 
 
 def test_fake_groundingdino_outputs_object_observations():
@@ -420,7 +421,7 @@ def test_heavy_detection_marks_recovered_from_summary():
     agent._heading = 0.0
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
     agent._cur_rgb_embed = np.ones(4, dtype=np.float32)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
     agent._goal_local_step = 2
     cur_vp = agent.topo_map.add_node(
         NodeType.WAYPOINT_VISITED,
@@ -484,7 +485,7 @@ def test_goat_agent_heavy_trigger_and_cooldown():
 # ==================== Phase3 folding / pruning / heavy tests ====================
 
 
-def test_far_object_is_folded_and_skipped_in_plan():
+def test_far_object_anchor_retention():
     config = ConfTopoConfig()
     config.perception.heavy_enabled = False
     agent = ConfTopoGOATAgent(config)
@@ -505,9 +506,255 @@ def test_far_object_is_folded_and_skipped_in_plan():
 
     node = agent.topo_map.get_node(obj_id)
     assert node.attributes.get("folded") is True
+    assert node.attributes.get("folded_detail") is True
+    assert node.attributes.get("is_semantic_anchor") is True
+    assert node.attributes.get("is_active_detail") is False
+    assert node.attributes.get("anchor_waypoint_id") is not None
 
     reason = agent._candidate_skip_reason(node)
-    assert reason == "folded"
+    assert reason == "folded_detail"
+
+
+def test_anchor_waypoint_is_visited():
+    topo = DynamicTopoMap()
+    visited_id = topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.zeros(3, dtype=np.float32),
+    )
+    topo.add_node(
+        NodeType.WAYPOINT_FRONTIER,
+        position=np.array([11.5, 0.0, 0.0], dtype=np.float32),
+    )
+    obj_id, _ = topo.upsert_object_observation(
+        label="chair",
+        bbox=[0, 0, 10, 10],
+        confidence=0.3,
+        position=np.array([12.0, 0.0, 0.0], dtype=np.float32),
+        view_heading=0.0,
+    )
+    topo.step()
+    topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
+
+    obj = topo.get_node(obj_id)
+    assert obj.attributes["anchor_waypoint_id"] == visited_id
+    anchor_wp = topo.get_node(obj.attributes["anchor_waypoint_id"])
+    assert anchor_wp.node_type == NodeType.WAYPOINT_VISITED
+
+
+def test_goal_relevant_folded_anchor_not_skipped():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_vp_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.zeros(3, dtype=np.float32),
+    )
+    obj_id = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([12.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.8,
+        label="sink",
+        attributes={
+            "folded": True,
+            "folded_detail": True,
+            "is_semantic_anchor": True,
+            "target_relevance": 1.0,
+        },
+    )
+
+    reason = agent._candidate_skip_reason(agent.topo_map.get_node(obj_id))
+    assert reason is None
+
+
+def test_plan_targets_anchor_waypoint_for_folded_goal_object():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    config.planning.two_stage_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    embed = np.zeros(512, dtype=np.float32)
+    embed[0] = 1.0
+    agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
+    agent._position = np.zeros(3, dtype=np.float32)
+    anchor_pos = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    anchor_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=anchor_pos,
+    )
+    agent._cur_vp_id = anchor_id
+    obj_id = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([12.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        label="sink",
+        embedding=embed.copy(),
+        attributes={
+            "folded": True,
+            "folded_detail": True,
+            "is_semantic_anchor": True,
+            "is_active_detail": False,
+            "target_relevance": 1.0,
+            "anchor_position": np.array([12.0, 0.0, 0.0], dtype=np.float32),
+            "anchor_waypoint_id": anchor_id,
+            "anchor_waypoint_position": anchor_pos.copy(),
+            "anchor_room_id": None,
+        },
+    )
+
+    plan = agent.plan()
+    assert plan["target_node_id"] == obj_id
+    assert plan["requires_regrounding"] is True
+    assert plan["target_anchor_type"] == "folded_object_anchor"
+    assert plan["anchor_waypoint_id"] == anchor_id
+    assert np.allclose(plan["target_position"], anchor_pos)
+
+
+def test_room_semantic_summary_records_folded_object():
+    topo = DynamicTopoMap()
+    topo.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.zeros(3, dtype=np.float32),
+    )
+    obj_id, _ = topo.upsert_object_observation(
+        label="chairs",
+        bbox=[0, 0, 10, 10],
+        confidence=0.35,
+        position=np.array([12.0, 0.0, 0.0], dtype=np.float32),
+        view_heading=0.0,
+        room_context="storage",
+    )
+    topo.step()
+    topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
+
+    obj = topo.get_node(obj_id)
+    room = topo.get_node(obj.attributes["anchor_room_id"])
+    assert "chairs" in room.attributes["contains_labels"]
+    assert obj_id in room.attributes["contains_node_ids"]
+    semantic_summary = room.attributes["semantic_summary"]
+    assert semantic_summary["contains_labels"]["chair"] >= 1
+    assert obj_id in semantic_summary["folded_object_ids"]
+    assert "chair" in semantic_summary["representative_objects"]
+    assert room.attributes["summary_text"]
+
+
+def test_regrounding_starts_only_after_anchor_reached():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    agent._position = np.zeros(3, dtype=np.float32)
+    plan_output = {
+        "target_node_id": "obj_sink",
+        "target_position": np.array([2.0, 0.0, 0.0], dtype=np.float32),
+        "requires_regrounding": True,
+        "anchor_waypoint_id": "wp_anchor",
+    }
+
+    action = agent.act(plan_output)
+    assert action["action"] == "navigate"
+    assert agent._reground_state == "idle"
+
+    agent._position = np.array([0.1, 0.0, 0.0], dtype=np.float32)
+    plan_output["target_position"] = np.zeros(3, dtype=np.float32)
+    action = agent.act(plan_output)
+    assert action["action"] == "turn_right"
+    assert action["mode"] == "local_reground_scan"
+    assert agent._reground_state == "scanning"
+
+
+def test_regrounding_forces_heavy_perception():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    config.perception.heavy_interval = 100
+    agent = ConfTopoGOATAgent(config)
+    agent.set_heavy_perceiver(HeavyPerceiver(FakeGroundingDINOBackend([]), min_confidence=0.2))
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._last_heavy_step = agent.topo_map.current_step
+    agent._reground_state = "scanning"
+
+    should_run, reason = agent._should_run_heavy_perception()
+    assert should_run is True
+    assert reason == "local_regrounding"
+
+
+def test_reground_scan_transitions_to_searching_after_rotations():
+    agent = ConfTopoGOATAgent(ConfTopoConfig())
+    agent._reground_state = "scanning"
+
+    action = None
+    for _ in range(agent._reground_scan_rotations):
+        action = agent.act({"mode": "local_reground_scan"})
+
+    assert action["action"] == "turn_right"
+    assert agent._reground_state == "searching"
+    assert agent._reground_steps == 0
+    assert agent._reground_scan_rotated == 0
+
+
+def test_reground_heavy_detection_records_target_object():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = True
+    config.perception.object_detection_threshold = 0.2
+    agent = ConfTopoGOATAgent(config)
+    agent.set_heavy_perceiver(HeavyPerceiver(
+        FakeGroundingDINOBackend([{
+            "label": "sink",
+            "bbox": [100, 100, 200, 220],
+            "confidence": 0.82,
+        }]),
+        min_confidence=0.2,
+    ))
+    agent.set_new_goal(GoalNode(target_object="sink"))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._heading = 0.0
+    agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    agent._cur_rgb_embed = np.ones(4, dtype=np.float32)
+    agent._cur_report = PerceptionReport()
+    agent._reground_state = "scanning"
+    cur_vp = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.zeros(3, dtype=np.float32),
+    )
+
+    agent._add_heavy_object_nodes(cur_vp, None)
+
+    assert agent._target_object_detected_this_scan is True
+    target = agent.topo_map.get_node(agent._reground_target_node_id)
+    assert target is not None
+    assert target.node_type == NodeType.OBJECT
+    assert target.label == "sink"
+
+
+def test_reground_search_exits_after_max_steps():
+    config = ConfTopoConfig()
+    config.perception.heavy_enabled = False
+    agent = ConfTopoGOATAgent(config)
+    agent.set_new_goal(GoalNode(target_object="sink"))
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_vp_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.zeros(3, dtype=np.float32),
+    )
+    agent._reground_state = "searching"
+    agent._reground_anchor_node_id = "wp_anchor"
+    agent._reground_anchor_position = np.zeros(3, dtype=np.float32)
+    agent._reground_max_steps = 1
+
+    agent.plan()
+
+    assert agent._reground_state == "failed"
+    assert agent._reground_failed_anchor_node_id == "wp_anchor"
+
+    action = agent.act({
+        "target_node_id": "obj_sink",
+        "target_position": np.zeros(3, dtype=np.float32),
+        "requires_regrounding": True,
+        "anchor_waypoint_id": "wp_anchor",
+    })
+    assert action["action"] in ("navigate", "stop")
+    assert agent._reground_state == "failed"
 
 
 def test_folded_object_unfolds_when_agent_near():
@@ -692,7 +939,7 @@ def test_heavy_summary_labels_exclude_vocabulary():
                                 landmarks=["faucet"]))
     agent._position = np.zeros(3, dtype=np.float32)
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
 
     class FakeSummary:
         attributes = {"contains_labels": ["towel", "mirror"]}
@@ -717,7 +964,7 @@ def test_heavy_labels_align_with_room_structure_target():
     agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
     agent._position = np.zeros(3, dtype=np.float32)
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
 
     room = agent.topo_map._nodes.setdefault(
         "kitchen_room",
@@ -758,7 +1005,7 @@ def test_heavy_labels_align_with_portal_structure_target():
     agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
     agent._position = np.zeros(3, dtype=np.float32)
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
 
     portal_id = agent.topo_map.add_node(
         NodeType.LANDMARK,
@@ -797,7 +1044,7 @@ def test_heavy_align_with_structure_target_disabled_uses_default_vocab():
     agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
     agent._position = np.zeros(3, dtype=np.float32)
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
 
     room_id = agent.topo_map.add_node(
         NodeType.ROOM,
@@ -829,7 +1076,7 @@ def test_heavy_detection_boosts_structural_label_relevance():
     agent.set_new_goal(GoalNode(target_object="sink", target_embedding=embed.copy()))
     agent._position = np.zeros(3, dtype=np.float32)
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {}
+    agent._cur_report = PerceptionReport()
     agent._goal_local_step = 1
     cur_vp = agent.topo_map.add_node(
         NodeType.WAYPOINT_VISITED, position=np.zeros(3, dtype=np.float32))
@@ -1006,12 +1253,11 @@ def test_agent_waypoint_stores_room_scores():
     agent._position = np.zeros(3, dtype=np.float32)
     agent._heading = 0.0
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._cur_perception = {
-        "room_label": "bedroom",
-        "room_confidence": 0.45,
-        "goal_scores": [],
-        "landmark_scores": [],
-    }
+    agent._cur_report = PerceptionReport(
+        room_label="bedroom",
+        room_confidence=0.45,
+        source="clip",
+    )
     # Run enough steps to get 5 consistent bedroom frames
     for _ in range(5):
         agent.update_memory()

@@ -29,7 +29,7 @@ class MemoryConfig:
     mid_prune_distance: float = 6.0
     mid_prune_threshold: float = 0.12
     # Relaxed room_level trigger conditions
-    room_level_min_distance: float = 6.0
+    room_level_min_distance: float = 4.5
     room_level_confidence_max: float = 0.65
     room_level_detail_max: float = 0.55
     # Bottom-layer spatial graph: connect nearby room summaries
@@ -49,7 +49,7 @@ class PerceptionConfig:
     heavy_on_frontier: bool = True
     heavy_goal_warmup_steps: int = 1
     heavy_goal_sim_threshold: float = 0.35
-    heavy_low_object_confidence: float = 0.35
+    heavy_low_object_confidence: float = 0.18
     # Summary-context heavy perception: separate cooldown and label budget
     heavy_summary_cooldown: int = 8
     heavy_summary_max_labels: int = 12
@@ -81,6 +81,11 @@ class PerceptionConfig:
         "hallway", "dining room", "office", "garage",
         "laundry room", "closet", "staircase", "balcony",
     ])
+    # Perception backend: "clip_groundingdino" (default) or "vlm"
+    backend: str = "clip_groundingdino"
+    vlm_api_base: str = "http://localhost:8000/v1"
+    vlm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    vlm_timeout: float = 5.0
 
 
 @dataclass
@@ -95,6 +100,7 @@ class PlanningConfig:
     sticky_reach_radius: float = 0.75
     sticky_release_after_no_progress: int = 5
     sticky_min_progress: float = 0.05
+    sticky_detour_release_ratio: float = 1.5
     frontier_consume_radius: float = 0.75
     target_too_close_radius: float = 0.45
     blocked_target_ttl: int = 20
@@ -104,12 +110,35 @@ class PlanningConfig:
     # to that target. Falls back to the legacy single-stage behaviour when
     # no structure target clears the score threshold.
     two_stage_enabled: bool = True
-    structure_target_score_threshold: float = 0.05
+    global_graph_enabled: bool = False
+    structure_target_score_threshold: float = 0.15
     structure_anchor_radius: float = 6.0
     structure_anchor_bonus: float = 0.25
+    # Stage-1 only accepts a structure target when it has an explicit
+    # semantic match against the current goal (goal label appears in the
+    # room's contains_labels, the room label matches goal.room_prior, or
+    # the structural landmark/portal label is in goal.landmarks). This
+    # disables the "any nearby room" fallback that the +0.1 distance
+    # bonus used to allow.
+    structure_target_require_semantic_match: bool = True
     # Far semantic objects (not the goal object) are pruned when a
     # structure target is active and they sit outside the anchor radius.
     far_object_skip_when_anchored: bool = True
+    # When True, plain OBJECT candidates (and folded-object anchors that
+    # do not yet expose an anchor waypoint) navigate to the nearest
+    # WAYPOINT_VISITED instead of the object's own approach pose. This
+    # keeps navigation targets on the topo backbone where a viable graph
+    # / navmesh path is more likely to exist.
+    object_route_to_waypoint_anchor: bool = True
+    # Planner score blend: candidate_score = semantic_bias
+    # + structure_anchor_bonus
+    # + reachability_score_weight * reachable_score
+    # - path_cost_score_weight * normalized_path_cost
+    # The reachability term prefers candidates that have a navigable path
+    # (graph or navmesh probe) from the agent's current waypoint; the
+    # path-cost term penalises long detours.
+    reachability_score_weight: float = 0.20
+    path_cost_score_weight: float = 0.15
 
 
 @dataclass

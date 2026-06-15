@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from enum import Enum
 import numpy as np
 import networkx as nx
+import math
 
 from conftopo.core.confidence import ConfidenceFactors, compute_semantic_confidence
 from conftopo.core.landmark_roles import (
@@ -80,6 +81,33 @@ def _angle_delta(a: float, b: float) -> float:
     return float((a - b + np.pi) % (2 * np.pi) - np.pi)
 
 
+def _normalize_angle(angle: float) -> float:
+    """Normalize angle to [-pi, pi]."""
+    return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def _heading_to_direction_label(heading_rad: float) -> str:
+    """Convert relative heading to 8-direction label."""
+    h = _normalize_angle(heading_rad)
+    if abs(h) < 0.3927:          # pi/8
+        return "forward"
+    if h > 0.3927 and h < 1.1781:  # pi/8 to 3pi/8
+        return "forward-left"
+    if h > 1.1781 and h < 1.9635:  # 3pi/8 to 5pi/8
+        return "left"
+    if h > 1.9635 and h < 2.7489:  # 5pi/8 to 7pi/8
+        return "backward-left"
+    if abs(h) > 2.7489:             # beyond 7pi/8
+        return "backward"
+    if h < -0.3927 and h > -1.1781:
+        return "forward-right"
+    if h < -1.1781 and h > -1.9635:
+        return "right"
+    if h < -1.9635 and h > -2.7489:
+        return "backward-right"
+    return "forward"
+
+
 class DynamicTopoMap:
     """Confidence-aware semantic topological memory.
 
@@ -97,6 +125,7 @@ class DynamicTopoMap:
         self._nodes: Dict[str, SemanticNode] = {}
         self._node_counter = 0
         self._current_step = 0
+
 
         # Config
         if config is not None:
@@ -142,7 +171,7 @@ class DynamicTopoMap:
             self.far_prune_threshold = 0.18
             self.mid_prune_distance = 6.0
             self.mid_prune_threshold = 0.12
-            self.room_level_min_distance = 8.0
+            self.room_level_min_distance = 4.5
             self.room_level_confidence_max = 0.55
             self.room_level_detail_max = 0.45
             self.room_link_max_distance = 12.0
@@ -153,7 +182,9 @@ class DynamicTopoMap:
 
         self.object_history_keep_recent = 2
         self.landmark_history_keep_recent = 2
+        self._last_granularity_debug: Dict[str, int] = {}
 
+        self._last_visibility_debug: Dict[str, int] = {}
     @property
     def num_nodes(self) -> int:
         return len(self._nodes)
@@ -205,6 +236,28 @@ class DynamicTopoMap:
     def get_node(self, node_id: str) -> Optional[SemanticNode]:
         return self._nodes.get(node_id)
 
+    def get_object_anchor(self, node_id: str) -> Optional[dict]:
+        node = self._nodes.get(node_id)
+        if node is None:
+            return None
+
+        attrs = node.attributes
+        if not attrs.get("is_semantic_anchor"):
+            return None
+
+        position = attrs.get("anchor_position")
+        if position is None:
+            position = node.position.copy()
+
+        return {
+            "position": position,
+            "waypoint_id": attrs.get("anchor_waypoint_id"),
+            "waypoint_position": attrs.get("anchor_waypoint_position"),
+            "room_id": attrs.get("anchor_room_id"),
+            "label": node.label,
+            "confidence": float(node.confidence),
+        }
+
     def remove_node(self, node_id: str):
         if node_id in self._nodes:
             del self._nodes[node_id]
@@ -229,7 +282,85 @@ class DynamicTopoMap:
                 edge_type=edge_type.value,
                 weight=weight,
             )
+            if edge_type == EdgeType.NAVIGABLE:
+                self._enrich_navigable_edge(node_a, node_b)
     #找与 node 直接相连的 node
+    def _enrich_navigable_edge(self, node_a: str, node_b: str) -> None:
+        """Add structured attributes to a NAVIGABLE edge (bidirectional)."""
+        if not self.graph.has_edge(node_a, node_b):
+            return
+        node_a_obj = self._nodes.get(node_a)
+        node_b_obj = self._nodes.get(node_b)
+        if node_a_obj is None or node_b_obj is None:
+            return
+        pos_a = node_a_obj.position
+        pos_b = node_b_obj.position
+        dx = float(pos_b[0] - pos_a[0])
+        dz = float(pos_b[2] - pos_a[2])
+        dist = float(np.linalg.norm([dx, dz]))
+        heading_ab = _normalize_angle(math.atan2(dx, dz))
+        heading_ba = _normalize_angle(math.atan2(-dx, -dz))
+        label_ab = _heading_to_direction_label(heading_ab)
+        label_ba = _heading_to_direction_label(heading_ba)
+
+        edge_data = self.graph.edges[node_a, node_b]
+        edge_data["distance_m"] = round(dist, 2)
+        edge_data["traversability"] = max(1.0, float(edge_data.get("traversability", 1.0)))
+        edge_data["visited_count"] = int(edge_data.get("visited_count", 0)) + 1
+        edge_data["evidence"] = list(set(edge_data.get("evidence", []) + ["odometry"]))
+        edge_data["directions"] = {
+            node_a: {"to": node_b, "direction_label": label_ab, "heading_delta": round(heading_ab, 4)},
+            node_b: {"to": node_a, "direction_label": label_ba, "heading_delta": round(heading_ba, 4)},
+        }
+        edge_data["description_type"] = "navigable_transition"
+
+    def reduce_edge_traversability(self, node_a: str, node_b: str, penalty: float = 0.3) -> None:
+        """Reduce traversability of the edge between *node_a* and *node_b*."""
+        if self.graph.has_edge(node_a, node_b):
+            edge = self.graph.edges[node_a, node_b]
+            edge["traversability"] = max(0.1, float(edge.get("traversability", 1.0)) - penalty)
+
+    def _infer_passage_type(self, portal_node: Optional[SemanticNode], portal_label: str) -> str:
+        """Infer passage type from portal node attributes and label."""
+        if portal_node is None:
+            return "passage"
+        attrs = portal_node.attributes
+        label = (portal_label or "").lower()
+        if attrs.get("synthetic_portal"):
+            return "synthetic_portal"
+        if "door" in label or "doorway" in label:
+            return "door"
+        if "arch" in label:
+            return "arch"
+        if "corridor" in label or "hallway" in label:
+            return "corridor"
+        return "passage"
+
+    def _enrich_adjacent_edge(
+        self,
+        node_a: str,
+        node_b: str,
+        room_a_label: str,
+        room_b_label: str,
+        portal_label: str = "",
+        portal_node: Optional[SemanticNode] = None,
+    ) -> None:
+        """Add structured attributes to an ADJACENT_TO edge."""
+        if not self.graph.has_edge(node_a, node_b):
+            return
+        passage_type = self._infer_passage_type(portal_node, portal_label)
+        edge_data = self.graph.edges[node_a, node_b]
+        edge_data["connected_rooms"] = [room_a_label, room_b_label]
+        edge_data["via_landmark"] = portal_label or "passage"
+        edge_data["passage_type"] = passage_type
+        edge_data["confidence"] = float(edge_data.get("confidence", 0.6))
+        edge_data["evidence"] = list(set(edge_data.get("evidence", []) + ["room_transition"]))
+        edge_data["transitions"] = {
+            node_a: {"from_room": room_a_label, "to_room": room_b_label, "via_landmark": portal_label or "passage", "passage_type": passage_type},
+            node_b: {"from_room": room_b_label, "to_room": room_a_label, "via_landmark": portal_label or "passage", "passage_type": passage_type},
+        }
+
+
     def get_neighbors(self, node_id: str, edge_type: Optional[EdgeType] = None) -> List[str]:
         """Get neighbor node IDs, optionally filtered by edge type."""
         if node_id not in self.graph:
@@ -387,6 +518,7 @@ class DynamicTopoMap:
             )
             if self._should_add_observation_edge(node_id, viewpoint_id, room_context):
                 self.add_edge(viewpoint_id, node_id, EdgeType.OBSERVED_AT)
+            self._nodes[node_id].attributes["best_approach_position"] = self._compute_best_approach(node_id).tolist()
             return node_id, False
 
         self._merge_object_observation(
@@ -404,6 +536,7 @@ class DynamicTopoMap:
         )
         if self._should_add_observation_edge(match.node_id, viewpoint_id, room_context):
             self.add_edge(viewpoint_id, match.node_id, EdgeType.OBSERVED_AT)
+        match.attributes["best_approach_position"] = self._compute_best_approach(match.node_id).tolist()
         return match.node_id, True
 
     def _best_object_match(
@@ -570,6 +703,30 @@ class DynamicTopoMap:
             redundancy_penalty=float(attrs.get("redundancy_penalty", 0.0)),
             conflict_penalty=float(attrs.get("conflict_penalty", 0.0)),
         ))
+
+    def _compute_best_approach(self, object_node_id: str) -> np.ndarray:
+        """Pick the best approach position for an OBJECT node.
+
+        Selects the closest observed viewpoint (WAYPOINT_VISITED) to the
+        object.  Falls back to the object position itself when no valid
+        viewpoint is recorded.
+        """
+        node = self._nodes.get(object_node_id)
+        if node is None:
+            return np.zeros(3, dtype=np.float32)
+        obj_pos = node.position
+        viewpoint_ids = node.attributes.get("viewpoints", [])
+        best_pos = obj_pos.copy()
+        best_dist = float("inf")
+        for vp_id in viewpoint_ids:
+            vp = self._nodes.get(vp_id)
+            if vp is None:
+                continue
+            d = float(np.linalg.norm(vp.position - obj_pos))
+            if d < best_dist:
+                best_dist = d
+                best_pos = vp.position.copy()
+        return best_pos
 
     def _nearby_conflict_penalty(self, node: SemanticNode, position: np.ndarray) -> float:
         conflicts = 0
@@ -817,6 +974,8 @@ class DynamicTopoMap:
                 continue
             if self._is_persistent_structure_node(node):
                 continue
+            if node.attributes.get("is_semantic_anchor"):
+                continue
             if float(node.attributes.get("target_relevance", 0.0)) > 0:
                 continue
             if pos is not None and node.node_type in (NodeType.OBJECT, NodeType.LANDMARK):
@@ -837,32 +996,60 @@ class DynamicTopoMap:
     def adaptive_granularity(self, agent_pos: np.ndarray):
         """Compress distant semantic details into room/region summaries."""
         pos = np.array(agent_pos, dtype=np.float32)
+        debug = {
+            "object_nodes": 0,
+            "far_object_candidates": 0,
+            "object_room_level_updates": 0,
+            "object_detail_kept": 0,
+            "object_landmark_updates": 0,
+            "landmark_nodes": 0,
+            "landmark_room_level_updates": 0,
+            "summary_updates": 0,
+            "folded_anchor_marks": 0,
+        }
         for node in list(self._nodes.values()):
             dist = float(np.linalg.norm(node.position - pos))
             if node.node_type == NodeType.OBJECT:
+                debug["object_nodes"] += 1
                 detail_score = self._semantic_detail_score(node, pos)
                 node.attributes["detail_score"] = detail_score
-                if dist <= self.near_radius or detail_score >= self.summary_mid_detail_threshold:
+                # Staleness decay: mid-range objects not seen in 3+ steps get reduced detail_score
+                if dist > self.near_radius and dist <= self.room_level_min_distance:
+                    last_seen = int(node.attributes.get("last_seen_step", node.step_id))
+                    steps_since = self._current_step - last_seen
+                    if steps_since > 2:
+                        decay = max(0.35, 1.0 - 0.10 * (steps_since - 2))
+                        detail_score *= decay
+                if dist <= self.near_radius:
                     node.attributes["granularity"] = "object"
+                    debug["object_detail_kept"] += 1
                     continue
-                if dist > self.room_level_min_distance and (
-                    node.confidence < self.room_level_confidence_max
-                    or detail_score < self.room_level_detail_max
-                ):
+                if dist > self.room_level_min_distance:
+                    debug["far_object_candidates"] += 1
                     node.attributes["granularity"] = "room_level"
                     self._compress_object_history(node, "far_low_confidence")
                     summary_id = self._add_node_to_room_summary(node, "far_low_confidence")
+                    debug["object_room_level_updates"] += 1
                     if summary_id is not None:
                         node.attributes["fused_into_summary_id"] = summary_id
+                        debug["summary_updates"] += 1
+                    self._mark_node_folded_anchor(node, "room_level", summary_id)
+                    debug["folded_anchor_marks"] += 1
+                elif detail_score >= self.summary_mid_detail_threshold:
+                    node.attributes["granularity"] = "object"
+                    debug["object_detail_kept"] += 1
                 else:
                     node.attributes["granularity"] = "landmark"
                     self._compress_object_history(node, "mid_or_far_object")
                     self._fuse_object_to_landmark(node)
+                    debug["object_landmark_updates"] += 1
             elif node.node_type == NodeType.LANDMARK and dist > self.near_radius:
+                debug["landmark_nodes"] += 1
                 detail_score = self._semantic_detail_score(node, pos)
                 node.attributes["detail_score"] = detail_score
                 if dist >= self.room_level_min_distance and detail_score < self.room_level_detail_max:
                     node.attributes["granularity"] = "room_level"
+                    debug["landmark_room_level_updates"] += 1
                 else:
                     node.attributes["granularity"] = "landmark"
                 self._compress_landmark_history(node, "far_landmark")
@@ -870,6 +1057,8 @@ class DynamicTopoMap:
                     summary_id = self._add_node_to_room_summary(node, "far_landmark")
                     if summary_id is not None:
                         node.attributes["fused_into_summary_id"] = summary_id
+                        debug["summary_updates"] += 1
+        self._last_granularity_debug = debug
         self._update_node_visibility(pos)
         self._maintain_spatial_structure_graph()
         if getattr(self, "waypoint_compress_enabled", True):
@@ -1639,6 +1828,16 @@ class DynamicTopoMap:
             self._add_or_strengthen_edge(
                 portal.node_id, room_b.node_id, EdgeType.ADJACENT_TO, dist_b,
             )
+            self._enrich_adjacent_edge(
+                room_a.node_id, portal.node_id,
+                str(room_a.label or ""), str(room_b.label or ""),
+                portal_label=str(portal.label or ""), portal_node=portal,
+            )
+            self._enrich_adjacent_edge(
+                portal.node_id, room_b.node_id,
+                str(room_a.label or ""), str(room_b.label or ""),
+                portal_label=str(portal.label or ""), portal_node=portal,
+            )
 
         for landmark in nav_landmarks:
             if landmark.attributes.get("structure_role") == "portal":
@@ -1676,30 +1875,60 @@ class DynamicTopoMap:
             attrs = node.attributes
             # Unfold conditions
             if dist <= self.near_radius:
-                attrs["folded"] = False
+                self._mark_node_active_detail(node)
                 continue
             if attrs.get("recovered_from_summary"):
-                attrs["folded"] = False
+                self._mark_node_active_detail(node)
                 continue
             if float(attrs.get("target_relevance", 0.0)) > 0 and dist <= self.far_radius:
-                attrs["folded"] = False
+                self._mark_node_active_detail(node)
                 continue
             # Fold conditions
             granularity = attrs.get("granularity", "")
             if granularity == "room_level" and dist > self.near_radius:
-                attrs["folded"] = True
-                attrs["folded_reason"] = "room_level"
+                self._mark_node_folded_anchor(node, "room_level")
             elif attrs.get("history_compressed") and dist > self.fold_distance:
                 summary_id = self._find_folded_summary_id(node)
                 if summary_id is not None:
-                    attrs["folded"] = True
-                    attrs["folded_summary_id"] = summary_id
-                    attrs["folded_reason"] = "summary_member"
+                    self._mark_node_folded_anchor(node, "summary_member", summary_id)
                 else:
-                    attrs["folded"] = True
-                    attrs["folded_reason"] = "far_compressed"
+                    self._mark_node_folded_anchor(node, "far_compressed")
             else:
-                attrs["folded"] = False
+                self._mark_node_active_detail(node)
+
+    def _mark_node_active_detail(self, node: SemanticNode) -> None:
+        attrs = node.attributes
+        attrs["folded"] = False
+        attrs["folded_detail"] = False
+        attrs["is_active_detail"] = True
+
+    def _mark_node_folded_anchor(
+        self,
+        node: SemanticNode,
+        reason: str,
+        summary_id: Optional[str] = None,
+    ) -> None:
+        attrs = node.attributes
+        attrs["folded"] = True
+        attrs["folded_detail"] = True
+        attrs["folded_reason"] = reason
+        attrs["is_active_detail"] = False
+        attrs["is_semantic_anchor"] = True
+
+        attrs["anchor_position"] = node.position.tolist()
+        nearest_visited_wp = self.find_nearest_node(
+            node.position,
+            NodeType.WAYPOINT_VISITED,
+        )
+        attrs["anchor_waypoint_id"] = nearest_visited_wp.node_id if nearest_visited_wp else None
+        attrs["anchor_waypoint_position"] = (
+            nearest_visited_wp.position.tolist() if nearest_visited_wp else None
+        )
+
+        anchor_room_id = summary_id or attrs.get("fused_into_summary_id") or self._find_folded_summary_id(node)
+        attrs["anchor_room_id"] = anchor_room_id
+        if anchor_room_id is not None:
+            attrs["folded_summary_id"] = anchor_room_id
 
     def _find_folded_summary_id(self, node: SemanticNode) -> Optional[str]:
         """Find the room_region summary this node belongs to, if any."""
@@ -1829,8 +2058,71 @@ class DynamicTopoMap:
                 ) / member_count
 
         attrs["last_summary_update_step"] = self._current_step
+        self._absorb_object_into_room_summary(node, summary)
+        if attrs.get("summary_dirty"):
+            attrs["summary_text"] = self._format_room_summary_text(summary)
+            attrs["summary_dirty"] = False
         summary.confidence = max(float(summary.confidence), min(1.0, float(node.confidence) + 0.05))
         summary.step_id = self._current_step
+
+    def _normalize_semantic_label(self, label: str) -> str:
+        label = (label or "").strip().lower()
+        if label.endswith("s") and len(label) > 3:
+            label = label[:-1]
+        return label
+
+    def _absorb_object_into_room_summary(
+        self,
+        obj_node: SemanticNode,
+        room_node: SemanticNode,
+    ) -> None:
+        if obj_node.node_type != NodeType.OBJECT:
+            return
+        label = self._normalize_semantic_label(obj_node.label)
+        if not label:
+            return
+
+        summary = room_node.attributes.setdefault("semantic_summary", {})
+        folded_ids = summary.setdefault("folded_object_ids", [])
+        is_new_folded_id = obj_node.node_id not in folded_ids
+        if is_new_folded_id:
+            folded_ids.append(obj_node.node_id)
+
+        contains = summary.setdefault("contains_labels", {})
+        if is_new_folded_id:
+            contains[label] = contains.get(label, 0) + 1
+        else:
+            contains.setdefault(label, 1)
+
+        label_conf = summary.setdefault("label_confidence", {})
+        old_conf = float(label_conf.get(label, 0.0))
+        label_conf[label] = max(old_conf, float(obj_node.confidence))
+
+        representatives = summary.setdefault("representative_objects", {})
+        old_rep = representatives.get(label)
+        pos = obj_node.position.copy()
+        if hasattr(pos, "tolist"):
+            pos = pos.tolist()
+
+        if old_rep is None or obj_node.confidence > float(old_rep.get("confidence", 0.0)):
+            representatives[label] = {
+                "node_id": obj_node.node_id,
+                "position": pos,
+                "confidence": float(obj_node.confidence),
+            }
+
+        room_node.attributes["summary_dirty"] = True
+
+    def _format_room_summary_text(self, room_node: SemanticNode) -> str:
+        summary = room_node.attributes.get("semantic_summary", {})
+        contains = summary.get("contains_labels", {})
+
+        if not contains:
+            return f"{room_node.label} has no stable folded object summary."
+
+        top_items = sorted(contains.items(), key=lambda x: -x[1])[:5]
+        item_text = ", ".join([f"{cnt} {label}" for label, cnt in top_items])
+        return f"{room_node.label} contains {item_text}."
 
     def find_nearby_room_summary(
         self,
@@ -1998,14 +2290,14 @@ class DynamicTopoMap:
 
     # ==================== Shortest Path ====================
 
-    def shortest_path(self, source: str, target: str) -> Optional[List[str]]:
-        """Find shortest path between two nodes (navigable edges only)."""
-        nav_graph = nx.Graph()
+    def shortest_path(self, source: str, target: str, edge_type: EdgeType = EdgeType.NAVIGABLE) -> Optional[List[str]]:
+        """Find shortest path between two nodes using specified edge type."""
+        sub_graph = nx.Graph()
         for u, v, data in self.graph.edges(data=True):
-            if data.get("edge_type") == EdgeType.NAVIGABLE.value:
-                nav_graph.add_edge(u, v, weight=data.get("weight", 1.0))
+            if data.get("edge_type") == edge_type.value:
+                sub_graph.add_edge(u, v, weight=data.get("weight", 1.0))
         try:
-            return nx.shortest_path(nav_graph, source, target, weight="weight")
+            return nx.shortest_path(sub_graph, source, target, weight="weight")
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return None
 
@@ -2071,3 +2363,24 @@ class DynamicTopoMap:
         self.graph.clear()
         self._node_counter = 0
         self._current_step = 0
+
+
+# ==================== Edge Description (debug / LLM only) ====================
+
+def format_edge_description(edge_attrs: dict, from_node_id=None) -> str:
+    dist = edge_attrs.get('distance_m', 0.0)
+    direction = 'forward'
+    if from_node_id is not None:
+        direction = edge_attrs.get('directions', {}).get(from_node_id, {}).get('direction_label', 'forward')
+    return 'Move ' + direction + ' for ' + str(round(dist, 1)) + 'm.'
+
+
+def format_portal_description(edge_attrs: dict, from_room_id=None) -> str:
+    pt = edge_attrs.get('passage_type', 'passage')
+    if from_room_id is not None:
+        transitions = edge_attrs.get('transitions', {})
+        tr = transitions.get(from_room_id)
+        if tr:
+            return 'Go through ' + pt + ' from ' + str(tr.get('from_room', 'one area')) + ' to ' + str(tr.get('to_room', 'another area')) + '.'
+    rooms = edge_attrs.get('connected_rooms', ['one area', 'another area'])
+    return 'Go through ' + pt + ' between ' + str(rooms[0]) + ' and ' + str(rooms[1]) + '.'
