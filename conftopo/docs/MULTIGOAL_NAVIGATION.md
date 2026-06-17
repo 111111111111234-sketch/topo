@@ -167,12 +167,8 @@ _goal_local_step += 1
 6. decay / merge / prune / assign_waypoint_to_room
 ```
 
-**OBJECT 位置估计**（`_object_position_from_bbox`）：
-
-```text
-bbox 像素坐标（256×256）→ bearing + 自适应距离
-dist = clip(2.5 - 3.0 * apparent_size, 0.5, 2.0)
-```
+**OBJECT 位置**：所有 object（VLM / GroundingDINO / CLIP）使用观测 waypoint 作为
+semantic anchor position（`position_source = "anchor_waypoint"`），不做 bbox depth 估计。
 
 **Heavy 感知触发优先级**（`_should_run_heavy_perception`）：
 

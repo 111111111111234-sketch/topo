@@ -50,6 +50,11 @@ class PerceptionConfig:
     heavy_goal_warmup_steps: int = 1
     heavy_goal_sim_threshold: float = 0.35
     heavy_low_object_confidence: float = 0.18
+    # VLM / heavy perception cooldowns for expensive local confirmation.
+    # These prevent local regrounding from bypassing heavy_interval and
+    # issuing one VLM request every simulator step.
+    heavy_reground_cooldown: int = 5
+    heavy_near_goal_cooldown: int = 3
     # Summary-context heavy perception: separate cooldown and label budget
     heavy_summary_cooldown: int = 8
     heavy_summary_max_labels: int = 12

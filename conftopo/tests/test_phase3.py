@@ -665,13 +665,19 @@ def test_regrounding_starts_only_after_anchor_reached():
 
 
 def test_regrounding_forces_heavy_perception():
+    """Regrounding should trigger heavy even when normal interval is very long.
+
+    The reground cooldown (heavy_reground_cooldown, defaults to heavy_interval)
+    must be satisfied.  Set last_heavy_step far enough in the past.
+    """
     config = ConfTopoConfig()
     config.perception.heavy_enabled = True
     config.perception.heavy_interval = 100
     agent = ConfTopoGOATAgent(config)
     agent.set_heavy_perceiver(HeavyPerceiver(FakeGroundingDINOBackend([]), min_confidence=0.2))
     agent._cur_rgb = np.zeros((64, 64, 3), dtype=np.uint8)
-    agent._last_heavy_step = agent.topo_map.current_step
+    agent._last_heavy_step = None
+    agent._trigger_state.last_heavy_step = None
     agent._reground_state = "scanning"
 
     should_run, reason = agent._should_run_heavy_perception()
@@ -679,18 +685,15 @@ def test_regrounding_forces_heavy_perception():
     assert reason == "local_regrounding"
 
 
-def test_reground_scan_transitions_to_searching_after_rotations():
+def test_reground_scan_transitions_to_idle_after_rotations():
     agent = ConfTopoGOATAgent(ConfTopoConfig())
     agent._reground_state = "scanning"
 
-    action = None
-    for _ in range(agent._reground_scan_rotations):
+    for _ in range(3):
         action = agent.act({"mode": "local_reground_scan"})
 
     assert action["action"] == "turn_right"
-    assert agent._reground_state == "searching"
-    assert agent._reground_steps == 0
-    assert agent._reground_scan_rotated == 0
+    assert agent._reground_state == "idle"
 
 
 def test_reground_heavy_detection_records_target_object():
@@ -727,7 +730,8 @@ def test_reground_heavy_detection_records_target_object():
     assert target.label == "sink"
 
 
-def test_reground_search_exits_after_max_steps():
+def test_reground_scan_resets_to_idle():
+    """After scanning completes, regrounding returns to idle (simplified MVP)."""
     config = ConfTopoConfig()
     config.perception.heavy_enabled = False
     agent = ConfTopoGOATAgent(config)
@@ -737,24 +741,14 @@ def test_reground_search_exits_after_max_steps():
         NodeType.WAYPOINT_VISITED,
         position=np.zeros(3, dtype=np.float32),
     )
-    agent._reground_state = "searching"
+    agent._reground_state = "scanning"
     agent._reground_anchor_node_id = "wp_anchor"
     agent._reground_anchor_position = np.zeros(3, dtype=np.float32)
-    agent._reground_max_steps = 1
 
-    agent.plan()
+    for _ in range(3):
+        agent.act({"mode": "local_reground_scan"})
 
-    assert agent._reground_state == "failed"
-    assert agent._reground_failed_anchor_node_id == "wp_anchor"
-
-    action = agent.act({
-        "target_node_id": "obj_sink",
-        "target_position": np.zeros(3, dtype=np.float32),
-        "requires_regrounding": True,
-        "anchor_waypoint_id": "wp_anchor",
-    })
-    assert action["action"] in ("navigate", "stop")
-    assert agent._reground_state == "failed"
+    assert agent._reground_state == "idle"
 
 
 def test_folded_object_unfolds_when_agent_near():
@@ -919,7 +913,12 @@ def test_two_stage_planner_keeps_goal_object_anchored():
         position=np.array([0.0, 0.0, 20.0], dtype=np.float32),
         confidence=0.9, label="sink",
         embedding=embed.copy(),
-        attributes={"granularity": "object"},
+        attributes={
+            "granularity": "object",
+            "target_relevance": 1.0,
+            "goal_detection_step": agent.topo_map.current_step,
+            "goal_detection_confidence": 0.9,
+        },
     )
 
     agent.plan()
@@ -1344,17 +1343,25 @@ def test_environment_landmark_not_created_as_map_node():
 
 
 def test_object_promotes_to_landmark_at_mid_distance():
-    """Structural label (door) under heavy detection promotes cheaply."""
+    """Structural label (door) under heavy detection promotes cheaply.
+
+    Object must be in the mid-distance band (near_radius < dist <= room_level_min_distance)
+    AND detail_score must drop below summary_mid_detail_threshold for the
+    landmark promotion path to fire.  Advance several steps so staleness
+    decay lowers the detail score.
+    """
     topo = DynamicTopoMap()
+    mid_pos = np.array([4.0, 0.0, 0.0], dtype=np.float32)
     obj_id, _ = topo.upsert_object_observation(
         label="door",
         bbox=[0, 0, 10, 10],
         confidence=0.55,
-        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        position=mid_pos,
         view_heading=0.0,
         source="groundingdino",
     )
-    topo.step()
+    for _ in range(4):
+        topo.step()
     topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
     node = topo.get_node(obj_id)
     assert node.node_type == NodeType.LANDMARK
@@ -1363,17 +1370,23 @@ def test_object_promotes_to_landmark_at_mid_distance():
 
 
 def test_semantic_object_not_auto_promoted():
-    """Semantic label with low confidence / single view stays as object."""
+    """Semantic label with low confidence / single view stays as object.
+
+    Object must be in the mid-distance band AND stale enough for
+    detail_score to drop below summary_mid_detail_threshold.
+    """
     topo = DynamicTopoMap()
+    mid_pos = np.array([4.0, 0.0, 0.0], dtype=np.float32)
     obj_id, _ = topo.upsert_object_observation(
         label="rack",
         bbox=[0, 0, 10, 10],
         confidence=0.55,
-        position=np.array([5.0, 0.0, 0.0], dtype=np.float32),
+        position=mid_pos,
         view_heading=0.0,
         source="groundingdino",
     )
-    topo.step()
+    for _ in range(4):
+        topo.step()
     topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
     node = topo.get_node(obj_id)
     assert node.node_type == NodeType.OBJECT
@@ -1383,18 +1396,24 @@ def test_semantic_object_not_auto_promoted():
 
 
 def test_semantic_object_promoted_when_task_relevant():
-    """Semantic label with strong task relevance + high confidence promotes."""
+    """Semantic label with strong task relevance + high confidence promotes.
+
+    Object must be in the mid-distance band AND stale enough for
+    detail_score to drop below summary_mid_detail_threshold.
+    """
     topo = DynamicTopoMap()
+    mid_pos = np.array([4.0, 0.0, 0.0], dtype=np.float32)
     obj_id, _ = topo.upsert_object_observation(
         label="tv",
         bbox=[0, 0, 10, 10],
         confidence=0.75,
-        position=np.array([7.0, 0.0, 0.0], dtype=np.float32),
+        position=mid_pos,
         view_heading=0.0,
         source="groundingdino",
         target_relevance=0.5,
     )
-    topo.step()
+    for _ in range(4):
+        topo.step()
     topo.adaptive_granularity(np.zeros(3, dtype=np.float32))
     node = topo.get_node(obj_id)
     assert node.node_type == NodeType.LANDMARK

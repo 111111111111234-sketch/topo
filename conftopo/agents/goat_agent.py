@@ -25,10 +25,7 @@ from conftopo.config import ConfTopoConfig
 from conftopo.agents.base_agent import ConfTopoBaseAgent
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType, EdgeType, SemanticNode
 from conftopo.core.instruction_graph import InstructionGraph, GoalNode
-from conftopo.core.landmark_roles import (
-    STRUCTURAL_LANDMARK_LABEL_TOKENS,
-    is_structural_label,
-)
+from conftopo.core.landmark_roles import is_structural_label
 from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
 from conftopo.core.rule_scorer import compute_semantic_bias
 from conftopo.perception.light_perceiver import LightPerceiver
@@ -52,6 +49,31 @@ def _split_compound_label(label: str) -> Set[str]:
     if " or " in label:
         parts.update(p.strip().lower() for p in label.split(" or ") if p.strip())
     return parts
+
+
+def _label_matches_goal(obs_label: str, target_labels: Set[str]) -> bool:
+    """Fuzzy label match: exact, substring-contains, or single-word overlap.
+
+    VLMs may return abbreviated or paraphrased labels (e.g. "toy" for goal
+    "plush toy", "couch" for "sofa").  This helper accepts a match when:
+      1. Exact match (obs_label in target_labels), OR
+      2. obs_label is a substring of any target label, OR
+      3. Any target label is a substring of obs_label, OR
+      4. Any individual word in obs_label appears in a target label's words
+         (bidirectional single-word overlap, ignoring very short words).
+    """
+    obs = obs_label.lower().strip()
+    if obs in target_labels:
+        return True
+    for tl in target_labels:
+        if obs in tl or tl in obs:
+            return True
+    obs_words = {w for w in obs.split() if len(w) > 2}
+    for tl in target_labels:
+        tl_words = {w for w in tl.split() if len(w) > 2}
+        if obs_words & tl_words:
+            return True
+    return False
 
 
 DEFAULT_HEAVY_OBJECT_VOCABULARY = [
@@ -83,6 +105,53 @@ DEFAULT_STRUCTURAL_HEAVY_VOCABULARY = [
     "counter",
     "gate",
 ]
+
+# v5: object-category search priors. When a goal carries no dataset-provided
+# room_prior / landmarks, fall back to these so exploration is biased toward
+# rooms / landmarks where the target usually lives (instead of random
+# frontier wandering). Keys are matched against goal.target_object substrings.
+OBJECT_CATEGORY_ROOM_PRIORS: Dict[str, List[str]] = {
+    "plush toy": ["bedroom", "living room", "closet"],
+    "stuffed": ["bedroom", "living room", "closet"],
+    "toy": ["bedroom", "living room", "closet"],
+    "wardrobe": ["bedroom"],
+    "bed": ["bedroom"],
+    "pillow": ["bedroom"],
+    "sofa": ["living room"],
+    "couch": ["living room"],
+    "tv": ["living room"],
+    "towel": ["bathroom"],
+    "toilet": ["bathroom"],
+    "sink": ["bathroom", "kitchen"],
+    "fridge": ["kitchen"],
+    "refrigerator": ["kitchen"],
+    "oven": ["kitchen"],
+    "microwave": ["kitchen"],
+    "pan": ["kitchen"],
+    "plate": ["kitchen", "dining room"],
+}
+
+OBJECT_CATEGORY_LANDMARK_PRIORS: Dict[str, List[str]] = {
+    "plush toy": ["bed", "sofa", "couch", "shelf", "cabinet", "table"],
+    "stuffed": ["bed", "sofa", "couch", "shelf", "cabinet", "table"],
+    "toy": ["bed", "sofa", "couch", "shelf", "cabinet", "table"],
+    "wardrobe": ["bed", "cabinet"],
+    "pillow": ["bed", "sofa"],
+    "tv": ["sofa", "cabinet"],
+    "towel": ["sink", "toilet"],
+    "plate": ["table", "counter"],
+}
+
+
+def _category_priors(target_object: Optional[str], table: Dict[str, List[str]]) -> List[str]:
+    """Return prior labels for the first category key found in ``target_object``."""
+    if not target_object:
+        return []
+    text = str(target_object).lower()
+    for key, vals in table.items():
+        if key in text:
+            return list(vals)
+    return []
 
 
 class ConfTopoGOATAgent(ConfTopoBaseAgent):
@@ -161,13 +230,40 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._heavy_perception_calls: int = 0
         self._object_merge_count: int = 0
         self._last_heavy_debug: Dict[str, Any] = {}
+        self._vlm_perception_attempts: int = 0
         self._last_stop_debug: Dict[str, Any] = {}
-        self._recent_goal_detections: List[int] = []
         self._recent_positions: List[np.ndarray] = []
         self._last_stuck_recovery_step: Optional[int] = None
         self._stuck_recovery_count: int = 0
-        self._consecutive_heavy_confirm_steps: int = 0
         self._heavy_confirm_eval_step: Optional[int] = None
+        self._nav_phase: str = "explore"
+        self._confirm_buffer: List[bool] = []
+        self._stop_buffer: List[bool] = []
+        self._approach_remaining: int = 0
+        self._approach_bearing: str = "center"
+        self._approach_lost_count: int = 0
+        self._approach_steps_used: int = 0
+        self._approach_best_bbox_area: float = 0.0
+        self._approach_peak_travel: float = 0.0
+        self._approach_best_anchor_dist: float = float("inf")
+        self._approach_entry_anchor_dist: float = float("inf")
+        self._approach_align_count: int = 0
+        self._approach_advance_steps: int = 0
+        self._goal_latched: bool = False
+        self._previous_goal_label: Optional[str] = None
+        self._previous_goal_object_nodes: List[str] = []
+        self._servo_prev_bbox_area: float = 0.0
+        self._servo_bbox_shrink_count: int = 0
+        self._servo_visual_advance_count: int = 0
+        self._servo_returning_to_peak: bool = False
+        self._approach_peak_position: Optional[np.ndarray] = None
+        self._confirm_window_active: bool = False
+        self._confirm_window_steps: int = 0
+        self._confirm_window_lost_count: int = 0
+        self._anchor_progress_window: List[float] = []
+        self._explored_rooms_no_target: Dict[str, int] = {}
+        self._room_step_counter: Dict[str, int] = {}
+        self._cur_vlm_mode: str = "explore"
         self._reset_reground_state()
         self._global_planner = GlobalGraphPlanner()
         # Optional callable injected by the runtime to ask the navmesh
@@ -191,6 +287,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
     def reset(self):
         """Full reset for new episode (clear memory)."""
+        self._position = None
+        self._origin_position = None
         self._heading = 0.0
         self._prev_position = None
         self._cur_vp_id = None
@@ -209,8 +307,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._blocked_target_until = {}
         self._last_skipped_candidates = []
         self._last_navigation_event = {}
-        if self.should_stop():
-            return {"target_node_id": None, "target_position": None, "is_exploration": True}
         self._last_plan_debug = {}
         self._last_structure_target_id: Optional[str] = None
         self._goal_local_step = 0
@@ -221,6 +317,35 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._heavy_perception_calls = 0
         self._object_merge_count = 0
         self._last_heavy_debug = {}
+        self._vlm_perception_attempts = 0
+        self._nav_phase = "explore"
+        self._confirm_buffer = []
+        self._stop_buffer = []
+        self._approach_remaining = 0
+        self._approach_bearing = "center"
+        self._approach_lost_count = 0
+        self._approach_steps_used = 0
+        self._approach_best_bbox_area = 0.0
+        self._approach_peak_travel = 0.0
+        self._approach_best_anchor_dist = float("inf")
+        self._approach_entry_anchor_dist = float("inf")
+        self._approach_peak_position = None
+        self._approach_align_count = 0
+        self._approach_advance_steps = 0
+        self._goal_latched = False
+        self._previous_goal_label = None
+        self._previous_goal_object_nodes = []
+        self._servo_prev_bbox_area = 0.0
+        self._servo_bbox_shrink_count = 0
+        self._servo_visual_advance_count = 0
+        self._servo_returning_to_peak = False
+        self._confirm_window_active = False
+        self._confirm_window_steps = 0
+        self._confirm_window_lost_count = 0
+        self._anchor_progress_window = []
+        self._explored_rooms_no_target = {}
+        self._room_step_counter = {}
+        self._cur_vlm_mode = "explore"
         self._reset_reground_state()
 
     def set_environment_landmark_labels(self, labels: List[str]) -> None:
@@ -237,8 +362,33 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         This is the key for multi-goal: DynamicTopoMap is NOT cleared.
         """
+        old_label = None
+        if self.instruction_graph is not None:
+            old_goal = self.instruction_graph.get_current_goal()
+            old_label = getattr(old_goal, "target_object", None) if old_goal else None
+        old_goal_nodes: List[str] = []
+        if old_label:
+            old_targets = _split_compound_label(old_label)
+            for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
+                if node.label and _label_matches_goal(node.label, old_targets):
+                    old_goal_nodes.append(node.node_id)
+
         self.reset_keep_memory()
         self._clear_sticky("new_goal")
+
+        self._previous_goal_label = old_label
+        self._previous_goal_object_nodes = old_goal_nodes
+
+        # v5: backfill category search priors when the dataset goal has none,
+        # so exploration is biased toward likely rooms / landmarks.
+        if not getattr(goal, "room_prior", None):
+            room_prior = _category_priors(goal.target_object, OBJECT_CATEGORY_ROOM_PRIORS)
+            if room_prior:
+                goal.room_prior = room_prior
+        if not getattr(goal, "landmarks", None):
+            landmark_prior = _category_priors(goal.target_object, OBJECT_CATEGORY_LANDMARK_PRIORS)
+            if landmark_prior:
+                goal.landmarks = landmark_prior
 
         if self.instruction_graph is None:
             self.instruction_graph = InstructionGraph(
@@ -248,9 +398,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         else:
             self.instruction_graph.set_current_goal(goal)
 
-        # Update perceiver with new goal labels
-        goal_labels = [goal.target_object]
-        goal_labels.extend(goal.attributes)
         self.perceiver.set_goal_labels(
             labels=[goal.target_object],
             embeddings=goal.target_embedding[np.newaxis, :] if goal.target_embedding is not None else None,
@@ -261,21 +408,56 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 embeddings=goal.landmark_embeddings,
             )
 
-        # Reset target_relevance for all objects so non-goal objects can be folded
+        # Reset target_relevance for non-current-goal objects, but preserve
+        # all existing nodes across goal switches for multi-goal memory.
         for node in self.topo_map._nodes.values():
+            node.attributes["cross_goal_preserved"] = True
             if node.node_type in (NodeType.OBJECT, NodeType.LANDMARK):
                 node.attributes["target_relevance"] = 0.0
+
+        if (self._previous_goal_label
+                and self._previous_goal_label == goal.target_object
+                and self._previous_goal_object_nodes):
+            for nid in self._previous_goal_object_nodes:
+                prev_node = self.topo_map.get_node(nid)
+                if prev_node is not None:
+                    prev_node.attributes["target_relevance"] = 0.8
+                    prev_node.attributes["repeated_goal_source"] = True
         self._goal_idx += 1
         self._goal_local_step = 0
         self._goal_travel_distance = 0.0
         self._last_heavy_step = None
         self._last_stop_debug = {}
-        self._recent_goal_detections = []
         self._recent_positions = []
         self._last_stuck_recovery_step = None
         self._stuck_recovery_count = 0
-        self._consecutive_heavy_confirm_steps = 0
         self._heavy_confirm_eval_step = None
+        self._nav_phase = "explore"
+        self._confirm_buffer = []
+        self._stop_buffer = []
+        self._approach_remaining = 0
+        self._approach_bearing = "center"
+        self._approach_lost_count = 0
+        self._approach_steps_used = 0
+        self._approach_best_bbox_area = 0.0
+        self._approach_peak_travel = 0.0
+        self._approach_best_anchor_dist = float("inf")
+        self._approach_entry_anchor_dist = float("inf")
+        self._approach_peak_position = None
+        self._approach_align_count = 0
+        self._approach_advance_steps = 0
+        self._goal_latched = False
+        self._servo_prev_bbox_area = 0.0
+        self._servo_bbox_shrink_count = 0
+        self._servo_visual_advance_count = 0
+        self._servo_returning_to_peak = False
+        self._confirm_window_active = False
+        self._confirm_window_steps = 0
+        self._confirm_window_lost_count = 0
+        self._anchor_progress_window = []
+        self._explored_rooms_no_target = {}
+        self._room_step_counter = {}
+        self._cur_vlm_mode = "explore"
         self._reset_reground_state()
 
     def observe(self, obs: Dict[str, Any]) -> None:
@@ -336,8 +518,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         # 2. Add semantic nodes (room, landmark detection)
         room_label = self._add_semantic_nodes(cur_vp)
 
-        # 2b. Add object-level heavy detections when triggered
-        self._add_heavy_object_nodes(cur_vp, room_label)
+        # 2b. Add object-level heavy detections when triggered;
+        # returns final room label (VLM room preferred over CLIP room).
+        room_label = self._add_heavy_object_nodes(cur_vp, room_label) or room_label
+        self._record_view_object_labels(cur_vp)
 
         # 3. Generate frontier-like nodes
         self._generate_frontiers(cur_vp)
@@ -353,6 +537,33 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         # 5. Explicit waypoint->room binding. Done after adaptive_granularity
         # so room summaries created/refreshed this step are visible.
         self.topo_map.assign_waypoint_to_room(cur_vp, view_room_label=room_label)
+
+        # 6. Negative memory: track rooms explored without finding the goal.
+        self._update_negative_room_memory()
+
+    def _update_negative_room_memory(self) -> None:
+        """Mark a room as searched if agent has spent 20+ steps in it
+        without detecting the goal object."""
+        cur_room = self._current_room_id()
+        if cur_room is None or cur_room in self._explored_rooms_no_target:
+            return
+        self._room_step_counter[cur_room] = self._room_step_counter.get(cur_room, 0) + 1
+        if self._room_step_counter[cur_room] < 20:
+            return
+        has_goal_in_room = False
+        if self.instruction_graph is not None:
+            goal = self.instruction_graph.get_current_goal()
+            target_label = getattr(goal, "target_object", None) if goal is not None else None
+            if target_label:
+                target_labels = _split_compound_label(target_label)
+                for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
+                    if node.label and _label_matches_goal(node.label, target_labels):
+                        obj_room = node.attributes.get("anchor_room_id")
+                        if obj_room == cur_room:
+                            has_goal_in_room = True
+                            break
+        if not has_goal_in_room:
+            self._explored_rooms_no_target[cur_room] = self._goal_local_step
 
     def _add_visited_waypoint(self) -> str:
         """Add current position as visited waypoint, connect to previous."""
@@ -424,6 +635,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         node.attributes["blocked_reason"] = reason
         node.attributes["blocked_until_step"] = until
         node.confidence = min(node.confidence, 0.1)
+        if node.node_type == NodeType.OBJECT and self._is_goal_object_node(node):
+            self._goal_latched = False
 
     def _consume_or_block_target(self, node_id: str, reason: str) -> Dict[str, Any]:
         node = self.topo_map.get_node(node_id)
@@ -446,18 +659,23 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_navigation_event = event
         return event
 
-    def _object_center_dist(self, node: SemanticNode) -> float:
+    def _is_anchor_object(self, node: SemanticNode) -> bool:
+        return (
+            node.node_type == NodeType.OBJECT
+            and node.attributes.get("position_source") == "anchor_waypoint"
+        )
+
+    def _anchor_dist(self, node: SemanticNode) -> float:
+        """Distance from agent to the anchor waypoint of an object node."""
+        anchor_id = (
+            node.attributes.get("anchor_waypoint_id")
+            or node.attributes.get("observed_from")
+        )
+        anchor = self.topo_map.get_node(anchor_id) if anchor_id else None
+        pos = anchor.position if anchor is not None else node.position
         if self._position is None:
             return float("inf")
-        return float(np.linalg.norm(node.position - self._position))
-
-    def _goal_object_memory_ok(self, node: SemanticNode) -> bool:
-        """Require multi-view or high-confidence detections before trusting stop."""
-        attrs = node.attributes
-        multi_view = int(attrs.get("multi_view_count", 1))
-        scores = [float(s) for s in attrs.get("detection_scores", []) if s is not None]
-        max_score = max(scores) if scores else float(attrs.get("confidence", 0.0))
-        return multi_view >= 2 or max_score >= 0.45
+        return float(np.linalg.norm(pos - self._position))
 
     def on_navigation_event(self, target_node_id: Optional[str], event: str) -> Dict[str, Any]:
         if target_node_id is None:
@@ -471,7 +689,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         return self._consume_or_block_target(target_node_id, event)
 
     def _handle_target_reached(self, target_node_id: str) -> Dict[str, Any]:
-        """Handle executor reach events with node-type-specific semantics."""
+        """Handle executor reach events with node-type-specific semantics.
+
+        For OBJECT nodes all positions are semantic anchors (waypoints), not
+        metric object centers.  Reaching the anchor triggers
+        ``approach_confirm`` if this is a goal object.
+        """
         node = self.topo_map.get_node(target_node_id)
         if node is None:
             out = {"target_node_id": target_node_id, "reason": "target_reached", "action": "missing"}
@@ -479,43 +702,22 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return out
 
         if node.node_type == NodeType.OBJECT:
-            object_dist = self._object_center_dist(node)
-            if self.should_stop():
+            anchor_d = self._anchor_dist(node)
+            if self._is_goal_object_node(node):
+                if (self._nav_phase != "approach_confirm"
+                        and anchor_d <= self._APPROACH_CONFIRM_ANCHOR_RADIUS
+                        and self._vlm_sees_goal_now()):
+                    self._enter_approach_confirm()
                 out = {
                     "target_node_id": target_node_id,
-                    "reason": "object_should_stop",
-                    "action": "should_stop",
-                    "object_dist": round(object_dist, 3),
+                    "reason": "anchor_reached_enter_approach_confirm",
+                    "action": "anchor_reached_awaiting_confirm",
+                    "anchor_dist": round(anchor_d, 3),
+                    "vlm_confirmed": self._nav_phase == "approach_confirm",
                 }
                 self._last_navigation_event = out
                 return out
-            if object_dist <= 0.8:
-                if self._is_goal_object_node(node):
-                    out = {
-                        "target_node_id": target_node_id,
-                        "reason": "object_center_near",
-                        "action": "object_center_near",
-                        "object_dist": round(object_dist, 3),
-                    }
-                    self._last_navigation_event = out
-                    return out
-                return self._consume_or_block_target(target_node_id, "target_reached")
-
-            failed = node.attributes.setdefault("failed_approach_viewpoints", [])
-            if self._cur_vp_id and self._cur_vp_id not in failed:
-                failed.append(self._cur_vp_id)
-            self._block_target(target_node_id, "approach_reached_not_confirmed", ttl=5)
-            if self._sticky_target_id == target_node_id:
-                self._clear_sticky("approach_reached_not_confirmed")
-            out = {
-                "target_node_id": target_node_id,
-                "reason": "approach_reached_not_confirmed",
-                "action": "blocked_target",
-                "object_dist": round(object_dist, 3),
-                "failed_approach_viewpoints": list(failed),
-            }
-            self._last_navigation_event = out
-            return out
+            return self._consume_or_block_target(target_node_id, "target_reached")
 
         return self._consume_or_block_target(target_node_id, "target_reached")
 
@@ -560,52 +762,41 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
     def _reset_reground_state(self) -> None:
         self._reground_state = "idle"
-        self._reground_steps = 0
-        self._reground_max_steps = 30
-        self._reground_anchor_reach_radius = 0.8
-        self._reground_scan_rotations = 8
         self._reground_scan_rotated = 0
-        self._reground_target_node_id = None
         self._reground_anchor_node_id = None
+        self._reground_target_node_id = None
         self._reground_anchor_position = None
-        self._reground_failed_anchor_node_id = None
         self._target_object_detected_this_scan = False
 
     def _try_start_regrounding(self, plan_output: Dict[str, Any]) -> bool:
-        if self._position is None:
-            return False
-        if self._reground_state not in ("idle", "failed"):
+        if self._position is None or self._reground_state != "idle":
             return False
         if not plan_output.get("requires_regrounding"):
             return False
-
-        anchor_node_id = plan_output.get("anchor_waypoint_id")
-        if anchor_node_id and anchor_node_id == self._reground_failed_anchor_node_id:
-            return False
-
         target_pos = plan_output.get("target_position")
         if target_pos is None:
             return False
         anchor_pos = np.array(target_pos, dtype=np.float32)
-        dist = float(np.linalg.norm(anchor_pos - self._position))
-        if dist >= self._reground_anchor_reach_radius:
+        if float(np.linalg.norm(anchor_pos - self._position)) >= 0.8:
             return False
-
         self._reground_state = "scanning"
-        self._reground_steps = 0
         self._reground_scan_rotated = 0
-        self._reground_target_node_id = None
-        self._reground_anchor_node_id = anchor_node_id
+        self._reground_anchor_node_id = plan_output.get("anchor_waypoint_id")
         self._reground_anchor_position = anchor_pos.copy()
         self._target_object_detected_this_scan = False
         return True
 
     def _reground_scan_action(self) -> Dict[str, Any]:
         self._reground_scan_rotated += 1
-        if self._reground_scan_rotated >= self._reground_scan_rotations:
-            self._reground_scan_rotated = 0
-            self._reground_state = "searching"
-            self._reground_steps = 0
+        if self._reground_scan_rotated >= 3:
+            if not self._target_object_detected_this_scan:
+                if self._reground_anchor_node_id:
+                    self._block_target(self._reground_anchor_node_id, "reground_failed", ttl=50)
+                cur_room = self._current_room_id()
+                if cur_room:
+                    self._explored_rooms_no_target[cur_room] = self._goal_local_step
+                self._nav_phase = "explore"
+            self._reset_reground_state()
         return {
             "action": "turn_right",
             "target_position": None,
@@ -686,12 +877,20 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     extras.update(wp_extras)
                     extras["target_anchor_type"] = "folded_object_anchor"
         elif node.node_type == NodeType.OBJECT:
-            if getattr(self.config.planning, "object_route_to_waypoint_anchor", False):
-                wp_pos, wp_extras = self._resolve_object_waypoint_anchor(node)
-                if wp_pos is not None:
-                    target_pos = wp_pos
-                    extras.update(wp_extras)
-                    return target_pos, extras
+            anchor_id = node.attributes.get("anchor_waypoint_id") or node.attributes.get("observed_from")
+            anchor = self.topo_map.get_node(anchor_id) if anchor_id else None
+            if anchor is not None:
+                range_bin = node.attributes.get("range_bin", "unknown")
+                return anchor.position.copy(), {
+                    "target_anchor_type": "object_anchor",
+                    "semantic_target_node_id": node.node_id,
+                    "anchor_waypoint_id": anchor.node_id,
+                    "anchor_waypoint_position": anchor.position.tolist(),
+                    "requires_regrounding": range_bin in ("near", "mid", "unknown"),
+                    "vlm_range_bin": range_bin,
+                    "vlm_bearing": node.attributes.get("bearing", "unknown"),
+                    "vlm_visibility": node.attributes.get("visibility", "unknown"),
+                }
             approach = node.attributes.get("best_approach_position")
             if approach is not None:
                 target_pos = np.array(approach, dtype=np.float32)
@@ -712,10 +911,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         # node itself has been deleted from the topo_map.
         target_pos, target_extras = self._target_output_for_node(node)
         dist = float(np.linalg.norm(target_pos - self._position))
-        reach_dist = dist
-        if node.node_type == NodeType.OBJECT and self._is_goal_object_node(node):
-            reach_dist = self._object_center_dist(node)
-        if reach_dist <= cfg.sticky_reach_radius:
+        if dist <= cfg.sticky_reach_radius:
             if target_extras.get("requires_regrounding"):
                 plan = {
                     "target_node_id": node.node_id,
@@ -746,8 +942,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if self._is_goal_object_node(node):
             for obj in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
                 if obj.node_id != node.node_id and self._is_goal_object_node(obj):
-                    obj_dist = float(np.linalg.norm(obj.position - self._position))
-                    if obj_dist < dist * 0.5:
+                    obj_anchor_d = self._anchor_dist(obj)
+                    if obj_anchor_d < dist * 0.5:
                         self._clear_sticky("closer_goal_found")
                         return None
 
@@ -832,6 +1028,31 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if len(tags) > 12:
             del tags[:-12]
 
+    def _record_view_object_labels(self, cur_vp: str) -> None:
+        """Store object labels seen from this waypoint for later search scoring."""
+        node = self.topo_map.get_node(cur_vp)
+        if node is None or self._cur_report.source == "none":
+            return
+        labels: set = set()
+        threshold = float(self.config.perception.object_threshold)
+        for obs in self._cur_report.objects:
+            if obs.label and float(obs.confidence) >= threshold * 0.8:
+                labels.add(str(obs.label).strip().lower())
+        for label, sim in self._cur_report.goal_scores:
+            if float(sim) >= threshold:
+                labels.add(str(label).strip().lower())
+        for label, sim in self._cur_report.landmark_scores:
+            if float(sim) >= float(self.config.perception.landmark_threshold):
+                labels.add(str(label).strip().lower())
+        if not labels:
+            return
+        seen = node.attributes.setdefault("view_object_labels", [])
+        for lab in sorted(labels):
+            if lab and lab not in seen:
+                seen.append(lab)
+        if len(seen) > 20:
+            del seen[:-20]
+
     def _link_semantic_to_room_summary(self, node_id: str, room_label: Optional[str]) -> None:
         if not room_label or room_label in ("unknown", ""):
             return
@@ -852,21 +1073,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return None
 
         pcfg = self.config.perception
-        room_label = self._cur_report.room_label
-        room_conf = self._cur_report.room_confidence
-        if room_label != "unknown" and room_conf >= pcfg.room_threshold:
-            self._record_view_context(cur_vp, room_label, room_conf)
-        if self._cur_report.source == "none":
-            return None
-
-        pcfg = self.config.perception
         raw_label = self._cur_report.room_label
         raw_conf = self._cur_report.room_confidence
 
-        # Collect object labels from latest heavy detections for object-prior boost.
         recent_obj_labels = [obs.label for obs in self._cur_report.objects]
 
-        # --- Temporally-smoothed room classification ---
         clf_result = self._room_clf.update(
             raw_label=raw_label,
             raw_confidence=raw_conf,
@@ -876,52 +1087,60 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         room_label = clf_result.confirmed_label or "unknown"
         room_conf = clf_result.top_confidence
 
-        # Always write distribution; only write confirmed label when threshold met.
         if room_label != "unknown" and room_conf >= pcfg.room_threshold:
             self._record_view_context_smoothed(
                 cur_vp, room_label, room_conf,
                 clf_result.scores, clf_result.is_transition,
             )
         elif clf_result.scores:
-            # Below threshold but we still persist the distribution for debug.
             node = self.topo_map.get_node(cur_vp)
             if node is not None:
                 node.attributes["room_scores"] = {
                     k: round(v, 4) for k, v in clf_result.scores.items()
                 }
 
-        # Goal object node
-        for label, sim in self._cur_report.goal_scores:
-            sim = float(sim)
-            if sim < pcfg.object_threshold:
-                continue
-            existing = self.topo_map.find_nodes_within_radius(
-                self._position, radius=2.0, node_type=NodeType.OBJECT
-            )
-            matched = next(
-                (
-                    o for o in existing
-                    if o.label == label and self._object_room_compatible(o, room_label)
-                ),
-                None,
-            )
-            if matched:
-                matched.confidence = max(matched.confidence, sim)
-                matched.step_id = self.topo_map.current_step
-                self._update_object_room_context(matched, room_label)
-                if self._cur_rgb_embed is not None:
-                    matched.embedding = self._cur_rgb_embed
-            else:
-                obj_id = self.topo_map.add_node(
-                    NodeType.OBJECT,
-                    position=self._position.copy(),
-                    embedding=self._cur_rgb_embed,
-                    confidence=sim,
-                    label=label,
-                    attributes=self._object_room_attributes(room_label, "light_clip"),
+        # CLIP goal object nodes — skip when VLM is the primary object source
+        # to avoid duplicate / false-positive anchor nodes.
+        if pcfg.backend != "vlm":
+            for label, sim in self._cur_report.goal_scores:
+                sim = float(sim)
+                if sim < pcfg.object_threshold:
+                    continue
+                existing = self.topo_map.find_nodes_within_radius(
+                    self._position, radius=2.0, node_type=NodeType.OBJECT
                 )
-                self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
-                self._link_semantic_to_room_summary(obj_id, room_label)
+                matched = next(
+                    (
+                        o for o in existing
+                        if o.label == label and self._object_room_compatible(o, room_label)
+                    ),
+                    None,
+                )
+                if matched:
+                    matched.confidence = max(matched.confidence, sim)
+                    matched.step_id = self.topo_map.current_step
+                    self._update_object_room_context(matched, room_label)
+                    if self._cur_rgb_embed is not None:
+                        matched.embedding = self._cur_rgb_embed
+                else:
+                    clip_attrs = self._object_room_attributes(room_label, "light_clip")
+                    clip_attrs.update({
+                        "anchor_waypoint_id": cur_vp,
+                        "observed_from": cur_vp,
+                        "position_source": "anchor_waypoint",
+                    })
+                    vp_node = self.topo_map.get_node(cur_vp)
+                    clip_pos = vp_node.position.copy() if vp_node is not None else self._position.copy()
+                    obj_id = self.topo_map.add_node(
+                        NodeType.OBJECT,
+                        position=clip_pos,
+                        embedding=self._cur_rgb_embed,
+                        confidence=sim,
+                        label=label,
+                        attributes=clip_attrs,
+                    )
+                    self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
+                    self._link_semantic_to_room_summary(obj_id, room_label)
 
         # Navigation landmark: only goal/instruction hints, not environment vocabulary.
         for label, sim in self._cur_report.landmark_scores:
@@ -1082,11 +1301,121 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         max_labels = int(self.config.perception.heavy_summary_max_labels)
         return result[:max_labels]
 
+    def _nearest_goal_anchor_dist(self) -> float:
+        """Distance from agent to the closest goal-matching object anchor."""
+        if self._position is None or self.instruction_graph is None:
+            return float("inf")
+        goal = self.instruction_graph.get_current_goal()
+        target_label = getattr(goal, "target_object", None) if goal is not None else None
+        if target_label is None:
+            return float("inf")
+        target_labels = _split_compound_label(target_label)
+        best = float("inf")
+        for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
+            if node.label and _label_matches_goal(node.label, target_labels):
+                d = self._anchor_dist(node)
+                if d < best:
+                    best = d
+        return best
+
+    def _nearest_goal_object_node(self) -> Optional[SemanticNode]:
+        """Return the closest goal-matching object node, if any."""
+        if self._position is None or self.instruction_graph is None:
+            return None
+        goal = self.instruction_graph.get_current_goal()
+        target_label = getattr(goal, "target_object", None) if goal is not None else None
+        if target_label is None:
+            return None
+        target_labels = _split_compound_label(target_label)
+        best_node: Optional[SemanticNode] = None
+        best_dist = float("inf")
+        for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
+            if node.label and _label_matches_goal(node.label, target_labels):
+                d = self._anchor_dist(node)
+                if d < best_dist:
+                    best_dist = d
+                    best_node = node
+        return best_node
+
+    def _try_refresh_goal_anchor_from_vlm(self, vlm: Dict[str, Any]) -> bool:
+        """Promote goal object anchor when current VLM view is visually closer."""
+        if not vlm.get("available") or not vlm.get("goal_visible"):
+            return False
+        if not (vlm.get("stop_grounding_ok") or vlm.get("grounding_ok")):
+            return False
+        node = self._nearest_goal_object_node()
+        if node is None or self._cur_vp_id is None:
+            return False
+        vp = self.topo_map.get_node(self._cur_vp_id)
+        if vp is None:
+            return False
+        return self.topo_map.promote_object_anchor_if_better(
+            node,
+            vp.position,
+            self._cur_vp_id,
+            vlm.get("bbox"),
+            vlm.get("range_bin"),
+            float(vlm.get("confidence", 0)),
+        )
+
+    def _check_goal_no_progress(self) -> None:
+        """Goal-level no-progress: if the agent has not gotten meaningfully
+        closer to its nearest goal anchor over a sliding window, abandon the
+        current anchor / structure target so the planner re-selects (REPLAN).
+
+        This complements ``_is_stuck`` (which only watches raw displacement):
+        here we watch whether we are actually approaching the goal.
+        """
+        anchor_dist = self._nearest_goal_anchor_dist()
+        if anchor_dist == float("inf"):
+            # No goal anchor in memory -> nothing to measure against; reset.
+            self._anchor_progress_window = []
+            return
+        self._anchor_progress_window.append(anchor_dist)
+        if len(self._anchor_progress_window) > self._GOAL_NO_PROGRESS_STEPS:
+            self._anchor_progress_window = self._anchor_progress_window[-self._GOAL_NO_PROGRESS_STEPS:]
+        if len(self._anchor_progress_window) < self._GOAL_NO_PROGRESS_STEPS:
+            return
+        window = self._anchor_progress_window
+        # Improvement = how much closer we got from the window start's best.
+        improvement = max(window) - min(window)
+        recent_best = min(window[-1], anchor_dist)
+        earliest_best = min(window[: max(1, self._GOAL_NO_PROGRESS_STEPS // 4)])
+        if (recent_best >= earliest_best - self._GOAL_NO_PROGRESS_EPS
+                and improvement < self._GOAL_NO_PROGRESS_EPS):
+            blocked_id = self._sticky_target_id or self._last_structure_target_id
+            if blocked_id is not None:
+                self._block_target(blocked_id, "goal_no_progress", ttl=40)
+                if self._sticky_target_id == blocked_id:
+                    self._clear_sticky("goal_no_progress")
+            self._anchor_progress_window = []
+
+    def _check_search_no_progress(self) -> None:
+        """When no goal anchor exists, detect if we're stuck in one area.
+
+        Every 30 steps without detecting the goal object, mark the current
+        room as searched and block the current structure target to force a
+        room switch.
+        """
+        if self._nearest_goal_anchor_dist() != float("inf"):
+            return
+        if self._goal_local_step <= 0 or self._goal_local_step % 30 != 0:
+            return
+        cur_room = self._current_room_id()
+        if cur_room:
+            self._explored_rooms_no_target[cur_room] = self._goal_local_step
+            if self._last_structure_target_id:
+                self._block_target(self._last_structure_target_id, "search_no_progress", ttl=30)
+                self._clear_sticky("search_no_progress")
+
     def _should_run_heavy_perception(self) -> Tuple[bool, str]:
         self._trigger_state.last_heavy_step = self._last_heavy_step
         self._trigger_state.last_heavy_summary_step = self._last_heavy_summary_step
         self._trigger_state.goal_local_step = self._goal_local_step
         self._trigger_state.reground_state = self._reground_state
+        self._trigger_state.nav_phase = self._nav_phase
+        self._trigger_state.nearest_anchor_dist = self._nearest_goal_anchor_dist()
+        self._trigger_state.confirm_window_active = self._confirm_window_active
         return self._perception_trigger.should_run(
             self._trigger_state,
             self.topo_map.current_step,
@@ -1095,52 +1424,80 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             self._position,
             self.topo_map,
             self._has_near_goal_object_node(radius=2.0),
-            self.heavy_perceiver is not None,
+            self.heavy_perceiver is not None or self.vlm_perceiver is not None,
         )
 
-    def _object_position_from_bbox(self, bbox: List[float], heading: float) -> np.ndarray:
-        if self._position is None:
-            return np.zeros(3, dtype=np.float32)
-        x1, y1, x2, y2 = [float(v) for v in bbox]
-        cx = (x1 + x2) * 0.5
-        # Assume normalized bbox if values are <= 1, otherwise use actual sensor resolution.
-        image_width = 1.0 if max(abs(x1), abs(x2)) <= 1.0 else 256.0
-        image_height = 1.0 if max(abs(y1), abs(y2)) <= 1.0 else 256.0
-        centered = (cx / image_width) - 0.5
-        bearing = heading - centered * 1.2
-        # Estimate distance from bbox apparent size: larger bbox → closer object
-        bbox_w = abs(x2 - x1) / image_width
-        bbox_h = abs(y2 - y1) / image_height
-        apparent_size = max(bbox_w, bbox_h)
-        dist = float(np.clip(2.5 - 3.0 * apparent_size, 0.5, 2.0))
-        return np.array([
-            self._position[0] - dist * np.sin(bearing),
-            self._position[1],
-            self._position[2] - dist * np.cos(bearing),
-        ], dtype=np.float32)
+    def _object_position_for_observation(self, obs: ObjectObservation, cur_vp: str) -> np.ndarray:
+        """Return map position for an object observation.
 
-    def _add_heavy_object_nodes(self, cur_vp: str, room_label: Optional[str]) -> None:
+        All objects use the observing waypoint as their position (semantic
+        anchor).  bbox is retained for grounding / stop confirmation only,
+        never for depth estimation.
+        """
+        vp = self.topo_map.get_node(cur_vp)
+        if vp is not None:
+            return vp.position.copy()
+        if self._position is not None:
+            return self._position.copy()
+        return np.zeros(3, dtype=np.float32)
+
+    def _spatial_attrs_for_observation(self, obs: ObjectObservation, cur_vp: str) -> Dict[str, Any]:
+        attrs: Dict[str, Any] = {
+            "anchor_waypoint_id": cur_vp,
+            "observed_from": cur_vp,
+            "position_source": "anchor_waypoint",
+        }
+        if obs.source == "vlm":
+            room_context = obs.room_context
+            if room_context is None and self._cur_report.room_label != "unknown":
+                room_context = self._cur_report.room_label
+            attrs.update({
+                "bearing": obs.bearing or "unknown",
+                "range_bin": obs.range_bin or "unknown",
+                "visibility": obs.visibility or "unknown",
+                "visible": obs.visible if obs.visible is not None else obs.visibility != "not_visible",
+                "spatial_relation": list(obs.spatial_relation or []),
+                "vlm_room_context": room_context,
+            })
+        return attrs
+
+    def _add_heavy_object_nodes(self, cur_vp: str, room_label: Optional[str]) -> Optional[str]:
+        """Run heavy / VLM perception and upsert objects.  Returns final room label."""
         should_run, reason = self._should_run_heavy_perception()
         self._last_heavy_debug = {"ran": False, "reason": reason, "detections": 0}
         if not should_run:
-            return
+            return room_label
+
+        labels: List[str] = []
+        struct_target_id = getattr(self, "_last_structure_target_id", None)
+        backend_name = "vlm" if self.vlm_perceiver is not None else "clip_groundingdino"
+        vlm_mode = "confirm" if self._nav_phase in ("confirm", "approach", "approach_confirm") else "explore"
 
         # --- VLM path: query the VLM and get a full PerceptionReport directly ---
         if self.vlm_perceiver is not None:
+            self._vlm_perception_attempts += 1
             try:
                 goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
                 goal_text = getattr(goal, "target_object", "explore") if goal else "explore"
+                labels = [str(goal_text)]
                 vlm_report = self.vlm_perceiver.perceive(
                     self._cur_rgb,
                     goal_text,
                     visual_embed=self._cur_rgb_embed,
                     step_id=self.topo_map.current_step,
+                    mode=vlm_mode,
                 )
                 observations = vlm_report.objects
                 self._cur_report = vlm_report
             except Exception as exc:
-                self._last_heavy_debug = {"ran": False, "reason": f"vlm_error:{exc}", "detections": 0}
-                return
+                self._last_heavy_debug = {
+                    "ran": False,
+                    "reason": f"vlm_error:{type(exc).__name__}:{exc}",
+                    "detections": 0,
+                    "backend": "vlm",
+                    "attempts": self._vlm_perception_attempts,
+                }
+                return room_label
         else:
             # --- Classic CLIP + GroundingDINO path ---
             summary = None
@@ -1148,13 +1505,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 summary = self.topo_map.find_nearby_room_summary(
                     self._position, radius=self.config.memory.summary_radius)
             structure_target = None
-            struct_target_id = getattr(self, "_last_structure_target_id", None)
             if struct_target_id:
                 structure_target = self.topo_map.get_node(struct_target_id)
             labels = self._heavy_labels(reason=reason, summary=summary, structure_target=structure_target)
             if not labels:
                 self._last_heavy_debug = {"ran": False, "reason": "no_labels", "detections": 0}
-                return
+                return room_label
             try:
                 observations = self.heavy_perceiver.perceive(
                     self._cur_rgb,
@@ -1165,7 +1521,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 )
             except RuntimeError as exc:
                 self._last_heavy_debug = {"ran": False, "reason": f"backend_unavailable:{exc}", "detections": 0}
-                return
+                return room_label
             light_out = self.perceiver.perceive(self._cur_rgb_embed) if self._cur_rgb_embed is not None else {}
             self._cur_report = self._report_builder.build_full(
                 light_out, observations, self._cur_rgb_embed, self.topo_map.current_step,
@@ -1175,6 +1531,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_heavy_step = self._trigger_state.last_heavy_step
         self._last_heavy_summary_step = self._trigger_state.last_heavy_summary_step
         self._heavy_perception_calls += 1
+        self._cur_vlm_mode = vlm_mode
         goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
         room_label = self._cur_report.room_label if self._cur_report.source != "none" else None
         room_priors = set(getattr(goal, "room_prior", []) or [])
@@ -1182,14 +1539,15 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         for obs in observations:
             goal_target = getattr(goal, "target_object", None) if goal is not None else None
             goal_labels = _split_compound_label(goal_target) if goal_target else set()
-            target_relevance = 1.0 if goal_labels and obs.label.lower() in goal_labels else 0.0
+            target_relevance = 1.0 if goal_labels and _label_matches_goal(obs.label, goal_labels) else 0.0
             # Structural detections are valuable as room anchors even when
             # they're not the goal: give them a small relevance so the
             # Phase 1 promotion gate can lift them into landmarks.
             if target_relevance <= 0.0 and is_structural_label(obs.label):
                 target_relevance = max(target_relevance, 0.25)
             room_prior_score = 1.0 if room_label in room_priors else 0.0
-            object_position = self._object_position_from_bbox(obs.bbox, obs.view_heading)
+            object_position = self._object_position_for_observation(obs, cur_vp)
+            spatial_attrs = self._spatial_attrs_for_observation(obs, cur_vp)
             obj_id, merged = self.topo_map.upsert_object_observation(
                 label=obs.label,
                 bbox=obs.bbox,
@@ -1202,15 +1560,17 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 target_relevance=target_relevance,
                 room_prior_score=room_prior_score,
                 source=obs.source,
+                spatial_attrs=spatial_attrs,
             )
             self._link_semantic_to_room_summary(obj_id, room_label)
-            summary_id = self.topo_map.mark_recovered_from_summary(
-                obj_id,
-                object_position,
-                label=obs.label,
-            )
-            if summary_id is not None:
-                self.topo_map.add_edge(obj_id, summary_id, EdgeType.BELONGS_TO)
+            if obs.source != "vlm":
+                summary_id = self.topo_map.mark_recovered_from_summary(
+                    obj_id,
+                    object_position,
+                    label=obs.label,
+                )
+                if summary_id is not None:
+                    self.topo_map.add_edge(obj_id, summary_id, EdgeType.BELONGS_TO)
             obj_node = self.topo_map.get_node(obj_id)
             if obj_node is not None and target_relevance > 0.0:
                 obj_node.attributes["goal_detection_step"] = self.topo_map.current_step
@@ -1225,12 +1585,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             if merged:
                 merges += 1
                 self._object_merge_count += 1
-        goal_target = getattr(goal, "target_object", None) if goal is not None else None
-        if goal_target:
-            goal_labels_set = _split_compound_label(goal_target)
-            goal_hits = [o for o in observations if o.label.lower() in goal_labels_set]
-            if goal_hits:
-                self._recent_goal_detections.append(self.topo_map.current_step)
         self._last_heavy_debug = {
             "ran": True,
             "reason": reason,
@@ -1238,7 +1592,16 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "labels": labels,
             "merged": merges,
             "structure_target_id": struct_target_id,
+            "backend": backend_name,
+            "attempts": self._vlm_perception_attempts if backend_name == "vlm" else None,
+            "vlm_mode": vlm_mode if backend_name == "vlm" else None,
+            "nav_phase": self._nav_phase,
         }
+        # Prefer VLM room over CLIP room when available.
+        heavy_room = self._cur_report.room_label if self._cur_report.source != "none" else None
+        if heavy_room and heavy_room != "unknown":
+            return heavy_room
+        return room_label
 
     def _generate_frontiers(self, cur_vp: str) -> None:
         """Generate frontier-like nodes from unexplored directions.
@@ -1324,7 +1687,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return "folded_detail"
         if self._is_consumed_frontier(node):
             return "consumed"
-        if node.node_type == NodeType.OBJECT and not self._object_direct_nav_allowed(node):
+        if node.node_type == NodeType.OBJECT and not self._object_search_candidate_allowed(node):
             return "object_not_current_goal_confirmed"
         if self._is_blocked_target(node.node_id):
             return "blocked"
@@ -1387,6 +1750,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 if str(x).strip()
             }
             if contains_labels & target_parts:
+                return True
+            if contains_labels & landmarks:
                 return True
             # Structural keywords occasionally present in summary text.
             summary_blob = node.attributes.get("semantic_summary", {}) or {}
@@ -1500,7 +1865,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if target_label is None:
             return False
         target_labels = _split_compound_label(target_label)
-        return node.node_type == NodeType.OBJECT and bool(node.label and node.label.lower() in target_labels)
+        return node.node_type == NodeType.OBJECT and bool(node.label and _label_matches_goal(node.label, target_labels))
 
     def _object_direct_nav_allowed(self, node: SemanticNode) -> bool:
         if node.node_type != NodeType.OBJECT:
@@ -1509,6 +1874,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return False
         if float(node.attributes.get("target_relevance", 0.0)) <= 0.0:
             return False
+        if node.attributes.get("repeated_goal_source"):
+            return True
         detected_step = node.attributes.get("goal_detection_step")
         if detected_step is None:
             return False
@@ -1529,21 +1896,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return False
         target_labels = _split_compound_label(target_label)
         for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
-            if node.label and node.label.lower() in target_labels:
-                if float(np.linalg.norm(node.position - self._position)) <= radius:
+            if node.label and _label_matches_goal(node.label, target_labels):
+                if self._anchor_dist(node) <= radius:
                     return True
         return False
-
-    def _heading_toward_object_ok(self, object_position: np.ndarray, max_angle: float = math.pi / 3) -> bool:
-        """Whether the agent is roughly facing *object_position*."""
-        if self._position is None:
-            return False
-        dx = float(object_position[0] - self._position[0])
-        dz = float(object_position[2] - self._position[2])
-        if abs(dx) < 1e-6 and abs(dz) < 1e-6:
-            return True
-        bearing = math.atan2(dx, dz)
-        return abs(_angle_delta(bearing, self._heading)) <= max_angle
 
     def _candidate_anchored_skip_reason(
         self,
@@ -1724,11 +2080,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             ):
                 continue
             if node.node_type == NodeType.OBJECT:
-                obj_room_id = node.attributes.get('"anchor_room_id"') or node.attributes.get('"fused_into_summary_id"')
+                obj_room_id = node.attributes.get("anchor_room_id") or node.attributes.get("fused_into_summary_id")
                 if obj_room_id == structure_target_id:
                     boosted[idx] += bonus
                 continue
-            room_id = node.attributes.get('"room_id"')
+            room_id = node.attributes.get("room_id")
             if room_id == structure_target_id:
                 boosted[idx] += bonus
                 continue
@@ -1738,87 +2094,204 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 boosted[idx] += bonus * max(0.0, 1.0 - dist / radius)
         return boosted
 
-    def _plan_to_reground_target(self) -> Optional[Dict[str, Any]]:
-        if self._reground_target_node_id is None:
-            return None
-        node = self.topo_map.get_node(self._reground_target_node_id)
-        if node is None:
-            self._reground_target_node_id = None
-            return None
-        target_pos, target_extras = self._target_output_for_node(node)
-        plan_output = {
-            "target_node_id": node.node_id,
-            "target_position": target_pos,
-            "is_exploration": False,
-            "scores": [],
-            "candidate_ids": [node.node_id],
-            "sticky_debug": self._last_plan_debug,
-            "structure_target_id": getattr(self, "_last_structure_target_id", None),
-            "mode": "local_reground_target",
-        }
-        plan_output.update(target_extras)
-        if self.config.planning.global_graph_enabled and target_pos is not None:
-            nav_target = self._resolve_navigable_target(node)
-            if nav_target is not None:
-                path = self._global_planner.plan_to_target(self.topo_map, self._cur_vp_id, nav_target)
-                if path:
-                    plan_output["global_path"] = path
-        return plan_output
+    def _in_goal_search_mode(self) -> bool:
+        """True when we have no goal object anchor and must search by context."""
+        return self._nearest_goal_anchor_dist() == float("inf")
 
-    def _fail_regrounding(self) -> None:
-        self._reground_failed_anchor_node_id = self._reground_anchor_node_id
-        self._reground_state = "failed"
-        self._reground_steps = 0
-        self._reground_scan_rotated = 0
-        self._reground_target_node_id = None
-        self._target_object_detected_this_scan = False
-
-    def _plan_local_reground_search(self) -> Optional[Dict[str, Any]]:
-        self._reground_steps += 1
-        if self._reground_steps > self._reground_max_steps:
-            self._fail_regrounding()
-            return None
-
-        anchor_pos = (
-            np.array(self._reground_anchor_position, dtype=np.float32)
-            if self._reground_anchor_position is not None
-            else self._position
-        )
-        if anchor_pos is None:
-            self._fail_regrounding()
-            return None
-        radius = max(float(self.config.memory.near_radius), float(self.config.memory.summary_radius))
-        candidates = []
-        for node in self.topo_map._nodes.values():
-            if node.node_type not in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
-                continue
-            if self._candidate_skip_reason(node) is not None:
-                continue
-            dist = float(np.linalg.norm(node.position - anchor_pos))
-            if dist <= radius:
-                candidates.append((dist, node))
-        if not candidates:
-            self._fail_regrounding()
-            return None
-
-        _, node = min(candidates, key=lambda item: item[0])
+    def _goal_context_room_priors(self) -> set:
+        if self.instruction_graph is None:
+            return set()
+        goal = self.instruction_graph.get_current_goal()
+        if goal is None:
+            return set()
         return {
-            "target_node_id": node.node_id,
-            "target_position": node.position.copy(),
-            "is_exploration": True,
-            "scores": [],
-            "candidate_ids": [node.node_id],
-            "sticky_debug": self._last_plan_debug,
-            "structure_target_id": getattr(self, "_last_structure_target_id", None),
-            "mode": "local_reground_search",
+            str(r).strip().lower()
+            for r in (getattr(goal, "room_prior", []) or [])
+            if str(r).strip()
         }
+
+    def _goal_context_landmark_priors(self) -> set:
+        if self.instruction_graph is None:
+            return set()
+        goal = self.instruction_graph.get_current_goal()
+        if goal is None:
+            return set()
+        return {
+            str(l).strip().lower()
+            for l in (getattr(goal, "landmarks", []) or [])
+            if str(l).strip()
+        }
+
+    def _label_in_priors(self, label: Optional[str], priors: set) -> bool:
+        if not label or not priors:
+            return False
+        text = str(label).strip().lower()
+        if text in priors:
+            return True
+        return any(p in text or text in p for p in priors)
+
+    def _is_context_landmark_node(self, node: SemanticNode) -> bool:
+        if node.node_type != NodeType.LANDMARK:
+            return False
+        return self._label_in_priors(node.label, self._goal_context_landmark_priors())
+
+    def _is_context_object_node(self, node: SemanticNode) -> bool:
+        if node.node_type != NodeType.OBJECT:
+            return False
+        if self._is_goal_object_node(node):
+            return False
+        return self._label_in_priors(node.label, self._goal_context_landmark_priors())
+
+    def _object_search_candidate_allowed(self, node: SemanticNode) -> bool:
+        if self._object_direct_nav_allowed(node):
+            return True
+        if not self._in_goal_search_mode():
+            return False
+        return self._is_context_object_node(node)
+
+    def _waypoint_view_context_labels(self, node: SemanticNode) -> set:
+        labels: set = set()
+        view_room = node.attributes.get("view_room_label")
+        if view_room and str(view_room).strip().lower() not in ("", "unknown"):
+            labels.add(str(view_room).strip().lower())
+        for lab in node.attributes.get("view_object_labels", []) or []:
+            if lab:
+                labels.add(str(lab).strip().lower())
+        for entry in node.attributes.get("scene_vocabulary", []) or []:
+            if isinstance(entry, dict) and entry.get("label"):
+                labels.add(str(entry["label"]).strip().lower())
+        room_scores = node.attributes.get("room_scores") or {}
+        if isinstance(room_scores, dict):
+            for room_name, score in room_scores.items():
+                if float(score) >= 0.25:
+                    labels.add(str(room_name).strip().lower())
+        return labels
+
+    def _nearest_context_landmark_dist(self, position: np.ndarray, landmark_priors: set) -> float:
+        best = float("inf")
+        for node in self.topo_map.get_nodes_by_type(NodeType.LANDMARK):
+            if not self._label_in_priors(node.label, landmark_priors):
+                continue
+            d = float(np.linalg.norm(node.position - position))
+            if d < best:
+                best = d
+        for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
+            if not self._label_in_priors(node.label, landmark_priors):
+                continue
+            d = float(np.linalg.norm(node.position - position))
+            if d < best:
+                best = d
+        return best
+
+    def _apply_goal_driven_search_boost(
+        self,
+        candidates: List[SemanticNode],
+        scores: np.ndarray,
+    ) -> np.ndarray:
+        """Context-driven search when no goal object anchor exists.
+
+        Scores candidates by room prior, landmark/object context, view memory,
+        and unexplored frontiers — not only direct goal object detections.
+        """
+        if scores.size == 0 or not self._in_goal_search_mode():
+            return scores
+        room_priors = self._goal_context_room_priors()
+        landmark_priors = self._goal_context_landmark_priors()
+        if not room_priors and not landmark_priors:
+            return scores
+
+        boosted = scores.astype(np.float32).copy()
+        for i, node in enumerate(candidates):
+            if node.node_type == NodeType.ROOM:
+                node_label = (node.label or "").strip().lower()
+                if node_label and node_label in room_priors:
+                    boosted[i] += 1.5
+                contains = {
+                    str(c).strip().lower()
+                    for c in node.attributes.get("contains_labels", [])
+                    if str(c).strip()
+                }
+                if contains & landmark_priors:
+                    boosted[i] += 0.9
+                if contains & room_priors:
+                    boosted[i] += 0.4
+
+            if node.node_type == NodeType.LANDMARK and self._label_in_priors(node.label, landmark_priors):
+                boosted[i] += 1.4
+
+            if node.node_type == NodeType.OBJECT and self._is_context_object_node(node):
+                boosted[i] += 1.0
+
+            context_labels = self._waypoint_view_context_labels(node)
+            if context_labels & room_priors:
+                boosted[i] += 0.8
+            if context_labels & landmark_priors:
+                boosted[i] += 0.6
+
+            room_id = node.attributes.get("room_id")
+            if room_id:
+                room_node = self.topo_map.get_node(room_id)
+                if room_node and room_node.label and room_node.label.lower() in room_priors:
+                    boosted[i] += 0.7
+                if room_id in self._explored_rooms_no_target:
+                    boosted[i] -= 0.8
+            elif node.node_type == NodeType.ROOM and node.node_id in self._explored_rooms_no_target:
+                boosted[i] -= 0.8
+
+            view_room = node.attributes.get("view_room_label", "")
+            if view_room and str(view_room).lower() in room_priors:
+                boosted[i] += 0.5
+
+            if node.node_type == NodeType.WAYPOINT_FRONTIER:
+                boosted[i] += 0.35
+                near_ctx = self._nearest_context_landmark_dist(node.position, landmark_priors)
+                if near_ctx < 4.0:
+                    boosted[i] += 0.8 * max(0.0, 1.0 - near_ctx / 4.0)
+                near_prior_room = False
+                if view_room and str(view_room).lower() in room_priors:
+                    near_prior_room = True
+                if room_id:
+                    room_node = self.topo_map.get_node(room_id)
+                    if room_node and room_node.label and room_node.label.lower() in room_priors:
+                        near_prior_room = True
+                if near_prior_room:
+                    boosted[i] += 0.5
+
+        return boosted
+
+    def _apply_goal_latch_boost(
+        self,
+        candidates: List[SemanticNode],
+        scores: np.ndarray,
+    ) -> np.ndarray:
+        """When goal is latched, heavily boost goal-object nodes to keep
+        the agent focused on the target instead of wandering off."""
+        if not self._goal_latched or scores.size == 0:
+            return scores
+        boosted = scores.astype(np.float32).copy()
+        for i, node in enumerate(candidates):
+            if node.node_type == NodeType.OBJECT and self._is_goal_object_node(node):
+                boosted[i] += 5.0
+            elif node.node_type == NodeType.WAYPOINT_FRONTIER:
+                anchor_dist = self._nearest_goal_anchor_dist()
+                if anchor_dist != float("inf") and self._position is not None:
+                    node_dist = float(np.linalg.norm(node.position - self._position))
+                    if node_dist > anchor_dist + 2.0:
+                        boosted[i] -= 2.0
+        return boosted
+
+    def _current_room_id(self) -> Optional[str]:
+        """Return the room node id the agent is currently inside, if any."""
+        if self._position is None:
+            return None
+        summary = self.topo_map.find_nearby_room_summary(
+            self._position, radius=3.0,
+        )
+        return summary.node_id if summary is not None else None
 
     def _plan_regrounding(self) -> Optional[Dict[str, Any]]:
+        """Simplified MVP regrounding: scan 3x then back to idle."""
         if self._reground_state == "scanning":
-            target_plan = self._plan_to_reground_target()
-            if target_plan is not None:
-                self._reground_state = "searching"
-                return target_plan
             return {
                 "target_node_id": None,
                 "target_position": None,
@@ -1829,11 +2302,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "scores": [],
                 "sticky_debug": self._last_plan_debug,
             }
-        if self._reground_state == "searching":
-            target_plan = self._plan_to_reground_target()
-            if target_plan is not None:
-                return target_plan
-            return self._plan_local_reground_search()
         return None
 
     def _resolve_navigable_target(self, node: SemanticNode) -> Optional[str]:
@@ -1847,30 +2315,26 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         return nearest_wp.node_id if nearest_wp else None
 
     def plan(self) -> Dict[str, Any]:
-        """Determine next target based on goal + memory.
+        """4-stage MVP plan dispatch.
 
-        Two-stage when ``planning.two_stage_enabled``: first picks a
-        structure target (room/portal/structural landmark) using the
-        structure-layer view, then expands navigation candidates anchored
-        to it. Falls back to the legacy single-stage candidate set when no
-        structure target clears the score threshold.
-
-        Returns dict with:
-            - target_node_id: best node to navigate to
-            - target_position: 3D position of target
-            - is_exploration: whether this is frontier exploration
-            - scores: all node scores
-            - structure_target_id: chosen structure-layer anchor (or None)
+        EXPLORE → NAV_TO_ANCHOR → APPROACH_CONFIRM → STOP
         """
         if self.instruction_graph is None or self._cur_vp_id is None:
             return {"plan_action": "no_target", "target_node_id": None, "target_position": None, "is_exploration": True}
 
         self._last_navigation_event = {}
-        if self.should_stop():
-            return {"plan_action": "stop", "target_node_id": None, "target_position": None, "is_exploration": True}
 
-        # Stuck detection: if the agent barely moved over the last 10 steps,
-        # block the current sticky target and issue a recovery turn (with cooldown).
+        if self._nav_phase == "approach_confirm":
+            return self._plan_approach_confirm()
+
+        self._check_goal_no_progress()
+        self._check_search_no_progress()
+
+        self._update_nav_phase()
+
+        if self._nav_phase == "approach_confirm":
+            return self._plan_approach_confirm()
+
         if self._is_stuck(window=10, threshold=0.08, cooldown=25):
             self._last_stuck_recovery_step = self.topo_map.current_step
             self._stuck_recovery_count += 1
@@ -1888,11 +2352,291 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "mode": "stuck_recovery",
             }
 
+        return self._plan_navigate()
+
+    def _plan_approach_confirm(self) -> Dict[str, Any]:
+        """Local visual servo: align, advance, hold, or stop based on VLM.
+
+        Sub-states:
+          SERVO_ALIGN   -- target off-center, turn toward bearing
+          SERVO_ADVANCE -- target centered, bbox growing or stable, move forward
+          SERVO_HOLD    -- bbox shrinking, hold position, evaluate stop
+          SERVO_LOST    -- target not visible for 3+ steps, replan
+        """
+        vlm = self._current_goal_vlm_confirmation()
+        goal_visible = bool(vlm.get("goal_visible")) if vlm.get("available") else False
+        anchor_dist = self._nearest_goal_anchor_dist()
+        if anchor_dist != float("inf"):
+            self._approach_best_anchor_dist = min(self._approach_best_anchor_dist, anchor_dist)
+
+        if vlm.get("available"):
+            self._try_refresh_goal_anchor_from_vlm(vlm)
+            bbox_area = float(vlm.get("bbox_area", 0))
+            range_near = vlm.get("range_bin") == "near"
+            if range_near and (vlm.get("stop_grounding_ok") or vlm.get("grounding_ok")):
+                if bbox_area > self._approach_best_bbox_area:
+                    self._approach_best_bbox_area = bbox_area
+                    self._approach_peak_travel = self._goal_travel_distance
+                    if self._position is not None:
+                        self._approach_peak_position = self._position.copy()
+
+            confirm_success = bool(
+                vlm.get("goal_visible")
+                and range_near
+                and (vlm.get("stop_grounding_ok") or vlm.get("grounding_ok"))
+                and float(vlm.get("confidence", 0)) >= 0.5
+            )
+
+            if self._heavy_confirm_eval_step != self.topo_map.current_step:
+                self._confirm_buffer.append(confirm_success)
+                if len(self._confirm_buffer) > 5:
+                    self._confirm_buffer = self._confirm_buffer[-5:]
+                self._heavy_confirm_eval_step = self.topo_map.current_step
+
+            if bbox_area > 0 and self._servo_prev_bbox_area > 0:
+                if bbox_area >= self._servo_prev_bbox_area * 0.98:
+                    self._servo_visual_advance_count += 1
+                    self._servo_bbox_shrink_count = 0
+                elif bbox_area < self._servo_prev_bbox_area * 0.95:
+                    self._servo_bbox_shrink_count += 1
+                else:
+                    self._servo_bbox_shrink_count = 0
+            if bbox_area > 0:
+                self._servo_prev_bbox_area = bbox_area
+
+            if goal_visible:
+                self._approach_lost_count = 0
+                self._approach_bearing = vlm.get("bearing", self._approach_bearing)
+            else:
+                self._approach_lost_count += 1
+        else:
+            self._approach_lost_count += 1
+
+        self._update_confirm_window(vlm)
+
+        if self._stop_verifier_passed(vlm):
+            self._last_stop_debug = {
+                "stop_allowed": True,
+                "reason": "mvp_stop_verifier",
+                "nav_phase": self._nav_phase,
+                "vlm_confirm": vlm,
+                "confirm_buffer": list(self._confirm_buffer[-3:]),
+                "approach_remaining": self._approach_remaining,
+                "approach_steps_used": self._approach_steps_used,
+                "advance_steps": self._approach_advance_steps,
+                "approach_best_bbox_area": round(self._approach_best_bbox_area, 4),
+                "anchor_dist": round(anchor_dist, 3) if anchor_dist != float("inf") else None,
+                "approach_best_anchor_dist": round(self._approach_best_anchor_dist, 3)
+                if self._approach_best_anchor_dist != float("inf") else None,
+                "entry_anchor_dist": round(self._approach_entry_anchor_dist, 3)
+                if self._approach_entry_anchor_dist != float("inf") else None,
+                "goal_local_step": self._goal_local_step,
+                "goal_travel_distance": round(self._goal_travel_distance, 3),
+            }
+            return {"plan_action": "stop", "target_node_id": None, "target_position": None, "is_exploration": False}
+
+        # --- Passed peak: bbox shrinking for 2+ frames → return to peak position ---
+        if (self._servo_bbox_shrink_count >= 2
+                and self._approach_peak_position is not None
+                and self._servo_visual_advance_count >= 2
+                and sum(self._confirm_buffer[-3:]) >= 2
+                and self._approach_steps_used >= self._APPROACH_MIN_STEPS_BEFORE_STOP):
+            if not self._servo_returning_to_peak:
+                self._servo_returning_to_peak = True
+            peak_pos = self._approach_peak_position
+            if self._position is not None:
+                dist_to_peak = float(np.linalg.norm(self._position - peak_pos))
+            else:
+                dist_to_peak = 999.0
+            if dist_to_peak < 0.3:
+                self._last_stop_debug = {
+                    "stop_allowed": True,
+                    "reason": "peak_return_stop",
+                    "nav_phase": self._nav_phase,
+                    "dist_to_peak": round(dist_to_peak, 3),
+                    "confirm_buffer": list(self._confirm_buffer[-3:]),
+                    "approach_best_bbox_area": round(self._approach_best_bbox_area, 4),
+                    "approach_steps_used": self._approach_steps_used,
+                    "anchor_dist": round(anchor_dist, 3) if anchor_dist != float("inf") else None,
+                }
+                return {"plan_action": "stop", "target_node_id": None, "target_position": None, "is_exploration": False}
+            self._approach_remaining -= 1
+            self._approach_steps_used += 1
+            self._last_stop_debug = {
+                "stop_allowed": False,
+                "reason": "peak_return_nav",
+                "nav_phase": self._nav_phase,
+                "dist_to_peak": round(dist_to_peak, 3),
+                "approach_remaining": self._approach_remaining,
+                "bbox_shrink_count": self._servo_bbox_shrink_count,
+            }
+            return {
+                "plan_action": "approach_confirm",
+                "action": "navigate_to",
+                "target_node_id": None,
+                "target_position": peak_pos.tolist(),
+                "is_exploration": False,
+                "mode": "peak_return",
+                "approach_remaining": self._approach_remaining,
+            }
+
+        if self._approach_lost_count >= 3:
+            self._nav_phase = "explore"
+            self._last_stop_debug = {
+                "stop_allowed": False,
+                "reason": "servo_lost_target",
+                "nav_phase": "explore",
+                "approach_lost_count": self._approach_lost_count,
+                "goal_local_step": self._goal_local_step,
+            }
+            return self._plan_navigate()
+
+        if self._approach_remaining <= 0:
+            if self._approach_budget_stop_eligible(vlm):
+                self._last_stop_debug = {
+                    "stop_allowed": True,
+                    "reason": "approach_budget_stop_with_confirm",
+                    "nav_phase": self._nav_phase,
+                    "vlm_confirm": vlm,
+                    "confirm_buffer": list(self._confirm_buffer[-3:]),
+                    "stop_buffer": list(self._stop_buffer[-3:]),
+                    "approach_best_bbox_area": round(self._approach_best_bbox_area, 4),
+                    "approach_peak_travel": round(self._approach_peak_travel, 3),
+                    "goal_travel_distance": round(self._goal_travel_distance, 3),
+                }
+                return {"plan_action": "stop", "target_node_id": None, "target_position": None, "is_exploration": False}
+            self._nav_phase = "explore"
+            self._last_stop_debug = {
+                "stop_allowed": False,
+                "reason": "approach_budget_exhausted",
+                "nav_phase": "explore",
+                "confirm_buffer": list(self._confirm_buffer[-3:]),
+                "goal_local_step": self._goal_local_step,
+            }
+            return self._plan_navigate()
+
+        self._approach_remaining -= 1
+        self._approach_steps_used += 1
+
+        # --- Align: at most 2 consecutive turns, then force advance ---
+        bearing = self._approach_bearing
+        align_needed = goal_visible and bearing not in ("center", "front", "front-center", "unknown")
+        if align_needed and self._approach_align_count < self._SERVO_ALIGN_BURST:
+            self._approach_align_count += 1
+            if bearing in ("left", "left_front"):
+                action = "turn_left"
+            else:
+                action = "turn_right"
+            self._last_stop_debug = {
+                "stop_allowed": False,
+                "reason": "servo_align",
+                "nav_phase": self._nav_phase,
+                "bearing": bearing,
+                "approach_remaining": self._approach_remaining,
+                "align_count": self._approach_align_count,
+            }
+            return {
+                "plan_action": "approach_confirm",
+                "action": action,
+                "target_node_id": None,
+                "target_position": None,
+                "is_exploration": False,
+                "mode": "servo_align",
+                "approach_remaining": self._approach_remaining,
+            }
+        self._approach_align_count = 0
+
+        # --- Default action: advance (move_forward) ---
+        self._approach_advance_steps += 1
+        self._last_stop_debug = {
+            "stop_allowed": False,
+            "reason": "servo_advance",
+            "nav_phase": self._nav_phase,
+            "approach_remaining": self._approach_remaining,
+            "goal_visible": goal_visible,
+            "anchor_dist": round(anchor_dist, 3) if anchor_dist != float("inf") else None,
+            "confirm_buffer": list(self._confirm_buffer[-3:]),
+            "stop_buffer": list(self._stop_buffer[-3:]),
+            "advance_steps": self._approach_advance_steps,
+        }
+        return {
+            "plan_action": "approach_confirm",
+            "action": "move_forward",
+            "target_node_id": None,
+            "target_position": None,
+            "is_exploration": False,
+            "mode": "servo_advance",
+            "approach_remaining": self._approach_remaining,
+        }
+
+    def _approach_budget_stop_eligible(self, vlm: Dict[str, Any]) -> bool:
+        """Allow STOP when approach budget ends at the best visual pose seen."""
+        if self._approach_steps_used < self._APPROACH_MIN_STEPS_BEFORE_STOP:
+            return False
+        if self._approach_advance_steps < self._MIN_ADVANCE_BEFORE_STOP:
+            return False
+        if sum(self._confirm_buffer[-3:]) < 2:
+            return False
+        if self._servo_visual_advance_count < 2:
+            return False
+        if self._approach_best_bbox_area <= 0:
+            return False
+        if vlm.get("available"):
+            bbox_area = float(vlm.get("bbox_area", 0))
+            if bbox_area < self._approach_best_bbox_area * self._STOP_BBOX_PEAK_RATIO_BUDGET:
+                return False
+        return True
+
+    def _is_vlm_recent(self, max_age: int = 2) -> bool:
+        """True if the last VLM run was within *max_age* steps of now."""
+        if self._last_heavy_step is None:
+            return False
+        return self.topo_map.current_step - self._last_heavy_step <= max_age
+
+    def _has_approach_progress(self) -> bool:
+        """True when the servo phase has shown real physical approach progress."""
+        if self._approach_advance_steps < self._MIN_ADVANCE_BEFORE_STOP:
+            return False
+        if self._approach_entry_anchor_dist != float("inf") and self._approach_best_anchor_dist != float("inf"):
+            if self._approach_best_anchor_dist >= self._approach_entry_anchor_dist - 0.1:
+                if self._servo_visual_advance_count < 3:
+                    return False
+        return True
+
+    def _stop_verifier_ready(self, vlm: Dict[str, Any]) -> bool:
+        """Visual confirm readiness with progress guard."""
+        if not vlm.get("available"):
+            return False
+        if not (vlm.get("fresh") or self._is_vlm_recent(2)):
+            return False
+        if not self._confirm_window_active:
+            return False
+        if self._approach_steps_used < self._APPROACH_MIN_STEPS_BEFORE_STOP:
+            return False
+        if self._approach_best_bbox_area < self._BBOX_MIN_AREA_FOR_APPROACH:
+            return False
+        if not self._has_approach_progress():
+            return False
+        return sum(self._confirm_buffer[-3:]) >= 2
+
+    def _stop_verifier_passed(self, vlm: Dict[str, Any]) -> bool:
+        """Pure visual STOP: bbox grew, near peak, then plateaued."""
+        if not self._stop_verifier_ready(vlm):
+            return False
+        if self._servo_visual_advance_count < 2:
+            return False
+        bbox_area = float(vlm.get("bbox_area", 0))
+        if self._approach_best_bbox_area > 0:
+            if bbox_area < self._approach_best_bbox_area * self._STOP_BBOX_PEAK_RATIO_NEAR:
+                return False
+        return self._servo_bbox_shrink_count >= 1
+
+    def _plan_navigate(self) -> Dict[str, Any]:
+        """Standard candidate-based navigation (explore / nav_to_anchor)."""
         reground_plan = self._plan_regrounding()
         if reground_plan is not None:
             return reground_plan
 
-        # Stage 1: structure-layer anchor (optional).
         structure_target_id: Optional[str] = None
         if self.config.planning.two_stage_enabled:
             structure_target_id = self._select_structure_target()
@@ -1903,6 +2647,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         fallback_candidates = []
         fallback_ids = []
         self._last_skipped_candidates = []
+        in_search_mode = self._in_goal_search_mode()
 
         for node in self.topo_map._nodes.values():
             reason = self._candidate_skip_reason(node)
@@ -1913,7 +2658,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 continue
             is_room_summary = (node.node_type == NodeType.ROOM
                                and node.attributes.get("summary_type") == "room_region")
-            if node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT) or is_room_summary:
+            is_search_landmark = in_search_mode and self._is_context_landmark_node(node)
+            is_search_context_object = in_search_mode and self._is_context_object_node(node)
+            if (node.node_type in (NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE, NodeType.OBJECT)
+                    or is_room_summary or is_search_landmark or is_search_context_object):
                 primary_candidates.append(node)
                 primary_ids.append(node.node_id)
             elif node.node_type == NodeType.WAYPOINT_VISITED:
@@ -1925,6 +2673,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         if not candidates:
             self._last_plan_debug = self._debug_plan_state()
+            self._last_stop_debug = {
+                "stop_allowed": False, "reason": "no_candidates",
+                "nav_phase": self._nav_phase, "goal_local_step": self._goal_local_step,
+            }
             return {
                 "plan_action": "no_target",
                 "target_node_id": None,
@@ -1936,7 +2688,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "structure_target_id": structure_target_id,
             }
 
-        # Stage 2: score candidates and apply structure anchor bonus.
         scores = compute_semantic_bias(
             goal_graph=self.instruction_graph,
             topo_map=self.topo_map,
@@ -1944,14 +2695,21 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             agent_position=self._position,
             normalize=False,
             current_node_id=self._cur_vp_id,
+            explored_rooms_no_target=self._explored_rooms_no_target,
         )
         scores = self._apply_structure_anchor_bonus(candidates, scores, structure_target_id)
         scores = self._apply_reachability_components(candidates, scores)
+        scores = self._apply_goal_driven_search_boost(candidates, scores)
+        scores = self._apply_goal_latch_boost(candidates, scores)
 
         sticky_plan = self._sticky_plan_if_valid(candidates, candidate_ids, scores)
         if sticky_plan is not None:
             sticky_plan["structure_target_id"] = structure_target_id
             sticky_plan.setdefault("plan_action", "navigate")
+            self._last_stop_debug = {
+                "stop_allowed": False, "reason": "navigating",
+                "nav_phase": self._nav_phase, "goal_local_step": self._goal_local_step,
+            }
             return sticky_plan
 
         best_idx = int(np.argmax(scores))
@@ -1975,6 +2733,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._sticky_release_reason = ""
         target_pos, target_extras = self._target_output_for_node(best_node)
 
+        self._last_stop_debug = {
+            "stop_allowed": False, "reason": "navigating",
+            "nav_phase": self._nav_phase, "goal_local_step": self._goal_local_step,
+        }
         plan_output = {
             "plan_action": "navigate",
             "target_node_id": best_node.node_id,
@@ -2002,6 +2764,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "target_anchor_type": plan_output.get("target_anchor_type"),
             "anchor_waypoint_id": plan_output.get("anchor_waypoint_id"),
             "anchor_room_id": plan_output.get("anchor_room_id"),
+            "vlm_range_bin": plan_output.get("vlm_range_bin"),
+            "vlm_bearing": plan_output.get("vlm_bearing"),
+            "vlm_visibility": plan_output.get("vlm_visibility"),
             "global_path": plan_output.get("global_path"),
             "reground_state": self._reground_state,
             "reground_target_node_id": self._reground_target_node_id,
@@ -2073,49 +2838,219 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if self.instruction_graph:
             return self.instruction_graph.advance()
         return False
-    def _current_goal_bbox_confirmation(self) -> Tuple[bool, float]:
-        """Check if current-frame heavy observations contain a large goal bbox.
 
-        Returns (confirmed, max_normalized_area).
+    _APPROACH_CONFIRM_ANCHOR_RADIUS = 1.5
+    _SERVO_MAX_STEPS = 32
+    _APPROACH_MAX_STEPS = _SERVO_MAX_STEPS
+    _APPROACH_MIN_STEPS_BEFORE_STOP = 8
+    _MIN_ADVANCE_BEFORE_STOP = 3
+    _STOP_SQUEEZE_REMAINING = 0
+    _STOP_BBOX_PEAK_RATIO_NEAR = 0.80
+    _STOP_BBOX_PEAK_RATIO_BUDGET = 0.70
+    _SERVO_ALIGN_BURST = 2
+    _BBOX_MIN_AREA_FOR_APPROACH = 0.008
+    _BBOX_MIN_AREA_FOR_STOP = 0.018
+    _BBOX_MAX_AREA_FOR_GROUNDING = 0.42
+    _APPROACH_CONFIRM_ENTRY_MIN_TRAVEL = 1.0
+    _CONFIRM_WINDOW_MAX_STEPS = 10
+    _GOAL_NO_PROGRESS_STEPS = 40
+    _GOAL_NO_PROGRESS_EPS = 0.5
+
+    @staticmethod
+    def _bbox_area(bbox: Optional[List[float]]) -> float:
+        if not bbox or len(bbox) < 4:
+            return 0.0
+        w = max(0.0, float(bbox[2]) - float(bbox[0]))
+        h = max(0.0, float(bbox[3]) - float(bbox[1]))
+        return w * h
+
+    def _bbox_grounding_flags(self, goal_visible: bool, bbox_area: float) -> Tuple[bool, bool]:
+        """Return (approach_grounding_ok, stop_grounding_ok) from bbox area band."""
+        if not goal_visible:
+            return False, False
+        if bbox_area <= 0.0 or bbox_area > self._BBOX_MAX_AREA_FOR_GROUNDING:
+            return False, False
+        approach_ok = bbox_area >= self._BBOX_MIN_AREA_FOR_APPROACH
+        stop_ok = bbox_area >= self._BBOX_MIN_AREA_FOR_STOP
+        return approach_ok, stop_ok
+
+    def _vlm_sees_goal_now(self) -> bool:
+        """Check if the latest VLM report shows a bbox-grounded goal."""
+        vlm = self._current_goal_vlm_confirmation()
+        return bool(
+            vlm.get("available")
+            and vlm.get("goal_visible")
+            and vlm.get("grounding_ok")
+        )
+
+    def _update_nav_phase(self) -> None:
+        """Evaluate and transition the 4-stage navigation state machine.
+
+        States: explore → nav_to_anchor → approach_confirm → (stop via verifier)
+
+        Entering ``approach_confirm`` requires VLM visual evidence to avoid
+        false-positive anchor matches locking the agent far from the target.
         """
-        if not self._cur_report.objects or self.instruction_graph is None:
-            return False, 0.0
+        if self.instruction_graph is None or self._position is None:
+            return
+
+        if self._nav_phase == "approach_confirm":
+            return
+
+        anchor_dist = self._nearest_goal_anchor_dist()
+        has_memory = anchor_dist != float("inf")
+        prev = self._nav_phase
+
+        if prev == "explore":
+            if has_memory and anchor_dist <= self._APPROACH_CONFIRM_ANCHOR_RADIUS:
+                if (self._goal_travel_distance >= self._APPROACH_CONFIRM_ENTRY_MIN_TRAVEL
+                        and self._vlm_sees_goal_now()):
+                    self._enter_approach_confirm()
+            elif has_memory:
+                self._nav_phase = "nav_to_anchor"
+                self._goal_latched = True
+
+        elif prev == "nav_to_anchor":
+            if anchor_dist <= self._APPROACH_CONFIRM_ANCHOR_RADIUS and self._vlm_sees_goal_now():
+                self._enter_approach_confirm()
+            elif not has_memory:
+                self._nav_phase = "explore"
+
+    def _enter_approach_confirm(self) -> None:
+        """Transition into the local visual servo phase."""
+        self._nav_phase = "approach_confirm"
+        self._confirm_buffer = []
+        self._stop_buffer = []
+        self._approach_remaining = self._SERVO_MAX_STEPS
+        self._approach_lost_count = 0
+        self._approach_steps_used = 0
+        self._approach_best_bbox_area = 0.0
+        self._approach_peak_travel = 0.0
+        entry_anchor = self._nearest_goal_anchor_dist()
+        self._approach_entry_anchor_dist = entry_anchor if entry_anchor != float("inf") else float("inf")
+        self._approach_best_anchor_dist = entry_anchor if entry_anchor != float("inf") else float("inf")
+        self._approach_peak_position: Optional[np.ndarray] = None
+        self._approach_align_count = 0
+        self._approach_advance_steps = 0
+        self._servo_prev_bbox_area = 0.0
+        self._servo_bbox_shrink_count = 0
+        self._servo_visual_advance_count = 0
+        self._servo_returning_to_peak = False
+        self._confirm_window_active = False
+        self._confirm_window_steps = 0
+        self._confirm_window_lost_count = 0
+        self._last_heavy_step = None
+        self._goal_latched = True
+        vlm = self._current_goal_vlm_confirmation()
+        self._approach_bearing = vlm.get("bearing", "center") if vlm.get("available") else "center"
+
+    def _update_confirm_window(self, vlm: Dict[str, Any]) -> None:
+        """Open / advance / close the CONFIRM_WINDOW.
+
+        The window opens when VLM sees the goal nearby, or when
+        ``confirm_buffer`` already has evidence. It stays open while
+        the goal is visible (up to max steps) and closes after 3
+        consecutive steps of target loss.  Re-opening is allowed.
+        """
+        vlm_close_enough = bool(
+            vlm.get("available")
+            and vlm.get("goal_visible")
+            and (vlm.get("stop_grounding_ok") or vlm.get("grounding_ok"))
+            and vlm.get("range_bin") == "near"
+        )
+        goal_visible_now = bool(vlm.get("available") and vlm.get("goal_visible"))
+        has_confirm_evidence = sum(self._confirm_buffer[-3:]) >= 1
+
+        if not self._confirm_window_active:
+            if self._approach_steps_used >= self._APPROACH_MIN_STEPS_BEFORE_STOP:
+                if vlm_close_enough or has_confirm_evidence:
+                    self._confirm_window_active = True
+                    self._confirm_window_steps = 0
+                    self._confirm_window_lost_count = 0
+        else:
+            self._confirm_window_steps += 1
+            if not goal_visible_now and not has_confirm_evidence:
+                self._confirm_window_lost_count += 1
+            else:
+                self._confirm_window_lost_count = 0
+            if (self._confirm_window_lost_count >= 3
+                    or self._confirm_window_steps > self._CONFIRM_WINDOW_MAX_STEPS):
+                self._confirm_window_active = False
+                self._confirm_window_steps = 0
+                self._confirm_window_lost_count = 0
+
+    def _current_goal_vlm_confirmation(self) -> Dict[str, Any]:
+        """Return current-frame VLM grounding for the active goal.
+
+        Returns a flat dict with the fields that ``_plan_approach_confirm``
+        and ``_stop_verifier_passed`` consume: ``available``, ``goal_visible``,
+        ``grounding_ok``, ``stop_grounding_ok``, ``range_ok``, ``visibility_ok``,
+        ``bearing``, ``confidence``, ``bbox_area``, ``vlm_mode``.
+        """
+        fresh = self._last_heavy_step == self.topo_map.current_step
+        out: Dict[str, Any] = {
+            "available": False,
+            "goal_visible": False,
+            "visibility_ok": False,
+            "grounding_ok": False,
+            "stop_grounding_ok": False,
+            "range_ok": False,
+            "bearing": "unknown",
+            "range_bin": "unknown",
+            "confidence": 0.0,
+            "bbox_area": 0.0,
+            "fresh": fresh,
+            "vlm_mode": self._cur_vlm_mode,
+        }
+        if self._cur_report.source != "vlm" or not self._cur_report.objects or self.instruction_graph is None:
+            return out
         goal = self.instruction_graph.get_current_goal()
         target_label = getattr(goal, "target_object", None) if goal is not None else None
         if target_label is None:
-            return False, 0.0
+            return out
         target_labels = _split_compound_label(target_label)
-        matching = [obs for obs in self._cur_report.objects
-                    if obs.label.lower() in target_labels and obs.bbox is not None
-                    and float(obs.confidence) >= 0.35]
-        if not matching:
-            return False, 0.0
+        matches = [
+            obs for obs in self._cur_report.objects
+            if obs.label and _label_matches_goal(obs.label, target_labels) and float(obs.confidence) >= 0.35
+        ]
+        if not matches:
+            return out
 
-        def _norm_area(bbox):
-            w, h = abs(bbox[2] - bbox[0]), abs(bbox[3] - bbox[1])
-            if w > 1.0 or h > 1.0:
-                w /= 256.0
-                h /= 256.0
-            return w * h
+        best = max(matches, key=lambda obs: float(obs.confidence))
+        visibility = best.visibility or "unknown"
+        range_bin = best.range_bin or "unknown"
+        bearing = best.bearing or "unknown"
+        confidence = float(best.confidence)
+        bbox_area = self._bbox_area(best.bbox)
+        visible = best.visible if best.visible is not None else visibility != "not_visible"
+        visibility_ok = bool(visible and visibility in ("visible", "partially_visible", "unknown"))
+        goal_visible = bool(self._cur_report.goal_visible)
+        grounding_ok, stop_grounding_ok = self._bbox_grounding_flags(goal_visible, bbox_area)
+        range_ok = range_bin == "near" and stop_grounding_ok
 
-        max_area = max(_norm_area(obs.bbox) for obs in matching)
-        return max_area > 0.15, max_area
-
-    def _has_recent_goal_detection(self, max_age: int = 5, min_count: int = 1) -> bool:
-        """Whether goal object was detected by heavy perception in recent steps."""
-        if not self._recent_goal_detections:
-            return False
-        cur = self.topo_map.current_step
-        recent = [s for s in self._recent_goal_detections if cur - s <= max_age]
-        return len(recent) >= min_count
+        out.update({
+            "available": True,
+            "goal_visible": goal_visible,
+            "visibility_ok": visibility_ok,
+            "grounding_ok": grounding_ok,
+            "stop_grounding_ok": stop_grounding_ok,
+            "range_ok": range_ok,
+            "bearing": bearing,
+            "range_bin": range_bin,
+            "confidence": confidence,
+            "bbox_area": bbox_area,
+            "bbox": best.bbox,
+            "fresh": fresh,
+            "vlm_mode": self._cur_vlm_mode,
+        })
+        return out
 
     def should_stop(self) -> bool:
-        """Check if agent should call STOP for current goal.
+        """Simplified stop gate.
 
-        Hybrid policy: keep the local topo simple visual stop signal, and add
-        a permissive object proximity path.  The previous remote gate required
-        consecutive heavy confirmation, strong memory, and heading alignment at
-        the same time, which produced many approach arrivals and zero STOPs.
+        For VLM-backend object targets the real stop decision lives in
+        ``_stop_verifier_passed`` (called only from ``_plan_approach_confirm``).
+        ``should_stop()`` is kept for non-VLM / non-object paths.
         """
         goal_sim = self._cur_report.best_goal_sim
 
@@ -2127,100 +3062,28 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "goal_sim": round(goal_sim, 4),
                 "goal_local_step": self._goal_local_step,
                 "goal_travel_distance": round(self._goal_travel_distance, 3),
+                "nav_phase": self._nav_phase,
             }
             return False
 
-        if goal_sim > 0.5:
+        if self.config.perception.backend != "vlm" and goal_sim > 0.5:
             self._last_stop_debug = {
                 "stop_allowed": True,
                 "reason": "local_goal_similarity",
                 "goal_sim": round(goal_sim, 4),
+                "nav_phase": self._nav_phase,
             }
             return True
 
-        goal = self.instruction_graph.get_current_goal() if self.instruction_graph is not None else None
-        target_label = getattr(goal, "target_object", None) if goal is not None else None
-        if target_label is None or self._position is None:
-            self._last_stop_debug = {
-                "stop_allowed": False,
-                "reason": "no_target_or_position",
-                "goal_sim": round(goal_sim, 4),
-            }
-            return False
-
-        target_labels = _split_compound_label(target_label)
-        nearest_object_dist = float("inf")
-        nearest_approach_dist = float("inf")
-        nearest_goal_node: Optional[SemanticNode] = None
-        for node in self.topo_map.get_nodes_by_type(NodeType.OBJECT):
-            if not (node.label and node.label.lower() in target_labels):
-                continue
-            object_dist = float(np.linalg.norm(node.position - self._position))
-            if object_dist >= nearest_object_dist:
-                continue
-            nearest_object_dist = object_dist
-            nearest_goal_node = node
-            approach = node.attributes.get("best_approach_position")
-            if approach is not None:
-                nearest_approach_dist = float(
-                    np.linalg.norm(np.array(approach, dtype=np.float32) - self._position)
-                )
-            else:
-                nearest_approach_dist = object_dist
-
-        heavy_confirm_ok, heavy_bbox_area = self._current_goal_bbox_confirmation()
-        recent_confirm_ok = self._has_recent_goal_detection(max_age=8, min_count=1)
-        memory_seen = nearest_goal_node is not None
-        topo_near_ok = nearest_object_dist <= 1.0
-        topo_close_ok = nearest_object_dist <= 2.0
-        at_approach_ok = nearest_approach_dist <= 1.0
-
-        # Current-frame heavy confirmation is required for STOP.  Recent
-        # detections and topo memory alone were producing false stops several
-        # meters away from the GT object.  Unlike the previous remote version,
-        # we do not require two consecutive frames, strong memory confidence,
-        # or heading alignment.
-        stop_allowed = bool(
-            heavy_confirm_ok
-            and memory_seen
-            and (topo_close_ok or at_approach_ok or goal_sim > 0.35)
-        )
-
-        if stop_allowed:
-            if topo_close_ok:
-                reason = "heavy_confirmed_topo_close"
-            elif at_approach_ok:
-                reason = "heavy_confirmed_at_approach"
-            else:
-                reason = "heavy_confirmed_semantic"
-        elif not memory_seen:
-            reason = "no_goal_object_memory"
-        elif not topo_close_ok:
-            reason = "object_not_near_enough"
-        elif not heavy_confirm_ok:
-            reason = "no_current_heavy_confirmation"
-        else:
-            reason = "no_stop_confirmation"
-
         self._last_stop_debug = {
-            "stop_allowed": stop_allowed,
-            "reason": reason,
+            "stop_allowed": False,
+            "reason": "vlm_stop_via_approach_confirm_only",
             "goal_sim": round(goal_sim, 4),
-            "object_dist": round(nearest_object_dist, 3) if nearest_object_dist != float("inf") else None,
-            "approach_dist": round(nearest_approach_dist, 3) if nearest_approach_dist != float("inf") else None,
-            "topo_near_ok": topo_near_ok,
-            "topo_close_ok": topo_close_ok,
-            "at_approach_ok": at_approach_ok,
-            "heavy_confirm_ok": heavy_confirm_ok,
-            "heavy_bbox_area": round(heavy_bbox_area, 4),
-            "recent_confirm_ok": recent_confirm_ok,
-            "memory_seen": memory_seen,
+            "nav_phase": self._nav_phase,
             "goal_local_step": self._goal_local_step,
             "goal_travel_distance": round(self._goal_travel_distance, 3),
         }
-        return stop_allowed
-
-    # ==================== Statistics ====================
+        return False
 
     # ==================== Statistics ====================
 
@@ -2273,6 +3136,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "consumed_frontiers": len(self._consumed_frontier_ids),
             "blocked_targets": len(self._active_blocked_targets()),
             "heavy_perception_calls": self._heavy_perception_calls,
+            "vlm_perception_attempts": self._vlm_perception_attempts,
             "object_merge_count": self._object_merge_count,
             "mean_object_confidence": mean_object_conf,
             "room_summaries": room_summaries,
@@ -2283,4 +3147,5 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "visible_semantic_nodes": visible_semantic,
             "granularity_debug": getattr(self.topo_map, "_last_granularity_debug", {}),
             "last_heavy": self._last_heavy_debug,
+            "nav_phase": self._nav_phase,
         }

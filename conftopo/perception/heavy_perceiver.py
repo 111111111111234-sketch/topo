@@ -13,40 +13,94 @@ import os
 import numpy as np
 
 
+def normalize_bbox(raw: Any) -> Optional[List[float]]:
+    """Validate and normalise a raw bbox to ``[x1, y1, x2, y2]``.
+
+    Returns ``None`` when the input cannot be interpreted as a valid bbox
+    (wrong type, fewer than 4 numbers, degenerate box, etc.).
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) < 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in raw[:4]]
+    except (TypeError, ValueError):
+        return None
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
 @dataclass
 class ObjectObservation:
     """Normalized object-level detection result."""
 
     label: str
-    bbox: List[float]
+    bbox: Optional[List[float]]
     confidence: float
     embedding: Optional[np.ndarray] = None
     source: str = "heavy"
     view_heading: float = 0.0
     step_id: int = 0
+    visible: Optional[bool] = None
+    visibility: str = "unknown"
+    bearing: str = "unknown"
+    range_bin: str = "unknown"
+    spatial_relation: List[str] = None
+    room_context: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.spatial_relation is None:
+            self.spatial_relation = []
+        elif isinstance(self.spatial_relation, str):
+            self.spatial_relation = [self.spatial_relation]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "label": self.label,
-            "bbox": [float(v) for v in self.bbox],
+            "bbox": [float(v) for v in self.bbox] if self.bbox is not None else None,
             "confidence": float(self.confidence),
             "embedding": self.embedding.tolist() if self.embedding is not None else None,
             "source": self.source,
             "view_heading": float(self.view_heading),
             "step_id": int(self.step_id),
+            "visible": self.visible,
+            "visibility": self.visibility,
+            "bearing": self.bearing,
+            "range_bin": self.range_bin,
+            "spatial_relation": list(self.spatial_relation),
+            "room_context": self.room_context,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ObjectObservation":
         embedding = data.get("embedding")
+        relation = data.get("spatial_relation", data.get("relation", []))
+        if isinstance(relation, str):
+            relation = [relation]
+        if relation is None:
+            relation = []
         return cls(
             label=str(data.get("label", "")),
-            bbox=[float(v) for v in data.get("bbox", [0, 0, 0, 0])],
+            bbox=normalize_bbox(data.get("bbox")),
             confidence=float(data.get("confidence", 0.0)),
             embedding=np.array(embedding, dtype=np.float32) if embedding is not None else None,
             source=str(data.get("source", "heavy")),
             view_heading=float(data.get("view_heading", 0.0)),
             step_id=int(data.get("step_id", 0)),
+            visible=data.get("visible"),
+            visibility=str(data.get("visibility", "unknown")),
+            bearing=str(data.get("bearing", "unknown")),
+            range_bin=str(data.get("range_bin", data.get("range", "unknown"))),
+            spatial_relation=[str(x) for x in relation],
+            room_context=data.get("room_context"),
         )
 
 
@@ -240,7 +294,7 @@ class HeavyPerceiver:
                 embedding = visual_embedding
             observations.append(ObjectObservation(
                 label=label,
-                bbox=[float(v) for v in row.get("bbox", [0, 0, 0, 0])],
+                bbox=normalize_bbox(row.get("bbox")),
                 confidence=conf,
                 embedding=np.array(embedding, dtype=np.float32) if embedding is not None else None,
                 source=str(row.get("source", "groundingdino")),

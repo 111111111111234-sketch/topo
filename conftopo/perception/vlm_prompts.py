@@ -6,44 +6,107 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from conftopo.perception.heavy_perceiver import normalize_bbox
 
-SYSTEM_PROMPT = """\
-You are a navigation perception agent inside a house. You analyse a single \
-egocentric RGB image and answer strictly in JSON.
 
-Your response MUST be a valid JSON object with exactly these keys:
+_JSON_SCHEMA_BLOCK = """\
 {
   "room": {"label": "<room type>", "confidence": <0.0-1.0>},
   "objects": [
-    {"label": "<object name>", "bbox": [x1, y1, x2, y2], "confidence": <0.0-1.0>}
+    {
+      "label": "<object name>",
+      "bbox": [x1, y1, x2, y2],
+      "visible": <true|false>,
+      "visibility": "<visible|partially_visible|not_visible|unknown>",
+      "bearing": "<left|center|right|left_front|right_front|front|unknown>",
+      "range": "<near|mid|far|unknown>",
+      "relation": ["<spatial relation phrases>"],
+      "room_context": "<room or unknown>",
+      "confidence": <0.0-1.0>
+    }
   ],
   "goal_visible": <true|false>,
   "goal_reason": "<why you think the goal is visible or not>",
   "portals": ["<door/opening descriptions>"],
   "scene_summary": "<one sentence describing the scene>",
   "uncertainty": <0.0-1.0>
-}
+}"""
 
+_COMMON_RULES = """\
 Rules:
 - bbox coordinates are normalised to [0,1] (top-left origin).
-- Only include objects you are confident about (confidence >= 0.3).
+- Do not estimate metric distance. Use only the discrete range values near, mid, far, or unknown.
+- Use relation for coarse context such as "beside cabinet", "near wall", "on table", "near doorway".
 - room.label must be one of: kitchen, living room, bedroom, bathroom, \
 hallway, dining room, office, garage, laundry room, closet, staircase, \
 balcony, unknown.
 - Keep scene_summary under 30 words.
-- Do NOT include any text outside the JSON object.\
-"""
+- Do NOT include any text outside the JSON object."""
+
+EXPLORE_SYSTEM_PROMPT = f"""\
+You are a navigation perception agent inside a house in EXPLORATION mode. \
+Your job is to discover potential targets, landmarks, rooms, and spatial cues. \
+Analyse the egocentric RGB image and answer strictly in JSON.
+
+Your response MUST be a valid JSON object with exactly these keys:
+{_JSON_SCHEMA_BLOCK}
+
+{_COMMON_RULES}
+- Include any object that might be relevant to the navigation goal, even if \
+you are not fully certain (confidence >= 0.3).
+- Report rooms, landmarks, portals, and spatial relations generously — they \
+help build a memory map.
+- goal_visible should be true if the target is possibly present, even \
+partially or at a distance."""
+
+CONFIRM_SYSTEM_PROMPT = f"""\
+You are a navigation perception agent inside a house in CONFIRMATION mode. \
+The robot is close to where it expects to find the target. Your job is to \
+strictly verify whether the navigation goal is actually visible, close, and \
+directly in front. Analyse the egocentric RGB image and answer strictly in JSON.
+
+Your response MUST be a valid JSON object with exactly these keys:
+{_JSON_SCHEMA_BLOCK}
+
+{_COMMON_RULES}
+- Only report objects you are confident about (confidence >= 0.5).
+- goal_visible must be true ONLY if the target object is clearly identifiable \
+in the image. If uncertain, set goal_visible to false.
+- Pay special attention to range and bearing: the robot needs to know if the \
+target is near and in front.
+- If you are not sure the object matches the goal, set confidence lower and \
+goal_visible to false."""
+
+SYSTEM_PROMPT = EXPLORE_SYSTEM_PROMPT
 
 
-def build_user_prompt(goal_text: str, context: Optional[str] = None) -> str:
+def build_user_prompt(
+    goal_text: str,
+    context: Optional[str] = None,
+    mode: str = "explore",
+) -> str:
     """Construct the user-turn text sent alongside the image."""
     parts = [f"Current navigation goal: {goal_text}"]
     if context:
         parts.append(f"Context: {context}")
-    parts.append(
-        "Analyse the image and return the JSON perception report."
-    )
+    if mode == "confirm":
+        parts.append(
+            "The robot believes the target may be nearby. "
+            "Carefully verify whether the goal object is visible, its range, "
+            "and its bearing. Return the JSON perception report."
+        )
+    else:
+        parts.append(
+            "Analyse the image and return the JSON perception report."
+        )
     return "\n".join(parts)
+
+
+def get_system_prompt(mode: str = "explore") -> str:
+    """Return the appropriate system prompt for the given perception mode."""
+    if mode == "confirm":
+        return CONFIRM_SYSTEM_PROMPT
+    return EXPLORE_SYSTEM_PROMPT
 
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -94,9 +157,32 @@ def _normalise(data: Dict[str, Any]) -> Dict[str, Any]:
     objects: List[Dict[str, Any]] = []
     for o in objects_raw:
         if isinstance(o, dict) and "label" in o:
+            relation = o.get("relation", o.get("spatial_relation", []))
+            if isinstance(relation, str):
+                relation = [relation]
+            if not isinstance(relation, list):
+                relation = []
             objects.append({
                 "label": str(o.get("label", "")),
-                "bbox": [float(v) for v in o.get("bbox", [0, 0, 0, 0])],
+                "bbox": normalize_bbox(o.get("bbox")),
+                "visible": bool(o.get("visible", True)),
+                "visibility": _enum(
+                    o.get("visibility", "visible" if o.get("visible", True) else "not_visible"),
+                    {"visible", "partially_visible", "not_visible", "unknown"},
+                    "unknown",
+                ),
+                "bearing": _enum(
+                    o.get("bearing", "unknown"),
+                    {"left", "center", "right", "left_front", "right_front", "front", "unknown"},
+                    "unknown",
+                ),
+                "range": _enum(
+                    o.get("range", o.get("range_bin", "unknown")),
+                    {"near", "mid", "far", "unknown"},
+                    "unknown",
+                ),
+                "relation": [str(x) for x in relation],
+                "room_context": str(o.get("room_context", "")) or None,
                 "confidence": float(o.get("confidence", 0.0)),
             })
     return {
@@ -123,3 +209,8 @@ def _fallback() -> Dict[str, Any]:
         "scene_summary": "",
         "uncertainty": 1.0,
     }
+
+
+def _enum(value: Any, allowed: set, default: str) -> str:
+    text = str(value).strip().lower().replace(" ", "_")
+    return text if text in allowed else default

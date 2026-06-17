@@ -11,8 +11,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from conftopo.perception.vlm_prompts import (
-    SYSTEM_PROMPT,
     build_user_prompt,
+    get_system_prompt,
     parse_vlm_json,
 )
 
@@ -28,8 +28,12 @@ class VLMBackendBase(ABC):
         rgb: np.ndarray,
         goal_text: str,
         context: Optional[str] = None,
+        mode: str = "explore",
     ) -> Dict[str, Any]:
         """Send an image + goal description to the VLM and return parsed JSON.
+
+        *mode* selects the system prompt: ``"explore"`` for discovery,
+        ``"confirm"`` for strict stop verification.
 
         Returns a dict with the canonical schema::
 
@@ -69,6 +73,7 @@ class FakeVLMBackend(VLMBackendBase):
         rgb: np.ndarray,
         goal_text: str,
         context: Optional[str] = None,
+        mode: str = "explore",
     ) -> Dict[str, Any]:
         self.calls += 1
         return dict(self._response)
@@ -78,9 +83,14 @@ def _rgb_to_base64_jpeg(rgb: np.ndarray, quality: int = 85) -> str:
     """Encode an HWC uint8 RGB array to a base64 JPEG string."""
     from PIL import Image  # lazy import to avoid hard dependency
 
+    rgb = np.asarray(rgb)
+    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+        rgb = rgb[..., :3]
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     img = Image.fromarray(rgb)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -127,13 +137,14 @@ class Qwen3VLBackend(VLMBackendBase):
         rgb: np.ndarray,
         goal_text: str,
         context: Optional[str] = None,
+        mode: str = "explore",
     ) -> Dict[str, Any]:
         self._ensure_client()
         b64_img = _rgb_to_base64_jpeg(rgb)
-        user_text = build_user_prompt(goal_text, context)
+        user_text = build_user_prompt(goal_text, context, mode=mode)
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": get_system_prompt(mode)},
             {
                 "role": "user",
                 "content": [

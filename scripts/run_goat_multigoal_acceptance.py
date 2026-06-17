@@ -1,3 +1,16 @@
+"""Multigoal acceptance harness for ConfTopo-GOAT.
+
+Success criteria follow the GOAT-Bench benchmark definition (README):
+  - Each subtask has a budget of 500 agent actions.
+  - Success requires calling STOP while within 1m Euclidean distance of the
+    current goal object instance (judged at the STOP position, not merely passing nearby).
+  - ``goal_min_distance`` is recorded for debugging only.
+
+Note: the bundled ``goat-bench`` Habitat training config uses
+``success_distance: 0.25`` with geodesic distance to view points; that is the
+RL training/eval implementation detail, not the paper benchmark definition above.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -19,75 +32,130 @@ from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
 from conftopo.perception import ClipRuntimeEncoder
 
 
-def _build_goat_goal_index(dataset_goals: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, list[np.ndarray]]]:
-    """Index GOAT-Bench dataset goals by object_id and object_category."""
-    by_id: dict[str, np.ndarray] = {}
-    by_category: dict[str, list[np.ndarray]] = {}
-    for entries in dataset_goals.values():
-        if not isinstance(entries, list):
+DEFAULT_STEPS_PER_GOAL = 500  # GOAT-Bench README: 500 actions per subtask
+DEFAULT_SUCCESS_DISTANCE = 1.0  # GOAT-Bench README: 1m Euclidean at STOP
+
+
+def _scene_basename(episode: dict[str, Any]) -> str:
+    scene_id = str(episode.get("scene_id", ""))
+    return scene_id.split("/")[-1].replace(".basis.glb", "").replace(".glb", "")
+
+
+def _resolve_goat_subtask_goal_entries(
+    dataset_goals: dict[str, Any],
+    episode: dict[str, Any],
+    task_index: int,
+) -> list[dict[str, Any]]:
+    """Resolve GOAT goal dict entries for one subtask (mirrors GoatDatasetV1.from_json)."""
+    episode_tasks = episode.get("tasks") or []
+    if task_index >= len(episode_tasks):
+        return []
+    task = episode_tasks[task_index]
+    if len(task) < 2:
+        return []
+    goal_category = task[0]
+    goal_type = task[1]
+    goal_inst_id = task[2] if len(task) > 2 else None
+
+    same_cat_goal_lists = [
+        entries
+        for entries in dataset_goals.values()
+        if isinstance(entries, list)
+        and entries
+        and isinstance(entries[0], dict)
+        and entries[0].get("object_category") == goal_category
+    ]
+    if not same_cat_goal_lists:
+        return []
+
+    goal_entries = list(same_cat_goal_lists[0])
+    children_categories = same_cat_goal_lists[0][0].get("children_object_categories") or []
+    scene_name = _scene_basename(episode)
+    for child_category in children_categories:
+        child_key = f"{scene_name}_{child_category}"
+        child_entries = dataset_goals.get(child_key)
+        if isinstance(child_entries, list):
+            goal_entries.extend(child_entries)
+
+    if goal_type == "object":
+        return [g for g in goal_entries if isinstance(g, dict)]
+    if goal_inst_id is None:
+        return []
+    return [
+        g for g in goal_entries
+        if isinstance(g, dict) and str(g.get("object_id")) == str(goal_inst_id)
+    ]
+
+
+def _instance_positions_from_goal_entries(goal_entries: list[dict[str, Any]]) -> list[np.ndarray]:
+    """GT object-center positions for the current subtask's target instance(s)."""
+    positions: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for goal in goal_entries:
+        position = goal.get("position")
+        if position is None:
             continue
-        for entry in entries:
-            if not isinstance(entry, dict):
+        pos = np.asarray(position, dtype=np.float32)
+        key = tuple(np.round(pos, 4).tolist())
+        if key in seen:
+            continue
+        seen.add(key)
+        positions.append(pos)
+    return positions
+
+
+def _euclidean_distance_to_instances(
+    agent_world: np.ndarray,
+    instance_positions: list[np.ndarray],
+) -> float:
+    """Planar-agnostic 3D distance to the nearest target instance center."""
+    if not instance_positions:
+        return float("inf")
+    agent = np.asarray(agent_world, dtype=np.float32)
+    return min(float(np.linalg.norm(agent - pos)) for pos in instance_positions)
+
+
+def _view_points_from_goal_entries(goal_entries: list[dict[str, Any]]) -> list[np.ndarray]:
+    """View-point positions used only for SPL geodesic optimal-path estimation."""
+    viewpoints: list[np.ndarray] = []
+    seen: set[tuple[float, ...]] = set()
+    for goal in goal_entries:
+        for view_point in goal.get("view_points") or []:
+            if not isinstance(view_point, dict):
                 continue
-            position = entry.get("position")
+            agent_state = view_point.get("agent_state") or {}
+            position = agent_state.get("position")
             if position is None:
                 continue
             pos = np.asarray(position, dtype=np.float32)
-            object_id = entry.get("object_id")
-            if object_id:
-                by_id[str(object_id)] = pos
-            category = str(entry.get("object_category", "")).lower().strip()
-            if category:
-                by_category.setdefault(category, []).append(pos)
-    return by_id, by_category
-
-
-def _resolve_goat_gt_positions(
-    episode_task: list[Any] | None,
-    goal_object_names: set[str],
-    goals_by_id: dict[str, np.ndarray],
-    goals_by_category: dict[str, list[np.ndarray]],
-    sim=None,
-) -> list[np.ndarray]:
-    """Resolve GT world positions for one GOAT task.
-
-    Priority:
-    1. GOAT dataset object_id (when task specifies one)
-    2. GOAT dataset object_category matches (including compound splits)
-    3. Habitat semantic_scene fallback (MP3D-style scenes)
-    """
-    positions: list[np.ndarray] = []
-    seen: set[tuple[float, ...]] = set()
-
-    def _add(pos: np.ndarray) -> None:
-        key = tuple(np.round(pos.astype(np.float32), 4).tolist())
-        if key not in seen:
+            key = tuple(np.round(pos, 4).tolist())
+            if key in seen:
+                continue
             seen.add(key)
-            positions.append(pos.astype(np.float32))
+            viewpoints.append(pos)
+    return viewpoints
 
-    object_id = episode_task[2] if episode_task and len(episode_task) > 2 else None
-    if object_id and str(object_id) in goals_by_id:
-        _add(goals_by_id[str(object_id)])
-        return positions
 
-    for name in goal_object_names:
-        for pos in goals_by_category.get(name, []):
-            _add(pos)
-
-    if positions:
-        return positions
-
+def _goat_geodesic_distance_to_viewpoints(
+    sim,
+    agent_world: np.ndarray,
+    viewpoints: list[np.ndarray],
+) -> float:
+    """Official GOAT distance: geodesic from agent to nearest view point."""
+    if not viewpoints:
+        return float("inf")
     try:
-        if sim is not None and hasattr(sim, "semantic_scene") and sim.semantic_scene is not None:
-            for region in sim.semantic_scene.regions:
-                for obj in region.objects:
-                    if obj.category is not None and obj.aabb is not None:
-                        label = (obj.category.name() or "").lower()
-                        if label in goal_object_names:
-                            _add(np.array(obj.aabb.center, dtype=np.float32))
+        from habitat_sim.nav import MultiGoalShortestPath
+
+        path = MultiGoalShortestPath()
+        path.requested_start = np.asarray(agent_world, dtype=np.float32)
+        path.requested_ends = np.asarray(viewpoints, dtype=np.float32)
+        if not sim.pathfinder.find_path(path):
+            return float("inf")
+        geo = float(path.geodesic_distance)
+        return geo if np.isfinite(geo) else float("inf")
     except Exception:
-        pass
-    return positions
+        return float("inf")
 
 
 def set_start_state(sim_agent, episode):
@@ -209,7 +277,7 @@ def run_step(
             if evt_action == "should_stop":
                 action = "stop"
                 nav = {"reachable": True, "reason": nav_event.get("reason", "object_should_stop")}
-            elif evt_action in ("approach_reached_not_consumed", "object_center_near"):
+            elif evt_action == "anchor_reached_awaiting_confirm":
                 action = "turn_left"
                 nav = {"reachable": False, "reason": evt_action}
             elif evt_action in ("consumed_frontier", "blocked_target"):
@@ -334,22 +402,29 @@ def build_multigoal_acceptance_report(
 
     repeated_goal_checks: list[dict[str, Any]] = []
     repeated_goal_passed = True
-    for later_idx, earlier_idx in ((3, 0), (2, 1)):
-        if len(goals) <= later_idx or len(tasks) <= later_idx:
+    checked_later = set()
+    for later_idx in range(len(goals) - 1, 0, -1):
+        if later_idx >= len(tasks):
             continue
-        if goals[earlier_idx].target_object != goals[later_idx].target_object:
-            continue
-        task_row = tasks[later_idx]
-        hit = bool(task_row.get("repeated_goal_reuse_hits", 0) > 0 or task_row.get("repeated_goal_semantic_reuse"))
-        repeated_goal_checks.append({
-            "later_task_index": later_idx,
-            "earlier_task_index": earlier_idx,
-            "target_object": goals[later_idx].target_object,
-            "passed": hit,
-            "repeated_goal_reuse_hits": int(task_row.get("repeated_goal_reuse_hits", 0)),
-        })
-        if not hit:
-            repeated_goal_passed = False
+        for earlier_idx in range(later_idx):
+            if earlier_idx >= len(goals):
+                continue
+            if goals[earlier_idx].target_object != goals[later_idx].target_object:
+                continue
+            if later_idx in checked_later:
+                continue
+            checked_later.add(later_idx)
+            task_row = tasks[later_idx]
+            hit = bool(task_row.get("repeated_goal_reuse_hits", 0) > 0 or task_row.get("repeated_goal_semantic_reuse"))
+            repeated_goal_checks.append({
+                "later_task_index": later_idx,
+                "earlier_task_index": earlier_idx,
+                "target_object": goals[later_idx].target_object,
+                "passed": hit,
+                "repeated_goal_reuse_hits": int(task_row.get("repeated_goal_reuse_hits", 0)),
+            })
+            if not hit:
+                repeated_goal_passed = False
 
     if repeated_goal_checks:
         memory_reuse_passed = memory_reuse_passed or repeated_goal_passed
@@ -384,7 +459,7 @@ def main():
     ap.add_argument("--split", default="val_seen")
     ap.add_argument("--scene", default="GLAQ4DNUx5U")
     ap.add_argument("--episode-index", type=int, default=0)
-    ap.add_argument("--steps-per-goal", type=int, default=80)
+    ap.add_argument("--steps-per-goal", type=int, default=DEFAULT_STEPS_PER_GOAL)
     ap.add_argument("--max-goals", type=int, default=4)
     ap.add_argument("--dataset-dir", default="data/datasets/goat_bench/hm3d/v1")
     ap.add_argument("--scene-root", default="data/scene_datasets/hm3d")
@@ -394,9 +469,30 @@ def main():
     ap.add_argument("--frame-dir", default=None)
     ap.add_argument("--clip-model", default="ViT-B/32")
     ap.add_argument("--clip-device", default="auto")
+    ap.add_argument(
+        "--perception-backend",
+        choices=["clip_groundingdino", "vlm"],
+        default="clip_groundingdino",
+        help="Perception backend used by ConfTopoGOATAgent.",
+    )
+    ap.add_argument("--vlm-api-base", default="http://localhost:8000/v1")
+    ap.add_argument("--vlm-model", default="Qwen/Qwen3-VL-8B-Instruct")
+    ap.add_argument("--vlm-timeout", type=float, default=5.0)
     ap.add_argument("--object-threshold", type=float, default=None)
     ap.add_argument("--heavy-enabled", action="store_true")
     ap.add_argument("--heavy-interval", type=int, default=None)
+    ap.add_argument(
+        "--heavy-reground-cooldown",
+        type=int,
+        default=None,
+        help="Minimum simulator steps between VLM/heavy calls during local regrounding.",
+    )
+    ap.add_argument(
+        "--heavy-near-goal-cooldown",
+        type=int,
+        default=None,
+        help="Minimum simulator steps between VLM/heavy calls when a goal object is nearby.",
+    )
     ap.add_argument("--object-detection-threshold", type=float, default=None)
     ap.add_argument("--groundingdino-config", default=None)
     ap.add_argument("--groundingdino-checkpoint", default=None)
@@ -415,12 +511,16 @@ def main():
     ap.add_argument("--viz-fps", type=int, default=6)
     ap.add_argument("--block-stuck-target-after", type=int, default=24)
     ap.add_argument("--block-stuck-target-min-progress", type=float, default=0.25)
+    ap.add_argument(
+        "--success-distance",
+        type=float,
+        default=DEFAULT_SUCCESS_DISTANCE,
+        help="GOAT-Bench success threshold: STOP position within this Euclidean distance (m) of the goal instance (default 1.0).",
+    )
     args = ap.parse_args()
 
     scene_path, episode = pick_episode(ROOT / args.dataset_dir, args.split, args.scene, args.episode_index)
     dataset = load_json_gz(scene_path)
-    episode_tasks = episode.get("tasks", [])
-    goals_by_id, goals_by_category = _build_goat_goal_index(dataset.get("goals", {}))
     ig = load_goal_graph(ROOT / args.goal_graph_dir, args.split, scene_path, episode["episode_id"])
     goals = [g for g in ig.goal_nodes if isinstance(g, GoalNode)][: args.max_goals]
     if len(goals) < 2:
@@ -441,9 +541,17 @@ def main():
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
     config.perception.clip_device = args.clip_device
-    config.perception.heavy_enabled = bool(args.heavy_enabled)
+    config.perception.backend = args.perception_backend
+    config.perception.vlm_api_base = args.vlm_api_base
+    config.perception.vlm_model = args.vlm_model
+    config.perception.vlm_timeout = args.vlm_timeout
+    config.perception.heavy_enabled = bool(args.heavy_enabled or args.perception_backend == "vlm")
     if args.heavy_interval is not None:
         config.perception.heavy_interval = args.heavy_interval
+    if args.heavy_reground_cooldown is not None:
+        config.perception.heavy_reground_cooldown = args.heavy_reground_cooldown
+    if args.heavy_near_goal_cooldown is not None:
+        config.perception.heavy_near_goal_cooldown = args.heavy_near_goal_cooldown
     if args.object_detection_threshold is not None:
         config.perception.object_detection_threshold = args.object_detection_threshold
     if args.groundingdino_config is not None:
@@ -470,7 +578,7 @@ def main():
         frame_dir.mkdir(parents=True, exist_ok=True)
     sim = make_sim(scene_file)
     sim_agent = sim.initialize_agent(0)
-    # Load GT object positions from semantic scene for SR/SPL computation
+    # Success metric: Euclidean distance from STOP position to target instance center(s).
     state = set_start_state(sim_agent, episode)
     origin = np.array(state.position, dtype=np.float32)
     executor = PathfinderExecutor()
@@ -479,6 +587,8 @@ def main():
     steps: list[dict[str, Any]] = []
     tasks: list[dict[str, Any]] = []
     task0_semantic_nodes: set[str] = set()
+    per_task_semantic_nodes: dict[int, set[str]] = {}
+    per_task_goal_label: dict[int, str] = {}
     try:
         for idx, goal in enumerate(goals):
             before = agent.memory_stats.copy()
@@ -489,32 +599,20 @@ def main():
             monitor_target_id = None
             monitor_start_step = len(steps)
             monitor_best_distance = None
-            # GT-based goal proximity tracking for SR/SPL
-            goal_object_name = goal.target_object.lower().strip()
-            # Support compound target names like "oven and stove"
-            goal_object_names = {goal_object_name}
-            if " and " in goal_object_name:
-                goal_object_names.update(p.strip() for p in goal_object_name.split(" and ") if p.strip())
-            if " or " in goal_object_name:
-                goal_object_names.update(p.strip() for p in goal_object_name.split(" or ") if p.strip())
             goal_min_distance = float("inf")
             goal_min_step = -1
             goal_stopped = False
             goal_stop_distance = float("inf")
+            distance_to_target = float("inf")
             goal_path_length = 0.0
             goal_prev_world = None
             memory_reuse_hits = 0
             semantic_reuse_hits = 0
             repeated_goal_reuse_hits = 0
-            # Precompute GT object positions for this goal (GOAT dataset preferred)
-            episode_task = episode_tasks[idx] if idx < len(episode_tasks) else None
-            gt_object_positions = _resolve_goat_gt_positions(
-                episode_task,
-                goal_object_names,
-                goals_by_id,
-                goals_by_category,
-                sim=sim,
-            )
+            goal_entries = _resolve_goat_subtask_goal_entries(dataset.get("goals", {}), episode, idx)
+            goal_instance_positions = _instance_positions_from_goal_entries(goal_entries)
+            goal_view_points = _view_points_from_goal_entries(goal_entries)
+            goal_object_ids = [str(g.get("object_id")) for g in goal_entries if g.get("object_id")]
             for _ in range(args.steps_per_goal):
                 rec, previous = run_step(
                     sim,
@@ -543,20 +641,28 @@ def main():
                 if is_semantic_node_id(target_id) and target_id in known_before:
                     semantic_reuse_hits += 1
                     rec["semantic_reuse"] = True
-                if idx == 3 and task0_semantic_nodes and target_id in task0_semantic_nodes:
-                    repeated_goal_reuse_hits += 1
-                    rec["repeated_goal_reuse"] = True
+                if idx > 0 and is_semantic_node_id(target_id):
+                    for prev_idx, prev_label in per_task_goal_label.items():
+                        if prev_idx < idx and prev_label == goal.target_object:
+                            prev_nodes = per_task_semantic_nodes.get(prev_idx, set())
+                            if target_id in prev_nodes:
+                                repeated_goal_reuse_hits += 1
+                                rec["repeated_goal_reuse"] = True
+                                break
                 target_distance = planar_target_distance(rec.get("position"), rec.get("target_position"))
                 rec["target_distance"] = target_distance
-                # GT-based goal proximity: agent world position to nearest GT object instance
                 world_pos_raw = rec.get("world_position")
-                if world_pos_raw is not None and gt_object_positions:
+                if world_pos_raw is not None and goal_instance_positions:
                     agent_world = np.asarray(world_pos_raw, dtype=np.float32)
-                    for gt_pos in gt_object_positions:
-                        d = float(np.linalg.norm(agent_world - gt_pos))
-                        if d < goal_min_distance:
-                            goal_min_distance = d
-                            goal_min_step = len(steps)
+                    distance_to_target = _euclidean_distance_to_instances(
+                        agent_world, goal_instance_positions,
+                    )
+                    if distance_to_target < goal_min_distance:
+                        goal_min_distance = distance_to_target
+                        goal_min_step = len(steps)
+                rec["distance_to_target"] = (
+                    round(float(distance_to_target), 4) if np.isfinite(distance_to_target) else None
+                )
                 rec["goal_min_distance"] = goal_min_distance
                 # Path length tracking (world coordinates)
                 world_pos = rec.get("world_position")
@@ -594,13 +700,7 @@ def main():
                 steps.append(rec)
                 if rec["low_action"] == "stop":
                     goal_stopped = True
-                    stop_world_raw = rec.get("world_position")
-                    if stop_world_raw is not None and gt_object_positions:
-                        stop_world = np.asarray(stop_world_raw, dtype=np.float32)
-                        goal_stop_distance = min(
-                            float(np.linalg.norm(stop_world - gt_pos))
-                            for gt_pos in gt_object_positions
-                        )
+                    goal_stop_distance = distance_to_target
                     break
             after = agent.memory_stats.copy()
             # Compute SPL: S_i * l_i / max(p_i, l_i)
@@ -609,32 +709,27 @@ def main():
             goal_success_bool = (
                 goal_stopped
                 and goal_stop_distance != float("inf")
-                and goal_stop_distance <= 1.0
+                and goal_stop_distance <= args.success_distance
             )
             if goal_success_bool and goal_path_length > 0:
-                # Find the shortest geodesic path to any GT instance of the target
-                if gt_object_positions and len(steps) > start:
+                if goal_view_points and len(steps) > start:
                     first_step = steps[start]
-                    start_world = np.asarray(first_step.get("world_position", first_step.get("position", [0, 0, 0])), dtype=np.float32)
+                    start_world = np.asarray(
+                        first_step.get("world_position", first_step.get("position", [0, 0, 0])),
+                        dtype=np.float32,
+                    )
                     if start_world.shape == (3,):
-                        try:
-                            from habitat_sim.nav import ShortestPath
-                            best_geodesic = float("inf")
-                            for gt_pos in gt_object_positions:
-                                sp = ShortestPath()
-                                sp.requested_start = start_world
-                                sp.requested_end = gt_pos
-                                if sim.pathfinder.find_path(sp):
-                                    if sp.geodesic_distance < best_geodesic:
-                                        best_geodesic = float(sp.geodesic_distance)
-                            if best_geodesic < float("inf") and best_geodesic > 0:
-                                goal_optimal_path = best_geodesic
-                        except Exception:
-                            pass
+                        best_geodesic = _goat_geodesic_distance_to_viewpoints(
+                            sim, start_world, goal_view_points,
+                        )
+                        if np.isfinite(best_geodesic) and best_geodesic > 0:
+                            goal_optimal_path = best_geodesic
             if goal_optimal_path is not None and goal_optimal_path > 0 and goal_path_length > 0:
                 goal_spl = round(goal_optimal_path / max(goal_path_length, goal_optimal_path), 4)
+            per_task_semantic_nodes[idx] = semantic_node_ids(agent)
+            per_task_goal_label[idx] = goal.target_object
             if idx == 0:
-                task0_semantic_nodes = semantic_node_ids(agent)
+                task0_semantic_nodes = per_task_semantic_nodes[0]
             tasks.append({
                 "task_index": idx,
                 "target_object": goal.target_object,
@@ -653,7 +748,11 @@ def main():
                 "goal_stopped": goal_stopped,
                 "goal_stop_distance": round(float(goal_stop_distance), 4) if goal_stop_distance != float("inf") else None,
                 "goal_min_distance": float(goal_min_distance) if goal_min_distance != float("inf") else None,
+                "goal_view_points": len(goal_view_points),
+                "goal_instance_count": len(goal_instance_positions),
+                "goal_object_ids": goal_object_ids,
                 "goal_success": goal_success_bool,
+                "goal_budget_steps": args.steps_per_goal,
                 "goal_path_length": round(goal_path_length, 4),
                 "goal_optimal_path": round(goal_optimal_path, 4) if goal_optimal_path is not None else None,
                 "goal_spl": goal_spl,
@@ -681,6 +780,21 @@ def main():
             "object": config.perception.object_threshold,
             "room": config.perception.room_threshold,
             "landmark": config.perception.landmark_threshold,
+            "success_distance": args.success_distance,
+            "steps_per_goal": args.steps_per_goal,
+            "distance_metric": "euclidean_to_instance_position_at_stop",
+            "success_requires_stop": True,
+            "success_spec": "goat_bench_readme",
+        },
+        "perception": {
+            "backend": config.perception.backend,
+            "heavy_enabled": config.perception.heavy_enabled,
+            "heavy_interval": config.perception.heavy_interval,
+            "heavy_reground_cooldown": config.perception.heavy_reground_cooldown,
+            "heavy_near_goal_cooldown": config.perception.heavy_near_goal_cooldown,
+            "vlm_api_base": config.perception.vlm_api_base,
+            "vlm_model": config.perception.vlm_model,
+            "vlm_timeout": config.perception.vlm_timeout,
         },
         "task_summaries": tasks,
         "steps": steps,
@@ -699,6 +813,7 @@ def main():
             "semantic_reuse_count": sum(t["semantic_reuse_hits"] for t in tasks),
             "semantic_node_count": agent.memory_stats["objects"] + agent.memory_stats["rooms"] + agent.memory_stats["landmarks"],
             "heavy_perception_calls": agent.memory_stats.get("heavy_perception_calls", 0),
+            "last_heavy": agent.memory_stats.get("last_heavy", {}),
             "object_merge_count": agent.memory_stats.get("object_merge_count", 0),
             "mean_object_confidence": agent.memory_stats.get("mean_object_confidence", 0.0),
             "collision_like_count": sum(1 for st in steps if st.get("collision_like")),

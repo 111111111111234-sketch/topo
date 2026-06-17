@@ -1,6 +1,6 @@
 """Rule-based semantic scorer for navigation decision (Phase 2)."""
 
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 import numpy as np
 
 from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode
@@ -25,6 +25,7 @@ def compute_semantic_bias(
     agent_position: np.ndarray,
     normalize: bool = True,
     current_node_id: Optional[str] = None,
+    explored_rooms_no_target: Optional[Dict[str, int]] = None,
 ) -> np.ndarray:
     """Compute semantic bias scores for candidate nodes.
 
@@ -42,7 +43,8 @@ def compute_semantic_bias(
         if node is None:
             scores.append(0.0)
             continue
-        score = _score_node(current_goal, node, topo_map, agent_position)
+        score = _score_node(current_goal, node, topo_map, agent_position,
+                            explored_rooms_no_target=explored_rooms_no_target)
         scores.append(score)
 
     scores = np.array(scores, dtype=np.float32)
@@ -62,6 +64,7 @@ def _score_node(
     node: SemanticNode,
     topo_map: DynamicTopoMap,
     agent_pos: np.ndarray,
+    explored_rooms_no_target: Optional[dict] = None,
 ) -> float:
     """Score a single node against the current goal."""
     score = 0.0
@@ -81,6 +84,14 @@ def _score_node(
         score -= 0.1 * min(node.visit_count, 5) / 5.0
 
     score += 0.1 * node.confidence
+
+    if explored_rooms_no_target:
+        room_id = node.attributes.get("room_id")
+        if room_id and room_id in explored_rooms_no_target:
+            score -= 0.6
+        elif node.node_type == NodeType.ROOM and node.node_id in explored_rooms_no_target:
+            score -= 0.6
+
     return score
 
 
@@ -119,7 +130,29 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
         if sims:
             score += 0.2 * max(sims)
 
+    landmark_labels = {
+        str(l).strip().lower()
+        for l in (goal.landmarks or [])
+        if str(l).strip()
+    }
+    if landmark_labels:
+        node_label = (node.label or "").strip().lower()
+        if node.node_type in (NodeType.LANDMARK, NodeType.OBJECT) and node_label in landmark_labels:
+            score += 0.35 if node.node_type == NodeType.LANDMARK else 0.25
+
     if node.node_type in (NodeType.WAYPOINT_VISITED, NodeType.WAYPOINT_FRONTIER):
+        view_labels = {
+            str(x).strip().lower()
+            for x in node.attributes.get("view_object_labels", []) or []
+            if str(x).strip()
+        }
+        view_room = node.attributes.get("view_room_label")
+        if view_room and str(view_room).strip().lower() not in ("", "unknown"):
+            view_labels.add(str(view_room).strip().lower())
+        if goal.room_prior and view_labels & {r.lower() for r in goal.room_prior}:
+            score += 0.2
+        if landmark_labels and view_labels & landmark_labels:
+            score += 0.15
         neighbors = topo_map.get_neighbors(node.node_id)
         for neighbor_id in neighbors:
             neighbor = topo_map.get_node(neighbor_id)

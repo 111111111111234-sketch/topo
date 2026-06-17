@@ -24,6 +24,9 @@ class TriggerState:
     last_heavy_summary_step: Optional[int] = None
     goal_local_step: int = 0
     reground_state: str = "idle"
+    nav_phase: str = "explore"
+    nearest_anchor_dist: float = float("inf")
+    confirm_window_active: bool = False
 
 
 class PerceptionTrigger:
@@ -51,16 +54,38 @@ class PerceptionTrigger:
             return False, "missing_rgb"
 
         if state.reground_state in ("scanning", "searching"):
-            return True, "local_regrounding"
+            reground_cd = max(1, int(getattr(pcfg, "heavy_reground_cooldown", pcfg.heavy_interval)))
+            if state.last_heavy_step is None or step - state.last_heavy_step >= reground_cd:
+                return True, "local_regrounding"
+            return False, "local_regrounding_cooldown"
+
+        if state.nav_phase in ("confirm", "approach", "approach_confirm"):
+            if state.nav_phase == "approach_confirm" and state.confirm_window_active:
+                confirm_cd = 1
+            elif state.nav_phase == "approach_confirm":
+                confirm_cd = 2
+            else:
+                confirm_cd = max(1, int(getattr(pcfg, "heavy_near_goal_cooldown", 3)))
+            if state.last_heavy_step is None or step - state.last_heavy_step >= confirm_cd:
+                return True, f"phase_{state.nav_phase}"
+            return False, f"phase_{state.nav_phase}_cooldown"
+
+        if state.nav_phase == "nav_to_anchor" and state.nearest_anchor_dist <= 0.8:
+            confirm_cd = max(1, int(getattr(pcfg, "heavy_near_goal_cooldown", 3)))
+            if state.last_heavy_step is None or step - state.last_heavy_step >= confirm_cd:
+                return True, "pre_confirm_near_anchor"
 
         if has_near_goal_object:
-            min_confirm_cd = 3
+            min_confirm_cd = max(1, int(getattr(pcfg, "heavy_near_goal_cooldown", 3)))
             if state.last_heavy_step is None or step - state.last_heavy_step >= min_confirm_cd:
                 return True, "stop_confirmation_near_goal"
 
         interval = max(1, int(pcfg.heavy_interval))
 
         if state.last_heavy_step is not None and step - state.last_heavy_step < interval:
+            # v5: explore-with-no-memory previously fired at interval//2 which
+            # roughly doubled VLM calls during long searches. Keep it at the
+            # full interval to curb the call-count blow-up.
             return False, "cooldown"
 
         if state.last_heavy_step is None and state.goal_local_step <= max(1, int(pcfg.heavy_goal_warmup_steps)):

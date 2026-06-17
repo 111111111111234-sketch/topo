@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 
-from conftopo.perception.heavy_perceiver import ObjectObservation
+from conftopo.perception.heavy_perceiver import ObjectObservation, normalize_bbox
 from conftopo.perception.perception_report import PerceptionReport
 from conftopo.perception.vlm_backend import VLMBackendBase
 
@@ -30,9 +30,14 @@ class VLMPerceiver:
         visual_embed: Optional[np.ndarray] = None,
         step_id: int = 0,
         context: Optional[str] = None,
+        mode: str = "explore",
     ) -> PerceptionReport:
-        """Query the VLM and convert the response to a PerceptionReport."""
-        raw = self._backend.query(rgb, goal_text, context=context)
+        """Query the VLM and convert the response to a PerceptionReport.
+
+        *mode*: ``"explore"`` for discovery or ``"confirm"`` for strict
+        stop verification.  Selects the system prompt sent to the VLM.
+        """
+        raw = self._backend.query(rgb, goal_text, context=context, mode=mode)
         return self._build_report(raw, visual_embed, step_id)
 
     @staticmethod
@@ -47,12 +52,23 @@ class VLMPerceiver:
 
         objects = []
         for o in data.get("objects", []):
+            relation = o.get("relation", o.get("spatial_relation", []))
+            if isinstance(relation, str):
+                relation = [relation]
+            if relation is None:
+                relation = []
             objects.append(ObjectObservation(
                 label=str(o.get("label", "")),
-                bbox=[float(v) for v in o.get("bbox", [0, 0, 0, 0])],
+                bbox=normalize_bbox(o.get("bbox")),
                 confidence=float(o.get("confidence", 0.0)),
                 source="vlm",
                 step_id=step_id,
+                visible=bool(o.get("visible", True)),
+                visibility=str(o.get("visibility", "unknown")),
+                bearing=str(o.get("bearing", "unknown")),
+                range_bin=str(o.get("range", o.get("range_bin", "unknown"))),
+                spatial_relation=[str(x) for x in relation],
+                room_context=o.get("room_context"),
             ))
 
         return PerceptionReport(
