@@ -31,7 +31,7 @@ from run_goat_topo_trace import (
     snapshot_perception,
     snapshot_topo,
 )
-from conftopo.agents.goat_agent import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor

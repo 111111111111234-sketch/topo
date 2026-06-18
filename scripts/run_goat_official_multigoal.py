@@ -31,7 +31,7 @@ import numpy as np
 
 from run_goat_minimal import ROOT, quat_to_heading, rgb_to_embedding
 
-from conftopo.agents.goat_agent import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 from conftopo.perception import ClipRuntimeEncoder

@@ -25,7 +25,7 @@ import numpy as np
 
 from run_goat_minimal import ROOT, find_scene_file, load_json_gz, make_sim, normalize_quat
 from run_goat_topo_trace import load_goal_graph, pick_episode, quat_to_heading, rgb_to_embedding, snapshot_topo
-from conftopo.agents.goat_agent import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
@@ -196,6 +196,7 @@ def run_step(
     record_topo: bool,
     frame_dir: Path | None = None,
     step_index: int = 0,
+    goal_instance_positions: list[np.ndarray] | None = None,
 ):
     obs = sim.get_sensor_observations()
     state = sim_agent.get_state()
@@ -209,11 +210,17 @@ def run_step(
     rgb_embed = rgb_to_embedding(rgb) if use_placeholder else encoder.encode_image(rgb)
     world_position = np.asarray(state.position, dtype=np.float32)
     world_heading = quat_to_heading([state.rotation.real, *list(state.rotation.imag)])
+    instance_distance = None
+    if goal_instance_positions:
+        instance_distance = _euclidean_distance_to_instances(
+            world_position, goal_instance_positions,
+        )
     out = agent.step({
         "rgb": rgb,
         "rgb_embed": rgb_embed,
         "position": world_position,
         "heading": world_heading,
+        "instance_distance": instance_distance,
     })
     rel_position = world_position - origin
     collision = tracker.update(previous_action, rel_position)
@@ -627,6 +634,7 @@ def main():
                     args.record_topo or args.viz,
                     frame_dir=frame_dir,
                     step_index=len(steps),
+                    goal_instance_positions=goal_instance_positions,
                 )
                 rec["task_index"] = idx
                 rec["goal"] = {

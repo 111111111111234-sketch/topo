@@ -20,7 +20,7 @@ from run_goat_minimal import (
     rgb_to_embedding,
     make_sim,
 )
-from conftopo.agents.goat_agent import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 from conftopo.perception import ClipRuntimeEncoder
