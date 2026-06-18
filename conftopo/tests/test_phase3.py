@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from conftopo.agents.goat_agent import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.confidence import ConfidenceFactors, compute_semantic_confidence
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, EdgeType, NodeType
@@ -928,7 +928,7 @@ def test_two_stage_planner_keeps_goal_object_anchored():
 
 
 def test_heavy_summary_labels_exclude_vocabulary():
-    from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
+    from conftopo.agents.goat_agent_new import DEFAULT_HEAVY_OBJECT_VOCABULARY
     config = ConfTopoConfig()
     config.perception.heavy_enabled = True
     agent = ConfTopoGOATAgent(config)
@@ -954,7 +954,7 @@ def test_heavy_summary_labels_exclude_vocabulary():
 
 def test_heavy_labels_align_with_room_structure_target():
     """Room structure target replaces broad vocab with its contains_labels."""
-    from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
+    from conftopo.agents.goat_agent_new import DEFAULT_HEAVY_OBJECT_VOCABULARY
     config = ConfTopoConfig()
     config.perception.heavy_enabled = True
     agent = ConfTopoGOATAgent(config)
@@ -992,7 +992,7 @@ def test_heavy_labels_align_with_room_structure_target():
 
 def test_heavy_labels_align_with_portal_structure_target():
     """Portal/structural-landmark target injects structural vocabulary."""
-    from conftopo.agents.goat_agent import (
+    from conftopo.agents.goat_agent_new import (
         DEFAULT_HEAVY_OBJECT_VOCABULARY,
         DEFAULT_STRUCTURAL_HEAVY_VOCABULARY,
     )
@@ -1033,7 +1033,7 @@ def test_heavy_labels_align_with_portal_structure_target():
 
 
 def test_heavy_align_with_structure_target_disabled_uses_default_vocab():
-    from conftopo.agents.goat_agent import DEFAULT_HEAVY_OBJECT_VOCABULARY
+    from conftopo.agents.goat_agent_new import DEFAULT_HEAVY_OBJECT_VOCABULARY
     config = ConfTopoConfig()
     config.perception.heavy_enabled = True
     config.perception.heavy_align_with_structure_target = False

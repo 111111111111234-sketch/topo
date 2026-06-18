@@ -102,6 +102,9 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
     if node.node_type == NodeType.OBJECT and goal.target_embedding is not None:
         sim = cosine_similarity(goal.target_embedding, node.embedding)
         score += 0.4 * sim
+        failed = int(node.attributes.get("failed_approach_count", 0))
+        if failed > 0:
+            score -= 0.3 * min(failed, 3)
 
     if node.node_type == NodeType.ROOM and goal.room_prior:
         if node.label in goal.room_prior:

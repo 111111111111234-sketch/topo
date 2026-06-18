@@ -1135,6 +1135,8 @@ class DynamicTopoMap:
                 continue
             if node.attributes.get("cross_goal_preserved"):
                 continue
+            if node.attributes.get("semantic_role") == "object_anchor":
+                continue
             if float(node.attributes.get("target_relevance", 0.0)) > 0:
                 continue
             if pos is not None and node.node_type in (NodeType.OBJECT, NodeType.LANDMARK):

@@ -26,7 +26,6 @@ class TriggerState:
     reground_state: str = "idle"
     nav_phase: str = "explore"
     nearest_anchor_dist: float = float("inf")
-    confirm_window_active: bool = False
 
 
 class PerceptionTrigger:
@@ -60,10 +59,8 @@ class PerceptionTrigger:
             return False, "local_regrounding_cooldown"
 
         if state.nav_phase in ("confirm", "approach", "approach_confirm"):
-            if state.nav_phase == "approach_confirm" and state.confirm_window_active:
+            if state.nav_phase == "approach_confirm":
                 confirm_cd = 1
-            elif state.nav_phase == "approach_confirm":
-                confirm_cd = 2
             else:
                 confirm_cd = max(1, int(getattr(pcfg, "heavy_near_goal_cooldown", 3)))
             if state.last_heavy_step is None or step - state.last_heavy_step >= confirm_cd:
