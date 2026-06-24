@@ -75,6 +75,7 @@ class PerceptionConfig:
     groundingdino_device: str = "cpu"
     groundingdino_text_threshold: float = 0.25
     clip_model: str = "ViT-B/32"
+    clip_image_model: str = "RN50"  # GOAT official image-goal CLIP (1024-dim)
     clip_device: str = "auto"
     object_threshold: float = 0.28
     object_detection_threshold: float = 0.40

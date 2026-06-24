@@ -9,9 +9,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from conftopo.perception.light_perceiver import LightPerceiver, cosine_sim
 from conftopo.agents.etpnav_agent import ConfTopoETPNavAgent
 from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents.goat_agent import ConfTopoGOATAgent as MainGOATAgent
 from conftopo.config import ConfTopoConfig
-from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode
-from conftopo.core.dynamic_topo_map import NodeType
+from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode, Relation
+from conftopo.core.dynamic_topo_map import DynamicTopoMap, EdgeType, NodeType
+from conftopo.core.hypothesis_pool import Hypothesis
+from conftopo.core.rule_scorer import compute_semantic_bias
+from conftopo.perception.heavy_perceiver import ObjectObservation
 
 
 def test_cosine_sim():
@@ -197,6 +201,170 @@ def test_goat_agent_basic():
     print(f"  ✓ step 2: {stats2}")
 
 
+def test_goal_relation_near_scores_matching_object_higher():
+    """near(reference) boosts target objects that are near existing reference nodes."""
+    topo = DynamicTopoMap()
+    chair_near = topo.add_node(NodeType.OBJECT, [0, 0, 0], label="chair", confidence=0.7)
+    table = topo.add_node(NodeType.OBJECT, [1.0, 0, 0], label="table", confidence=0.7)
+    chair_far = topo.add_node(NodeType.OBJECT, [8.0, 0, 0], label="chair", confidence=0.7)
+    topo.add_edge(chair_near, table, EdgeType.OBSERVED_AT)
+
+    graph = InstructionGraph(
+        goal_type="object_goal",
+        goal_nodes=[GoalNode(target_object="chair", relations=[Relation("near", "table")])],
+    )
+    scores = compute_semantic_bias(
+        graph,
+        topo,
+        [chair_near, chair_far],
+        agent_position=np.zeros(3, dtype=np.float32),
+        normalize=False,
+    )
+    assert scores[0] > scores[1]
+    assert graph.total_goals == 1
+    assert len(topo.get_nodes_by_type(NodeType.OBJECT)) == 3
+    print("  ✓ relation scoring: near(table)")
+
+
+def test_goal_relation_reference_context_scores_room_and_waypoint():
+    """Relation references in summaries / waypoint views provide search context."""
+    topo = DynamicTopoMap()
+    room_with_ref = topo.add_node(
+        NodeType.ROOM,
+        [0, 0, 0],
+        label="dining room",
+        attributes={"summary_type": "room_region", "contains_labels": ["table"]},
+    )
+    room_without_ref = topo.add_node(
+        NodeType.ROOM,
+        [1, 0, 0],
+        label="bedroom",
+        attributes={"summary_type": "room_region", "contains_labels": ["bed"]},
+    )
+    wp_with_ref = topo.add_node(
+        NodeType.WAYPOINT_FRONTIER,
+        [0, 0, 1],
+        attributes={"view_object_labels": ["table"]},
+    )
+    wp_without_ref = topo.add_node(
+        NodeType.WAYPOINT_FRONTIER,
+        [1, 0, 1],
+        attributes={"view_object_labels": ["bed"]},
+    )
+    graph = InstructionGraph(
+        goal_type="object_goal",
+        goal_nodes=[GoalNode(target_object="chair", relations=[Relation("near", "table")])],
+    )
+    scores = compute_semantic_bias(
+        graph,
+        topo,
+        [room_with_ref, room_without_ref, wp_with_ref, wp_without_ref],
+        agent_position=np.zeros(3, dtype=np.float32),
+        normalize=False,
+    )
+    assert scores[0] > scores[1]
+    assert scores[2] > scores[3]
+    print("  ✓ relation scoring: context candidates")
+
+
+def test_main_goat_runtime_priors_do_not_mutate_goalgraph():
+    """Category priors are runtime context, not written back into the input GoalNode."""
+    agent = MainGOATAgent(ConfTopoConfig())
+    goal = GoalNode(target_object="sink")
+    agent.set_new_goal(goal)
+    assert goal.room_prior == []
+    assert goal.landmarks == []
+    assert {"kitchen", "bathroom"} <= set(agent._effective_room_priors(agent.instruction_graph.get_current_goal()))
+    heavy_labels = set(agent._heavy_labels())
+    assert "sink" in heavy_labels
+    assert agent._build_vlm_context(agent.instruction_graph.get_current_goal(), "explore")
+    print("  ✓ runtime priors do not mutate GoalGraph")
+
+
+def test_main_goat_goal_proposals_wrap_candidates():
+    """Planner boundary uses GoalProposal as runtime hypothesis over map nodes."""
+    agent = MainGOATAgent(ConfTopoConfig())
+    agent.set_new_goal(GoalNode(target_object="chair", relations=[Relation("near", "table")]))
+    obj_id = agent.topo_map.add_node(NodeType.OBJECT, [0, 0, 0], label="chair")
+    table_id = agent.topo_map.add_node(NodeType.OBJECT, [1, 0, 0], label="table")
+    agent.topo_map.add_edge(obj_id, table_id, EdgeType.OBSERVED_AT)
+    obj = agent.topo_map.get_node(obj_id)
+
+    proposals = agent.generate_goal_proposals([obj], np.array([1.0], dtype=np.float32))
+    scored = agent.score_goal_proposals(proposals)
+    best = agent.select_best_proposal(scored)
+
+    assert best is not None
+    assert best.goal_id == "goal_0"
+    assert best.candidate_node_id == obj_id
+    assert best.candidate_type == "object"
+    assert best.target_position is not None
+    assert best.source == "object_memory"
+    print("  ✓ GoalProposal wraps planner candidates")
+
+
+def test_main_goat_hypothesis_promotes_only_after_confirmed_observation():
+    """Weak hypotheses become ObjectNode only after heavy/VLM confirmation."""
+    class FakeHeavy:
+        def perceive(self, *args, **kwargs):
+            return [
+                ObjectObservation(
+                    label="chair",
+                    bbox=[0.1, 0.2, 0.4, 0.8],
+                    confidence=0.85,
+                    source="heavy",
+                    step_id=2,
+                )
+            ]
+
+    agent = MainGOATAgent(ConfTopoConfig())
+    agent.set_new_goal(GoalNode(target_object="chair"))
+    cur_vp = agent.topo_map.add_node(NodeType.WAYPOINT_VISITED, [0, 0, 0], label="wp")
+    agent._cur_vp_id = cur_vp
+    agent._position = np.zeros(3, dtype=np.float32)
+    agent._cur_rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+    agent.set_heavy_perceiver(FakeHeavy())
+
+    first = agent.hypothesis_pool.add_or_update(Hypothesis(
+        id="",
+        goal_id="goal_0",
+        kind="object",
+        label="chair",
+        source="clip",
+        anchor_node_id=cur_vp,
+        position=np.zeros(3, dtype=np.float32),
+        score=0.6,
+        confidence=0.6,
+        first_seen_step=1,
+        last_seen_step=1,
+    ))
+    second = agent.hypothesis_pool.add_or_update(Hypothesis(
+        id="",
+        goal_id="goal_0",
+        kind="object",
+        label="chair",
+        source="clip",
+        anchor_node_id=cur_vp,
+        position=np.zeros(3, dtype=np.float32),
+        score=0.62,
+        confidence=0.62,
+        first_seen_step=2,
+        last_seen_step=2,
+    ))
+    assert first.id == second.id
+    assert second.status == "needs_verify"
+    assert len(agent.topo_map.get_nodes_by_type(NodeType.OBJECT)) == 0
+
+    room_label = agent._add_heavy_object_nodes(cur_vp, None)
+    assert room_label is None or isinstance(room_label, str)
+    objects = agent.topo_map.get_nodes_by_type(NodeType.OBJECT)
+    assert len(objects) == 1
+    promoted = agent.hypothesis_pool.to_debug_list(goal_id="goal_0")
+    assert promoted[0]["status"] == "promoted"
+    assert promoted[0]["promoted_node_id"] == objects[0].node_id
+    print("  ✓ hypothesis promotes only after confirmed observation")
+
+
 def test_goat_agent_multi_goal():
     """Test GOAT agent multi-goal: memory NOT cleared between goals."""
     config = ConfTopoConfig()
@@ -232,12 +400,12 @@ def test_goat_agent_multi_goal():
 
 
 def test_goat_agent_semantic_node_creation():
-    """High-similarity perception creates object/room/landmark nodes."""
+    """High-similarity CLIP creates hints/landmarks but not formal object nodes."""
     config = ConfTopoConfig()
     config.perception.object_threshold = 0.1
     config.perception.room_threshold = 0.1
     config.perception.landmark_threshold = 0.1
-    agent = ConfTopoGOATAgent(config)
+    agent = MainGOATAgent(config)
 
     D = 512
     embed = np.zeros(D, dtype=np.float32)
@@ -259,14 +427,21 @@ def test_goat_agent_semantic_node_creation():
         "rgb_embed": embed.copy(),
     })
     stats = agent.memory_stats
-    assert stats["objects"] >= 1
+    assert stats["objects"] == 0
     assert stats["landmarks"] >= 1
     visited = agent.topo_map.get_visited()
     assert visited, "expected at least one visited waypoint"
     assert visited[0].attributes.get("view_room_label") == "kitchen"
+    assert visited[0].attributes.get("clip_goal_hypotheses")
     assert stats["rooms"] == 0, "clip room nodes should live on waypoint context only"
     assert action.get("target_node_id") is not None
     assert len(action.get("candidate_ids", [])) > 0
+    clip_props = [p for p in action.get("goal_proposals", []) if p.get("source") == "clip"]
+    assert clip_props
+    assert all(p.get("requires_verification") is True for p in clip_props)
+    assert all(p.get("can_stop") is False for p in clip_props)
+    assert all(float(p.get("score", 0.0)) <= 0.65 for p in clip_props)
+    assert action.get("hypotheses")
     print(f"  ✓ semantic nodes: {stats}")
 
 

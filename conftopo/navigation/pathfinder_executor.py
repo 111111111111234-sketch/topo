@@ -97,6 +97,26 @@ class PathfinderExecutor:
                 target_relative_arr = world_to_relative(target_world, origin_world_arr)
         except Exception:
             snapped_target_world = None
+
+        if snapped_target_world is None:
+            return ReachabilityProbe(
+                False,
+                reason="snap_failed",
+                target_position_relative=target_relative_arr.round(4).tolist(),
+                target_node_id=target_node_id,
+            )
+
+        try:
+            if not sim.pathfinder.is_navigable(snapped_target_world):
+                return ReachabilityProbe(
+                    False,
+                    reason="not_navigable",
+                    target_position_relative=target_relative_arr.round(4).tolist(),
+                    target_node_id=target_node_id,
+                )
+        except Exception:
+            pass
+
         start_relative = world_to_relative(start_world, origin_world_arr)
 
         planar_dist = float(np.linalg.norm((target_relative_arr - start_relative)[[0, 2]]))

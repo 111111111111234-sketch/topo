@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class VLMBackendBase(ABC):
     """Abstract interface for Vision-Language Model backends."""
 
+    supports_multi_image: bool = True
     @abstractmethod
     def query(
         self,
@@ -29,18 +30,29 @@ class VLMBackendBase(ABC):
         goal_text: str,
         context: Optional[str] = None,
         mode: str = "explore",
+        previous_rgb: Optional[np.ndarray] = None,
+        action_history: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Send an image + goal description to the VLM and return parsed JSON.
 
         *mode* selects the system prompt: ``"explore"`` for discovery,
-        ``"confirm"`` for strict stop verification.
+        ``"confirm"`` for strict stop verification.  When *previous_rgb*
+        is provided, backends that support multi-image may use it for
+        temporal comparison (e.g. relative_progress).
 
         Returns a dict with the canonical schema::
 
             {
                 "room": {"label": str, "confidence": float},
-                "objects": [{"label": str, "bbox": [x1,y1,x2,y2], "confidence": float}, ...],
+                "objects": [{"label": str, "bbox": [x1,y1,x2,y2], "attributes": {"color": {"value": str, "confidence": float}, "shape": {"value": str, "confidence": float}}, "confidence": float}, ...],
                 "goal_visible": bool,
+                "goal_match_confidence": float,
+                "target_direction": str,
+                "target_visibility": str,
+                "apparent_scale": str,
+                "relative_progress": str,
+                "stop_candidate": bool,
+                "recommended_action": str,
                 "goal_reason": str,
                 "portals": [str, ...],
                 "scene_summary": str,
@@ -74,6 +86,8 @@ class FakeVLMBackend(VLMBackendBase):
         goal_text: str,
         context: Optional[str] = None,
         mode: str = "explore",
+        previous_rgb: Optional[np.ndarray] = None,
+        action_history: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         self.calls += 1
         return dict(self._response)
@@ -114,6 +128,7 @@ class Qwen3VLBackend(VLMBackendBase):
         self._model = model
         self._timeout = timeout
         self._max_tokens = max_tokens
+        self.supports_multi_image = False
         self._client: Any = None
 
     def _ensure_client(self):
@@ -138,10 +153,31 @@ class Qwen3VLBackend(VLMBackendBase):
         goal_text: str,
         context: Optional[str] = None,
         mode: str = "explore",
+        previous_rgb: Optional[np.ndarray] = None,
+        action_history: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         self._ensure_client()
+
+        # Single-image backends: query current and previous separately, merge.
+        if previous_rgb is not None and not self.supports_multi_image:
+            primary = self._query_single_image(
+                rgb, goal_text, context, mode, action_history,
+            )
+            secondary = self._query_single_image(
+                previous_rgb, goal_text, context, mode, action_history,
+            )
+            sec_progress = str(secondary.get("relative_progress", "uncertain")).lower()
+            if sec_progress != "uncertain":
+                primary["relative_progress"] = sec_progress
+            return primary
+
         b64_img = _rgb_to_base64_jpeg(rgb)
-        user_text = build_user_prompt(goal_text, context, mode=mode)
+        has_previous = bool(previous_rgb is not None and self.supports_multi_image)
+        user_text = build_user_prompt(
+            goal_text, context, mode=mode,
+            has_previous_image=has_previous,
+            action_history=list(action_history or []),
+        )
 
         messages = [
             {"role": "system", "content": get_system_prompt(mode)},
@@ -159,6 +195,11 @@ class Qwen3VLBackend(VLMBackendBase):
             },
         ]
 
+        return self._query_single_image_raw(messages)
+
+
+    def _query_single_image_raw(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Execute a single VLM query and return the parsed JSON response."""
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -170,5 +211,31 @@ class Qwen3VLBackend(VLMBackendBase):
         except Exception as exc:
             logger.warning("VLM query failed: %s", exc)
             raw_text = ""
-
         return parse_vlm_json(raw_text)
+
+    def _query_single_image(
+        self,
+        rgb: np.ndarray,
+        goal_text: str,
+        context: Optional[str] = None,
+        mode: str = "explore",
+        action_history: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build a single-image message and query the VLM."""
+        b64_img = _rgb_to_base64_jpeg(rgb)
+        user_text = build_user_prompt(
+            goal_text, context, mode=mode,
+            has_previous_image=False,
+            action_history=list(action_history or []),
+        )
+        messages = [
+            {"role": "system", "content": get_system_prompt(mode)},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ]
+        return self._query_single_image_raw(messages)

@@ -116,11 +116,17 @@ class LightPerceiver:
         else:
             self.landmark_text_embeds = None
 
-    def perceive(self, visual_embed: np.ndarray) -> Dict:
+    def perceive(
+        self,
+        visual_embed: np.ndarray,
+        goal_visual_embed: Optional[np.ndarray] = None,
+    ) -> Dict:
         """Score current visual embedding against all semantic categories.
 
         Args:
             visual_embed: CLIP visual embedding [D] or [V, D] (V views)
+            goal_visual_embed: optional separate embed for image-goal matching
+                (e.g. RN50 1024-dim when room/landmark use ViT-B/32 512-dim)
 
         Returns:
             dict with room_scores, room_label, goal_scores, landmark_scores, etc.
@@ -132,6 +138,15 @@ class LightPerceiver:
             pooled = visual_embed.mean(axis=0)
         else:
             pooled = visual_embed
+
+        if goal_visual_embed is not None:
+            goal_pooled = (
+                goal_visual_embed.mean(axis=0)
+                if goal_visual_embed.ndim == 2
+                else goal_visual_embed
+            )
+        else:
+            goal_pooled = pooled
 
         # Room classification
         if self.room_text_embeds is not None:
@@ -148,7 +163,7 @@ class LightPerceiver:
 
         # Goal object matching
         if self.goal_text_embeds is not None:
-            goal_sims = cosine_sim(pooled, self.goal_text_embeds)  # [N_goals]
+            goal_sims = cosine_sim(goal_pooled, self.goal_text_embeds)  # [N_goals]
             goal_scores = list(zip(self.goal_labels, goal_sims.tolist()))
             goal_scores.sort(key=lambda x: x[1], reverse=True)
             result["goal_scores"] = goal_scores
@@ -170,7 +185,8 @@ class LightPerceiver:
 
         # Per-view scoring (for multi-view input)
         if visual_embed.ndim == 2 and self.goal_text_embeds is not None:
-            per_view_goal_sims = cosine_sim(visual_embed, self.goal_text_embeds)  # [V, N_goals]
+            goal_views = goal_visual_embed if goal_visual_embed is not None else visual_embed
+            per_view_goal_sims = cosine_sim(goal_views, self.goal_text_embeds)  # [V, N_goals]
             result["per_view_goal_sims"] = per_view_goal_sims  # for directional preference
             result["best_view_idx"] = int(per_view_goal_sims.max(axis=1).argmax())
         else:

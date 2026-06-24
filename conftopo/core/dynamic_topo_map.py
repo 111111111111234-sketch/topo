@@ -19,14 +19,19 @@ from conftopo.core.region_rooms import (
     room_for_labeled_waypoint,
 )
 
+from conftopo.core.object_memory_pool import ObjectMemoryPool
+
 
 class NodeType(Enum):
     WAYPOINT_VISITED = "waypoint_visited"
     WAYPOINT_FRONTIER = "waypoint_frontier"
     WAYPOINT_CANDIDATE = "waypoint_candidate"
+    WAYPOINT_APPROACH = "waypoint_approach"
     LANDMARK = "landmark"
     OBJECT = "object"
     ROOM = "room"
+    OBJECT_SUMMARY = "object_summary"
+    GOAL_REGION = "goal_region"
 
 
 class EdgeType(Enum):
@@ -35,6 +40,10 @@ class EdgeType(Enum):
     BELONGS_TO = "belongs_to"
     VISIBLE_FROM = "visible_from"
     ADJACENT_TO = "adjacent_to"  # traversable link in semantic-structural layer
+    IN_ROOM = "in_room"          # object is located in this room
+    NEAR = "near"                # object is spatially near another object/landmark
+    ANCHORED_TO = "anchored_to"  # object's anchor waypoint
+    SERVES_OBJECT = "serves_object"  # ApproachPoint -> Object
 
 _PORTAL_LABEL_PRIORITY = (
     "door", "hallway", "entrance", "corridor", "arch", "gate", "opening",
@@ -95,6 +104,16 @@ def _angle_delta(a: float, b: float) -> float:
 def _normalize_angle(angle: float) -> float:
     """Normalize angle to [-pi, pi]."""
     return float((angle + np.pi) % (2 * np.pi) - np.pi)
+
+
+def _heading_to_action_hint(
+    directions: dict, node_a: str, node_b: str, dist: float,
+) -> str:
+    if not directions:
+        return f"move {dist:.1f}m"
+    dir_data = directions.get(node_a) or {}
+    label = str(dir_data.get("direction_label", "forward"))
+    return f"go {label} {dist:.1f}m"
 
 
 def _heading_to_direction_label(heading_rad: float) -> str:
@@ -196,6 +215,8 @@ class DynamicTopoMap:
         self._last_granularity_debug: Dict[str, int] = {}
 
         self._last_visibility_debug: Dict[str, int] = {}
+
+        self._object_memory = ObjectMemoryPool(self)
     @property
     def num_nodes(self) -> int:
         return len(self._nodes)
@@ -207,6 +228,11 @@ class DynamicTopoMap:
     def step(self):
         """Advance internal step counter."""
         self._current_step += 1
+
+
+    @property
+    def object_memory(self) -> "ObjectMemoryPool":
+        return self._object_memory
 
     def _generate_id(self, prefix: str = "n") -> str:
         self._node_counter += 1
@@ -285,6 +311,9 @@ class DynamicTopoMap:
         node_b: str,
         edge_type: EdgeType,
         weight: float = 1.0,
+        *,
+        relation: str = "",
+        confidence: float = 0.5,
     ):
         """Add a typed edge between two nodes."""
         if node_a in self._nodes and node_b in self._nodes:
@@ -295,6 +324,11 @@ class DynamicTopoMap:
             )
             if edge_type == EdgeType.NAVIGABLE:
                 self._enrich_navigable_edge(node_a, node_b)
+            else:
+                self._enrich_semantic_edge(
+                    node_a, node_b, edge_type,
+                    relation=relation, confidence=confidence,
+                )
     #找与 node 直接相连的 node
     def _enrich_navigable_edge(self, node_a: str, node_b: str) -> None:
         """Add structured attributes to a NAVIGABLE edge (bidirectional)."""
@@ -319,17 +353,32 @@ class DynamicTopoMap:
         edge_data["traversability"] = max(1.0, float(edge_data.get("traversability", 1.0)))
         edge_data["visited_count"] = int(edge_data.get("visited_count", 0)) + 1
         edge_data["evidence"] = list(set(edge_data.get("evidence", []) + ["odometry"]))
+        edge_data["confidence"] = min(1.0, float(edge_data.get("traversability", 1.0)) * 0.6
+                                    + int(edge_data.get("visited_count", 0)) / 10.0 * 0.2 + 0.2)
         edge_data["directions"] = {
             node_a: {"to": node_b, "direction_label": label_ab, "heading_delta": round(heading_ab, 4)},
             node_b: {"to": node_a, "direction_label": label_ba, "heading_delta": round(heading_ba, 4)},
         }
+        edge_data["last_updated_step"] = self._current_step
+        edge_data["action_hint"] = _heading_to_action_hint(
+            edge_data.get("directions", {}),
+            node_a, node_b, float(dist),
+        )
         edge_data["description_type"] = "navigable_transition"
 
-    def reduce_edge_traversability(self, node_a: str, node_b: str, penalty: float = 0.3) -> None:
-        """Reduce traversability of the edge between *node_a* and *node_b*."""
-        if self.graph.has_edge(node_a, node_b):
-            edge = self.graph.edges[node_a, node_b]
-            edge["traversability"] = max(0.1, float(edge.get("traversability", 1.0)) - penalty)
+        def reduce_edge_traversability(self, node_a: str, node_b: str, penalty: float = 0.3) -> None:
+            """Reduce traversability of the edge between *node_a* and *node_b*."""
+            if self.graph.has_edge(node_a, node_b):
+                edge = self.graph.edges[node_a, node_b]
+                edge["traversability"] = max(0.1, float(edge.get("traversability", 1.0)) - penalty)
+                edge["last_updated_step"] = self._current_step
+
+        def increment_edge_blocked(self, node_a: str, node_b: str) -> None:
+            """Increment blocked_count when a navigable edge is blocked."""
+            if self.graph.has_edge(node_a, node_b):
+                edge = self.graph.edges[node_a, node_b]
+                edge["blocked_count"] = int(edge.get("blocked_count", 0)) + 1
+                edge["last_updated_step"] = self._current_step
 
     def _infer_passage_type(self, portal_node: Optional[SemanticNode], portal_label: str) -> str:
         """Infer passage type from portal node attributes and label."""
@@ -346,6 +395,22 @@ class DynamicTopoMap:
         if "corridor" in label or "hallway" in label:
             return "corridor"
         return "passage"
+
+
+    def _enrich_semantic_edge(
+        self,
+        node_a: str,
+        node_b: str,
+        edge_type: EdgeType,
+        relation: str = "",
+        confidence: float = 0.5,
+    ) -> None:
+        if not self.graph.has_edge(node_a, node_b):
+            return
+        edge_data = self.graph.edges[node_a, node_b]
+        edge_data["relation"] = str(relation)
+        edge_data["confidence"] = float(confidence)
+        edge_data["last_updated_step"] = self._current_step
 
     def _enrich_adjacent_edge(
         self,
@@ -471,10 +536,73 @@ class DynamicTopoMap:
             self._nodes[node_id].step_id = self._current_step
 
     def decay_all_confidences(self):
-        """Apply one step of decay to stale node confidences."""
+        """Apply staleness-driven decay rather than per-step multiplicative decay.
+
+        Per-step decay (×0.95 per step) is too aggressive for multi-goal
+        runs spanning hundreds of steps.  Instead, confidence is recomputed
+        from `compute_semantic_confidence` with a `staleness_steps` penalty,
+        so decay depends on how long ago the node was last observed, not
+        on the total run length.
+
+        Important nodes (object anchors, cross-goal preserved, etc.)
+        are exempted — same criteria as `prune_low_confidence`.
+        """
+        from conftopo.core.confidence import compute_semantic_confidence, ConfidenceFactors
         for node in self._nodes.values():
-            if node.step_id < self._current_step:
-                node.confidence *= self.confidence_decay
+            if node.step_id >= self._current_step:
+                continue
+            # Exempt important nodes (same criteria as prune_low_confidence)
+            if self._is_persistent_structure_node(node):
+                continue
+            if node.attributes.get("is_semantic_anchor"):
+                continue
+            if node.attributes.get("cross_goal_preserved"):
+                continue
+            if node.attributes.get("semantic_role") == "object_anchor":
+                continue
+            # P11: Protect confirmed objects from full decay
+            if node.node_type == NodeType.OBJECT:
+                if float(node.confidence) >= 0.55 or int(node.attributes.get("multi_view_count", 0)) >= 2:
+                    self._object_memory.update_state(node)
+                    continue
+            # P11: Protect confirmed objects even if not task-relevant
+            if node.node_type == NodeType.OBJECT:
+                if float(node.confidence) >= 0.55:
+                    self._object_memory.update_state(node)
+                    continue  # High-confidence objects survive
+                if int(node.attributes.get("multi_view_count", 0)) >= 2:
+                    self._object_memory.update_state(node)
+                    continue  # Multi-view confirmed objects survive
+                self._object_memory.update_state(node)
+                continue
+
+            staleness = self._current_step - node.step_id
+            if staleness < 1:
+                continue
+
+            if node.node_type in (NodeType.OBJECT, NodeType.LANDMARK, NodeType.ROOM):
+                detection_scores = node.attributes.get("detection_scores", [])
+                best_score = max(float(s) for s in detection_scores) if detection_scores else node.confidence
+                node.confidence = compute_semantic_confidence(ConfidenceFactors(
+                    detection_score=best_score,
+                    multi_view_count=int(node.attributes.get("multi_view_count", 1)),
+                    task_relevance=float(node.attributes.get("target_relevance", 0.0)),
+                    room_prior_score=float(node.attributes.get("room_prior_score", 0.0)),
+                    redundancy_penalty=float(node.attributes.get("redundancy_penalty", 0.0)),
+                    conflict_penalty=float(node.attributes.get("conflict_penalty", 0.0)),
+                    staleness_steps=staleness,
+                ))
+                # Tiered post-recomputation decay:
+                # task-relevant nodes decay very slowly (0.999/staleness step);
+                # environment objects use the default 0.995 built into
+                # compute_semantic_confidence already.
+                if float(node.attributes.get("target_relevance", 0.0)) > 0:
+                    node.confidence *= 0.999 ** staleness
+                if node.node_type == NodeType.OBJECT:
+                    self._object_memory.update_state(node)
+            else:
+                # Waypoint / frontier: gentle per-step decay (much slower than 0.95)
+                node.confidence *= 0.998
 
     # ==================== Object Observation Operations ====================
 
@@ -493,69 +621,43 @@ class DynamicTopoMap:
         room_prior_score: float = 0.0,
         source: str = "heavy",
         spatial_attrs: Optional[Dict[str, Any]] = None,
+        object_attrs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, bool]:
-        """Create or update an object node from an object-level observation.
-
-        Returns (node_id, merged_existing).
-        """
-        label = str(label)
-        pos = np.array(position, dtype=np.float32)
-        emb = np.array(embedding, dtype=np.float32) if embedding is not None else None
-        matches = self.find_nodes_within_radius(pos, self.merge_radius * 2.0, NodeType.OBJECT)
-        match = self._best_object_match(matches, label, bbox, emb, view_heading, pos, room_context)
-
-        if match is None:
-            attrs = self._new_object_attributes(
-                bbox=bbox,
-                confidence=confidence,
-                viewpoint_id=viewpoint_id,
-                view_heading=view_heading,
-                room_context=room_context,
-                source=source,
-                target_relevance=target_relevance,
-                room_prior_score=room_prior_score,
-                spatial_attrs=spatial_attrs,
-            )
-            node_id = self.add_node(
-                NodeType.OBJECT,
-                position=pos,
-                embedding=emb,
-                confidence=compute_semantic_confidence(ConfidenceFactors(
-                    detection_score=confidence,
-                    multi_view_count=1,
-                    task_relevance=target_relevance,
-                    room_prior_score=room_prior_score,
-                )),
-                label=label,
-                attributes=attrs,
-            )
-            if self._should_add_observation_edge(node_id, viewpoint_id, room_context):
-                self.add_edge(viewpoint_id, node_id, EdgeType.OBSERVED_AT)
-            anchor_pos = self._object_anchor_position(self._nodes[node_id])
-            best_pos = anchor_pos if anchor_pos is not None else self._compute_best_approach(node_id)
-            self._nodes[node_id].attributes["best_approach_position"] = best_pos.tolist()
-            return node_id, False
-
-        self._merge_object_observation(
-            match,
-            bbox=bbox,
-            confidence=confidence,
-            position=pos,
-            embedding=emb,
-            viewpoint_id=viewpoint_id,
-            view_heading=view_heading,
-            room_context=room_context,
-            source=source,
-            target_relevance=target_relevance,
-            room_prior_score=room_prior_score,
-            spatial_attrs=spatial_attrs,
+        obj_id, merged = self._object_memory.upsert(
+            label=label, bbox=bbox, confidence=confidence, position=position,
+            embedding=embedding, viewpoint_id=viewpoint_id, view_heading=view_heading,
+            room_context=room_context, target_relevance=target_relevance,
+            room_prior_score=room_prior_score, source=source,
+            spatial_attrs=spatial_attrs, object_attrs=object_attrs,
         )
-        if self._should_add_observation_edge(match.node_id, viewpoint_id, room_context):
-            self.add_edge(viewpoint_id, match.node_id, EdgeType.OBSERVED_AT)
-        anchor_pos = self._object_anchor_position(match)
-        best_pos = anchor_pos if anchor_pos is not None else self._compute_best_approach(match.node_id)
-        match.attributes["best_approach_position"] = best_pos.tolist()
-        return match.node_id, True
+        if viewpoint_id is not None and self._should_add_observation_edge(
+            obj_id, viewpoint_id, room_context,
+        ):
+            self.add_edge(viewpoint_id, obj_id, EdgeType.OBSERVED_AT)
+        
+        # P3: Sync ApproachPoint node
+        self._sync_approach_point(obj_id, viewpoint_id, position)
+        
+        # P4: Sync ObjectSummaryNode for this object's room
+        obj_node = self._nodes.get(obj_id)
+        if obj_node is not None:
+            room_context_raw = obj_node.attributes.get("room_context")
+            if room_context_raw and room_context_raw != "unknown":
+                for room in self.find_nodes_within_radius(position, self.summary_radius, NodeType.ROOM):
+                    if room.label == room_context_raw:
+                        self._sync_object_summary_from_room(room)
+                        break
+        
+        # P4: Sync GoalRegion for goal-relevant anchors
+        sem_role = obj_node.attributes.get("semantic_role") if obj_node else None
+        if sem_role == "object_anchor":
+            self._sync_goal_region(
+                goal_key=obj_node.label,
+                target_label=obj_node.label,
+                anchor_position=position,
+            )
+        
+        return obj_id, merged
 
     def _best_object_match(
         self,
@@ -634,6 +736,7 @@ class DynamicTopoMap:
         target_relevance: float,
         room_prior_score: float,
         spatial_attrs: Optional[Dict[str, Any]] = None,
+        object_attrs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         obs = {
             "bbox": [float(v) for v in bbox] if bbox is not None else None,
@@ -644,7 +747,10 @@ class DynamicTopoMap:
             "source": source,
         }
         clean_spatial = self._clean_object_spatial_attrs(spatial_attrs)
+        clean_object_attrs = self._clean_object_attributes(object_attrs)
         obs.update(clean_spatial)
+        if clean_object_attrs:
+            obs["attributes"] = dict(clean_object_attrs)
         attrs = {
             "bbox_observations": [obs],
             "detection_scores": [float(confidence)],
@@ -664,6 +770,8 @@ class DynamicTopoMap:
             "source": source,
         }
         attrs.update(clean_spatial)
+        if clean_object_attrs:
+            attrs["object_attributes"] = dict(clean_object_attrs)
         range_bin = clean_spatial.get("range_bin") or attrs.get("range_bin")
         self._record_best_anchor_score(attrs, bbox, range_bin, confidence)
         return attrs
@@ -673,7 +781,14 @@ class DynamicTopoMap:
         if not range_bin:
             return 0
         key = str(range_bin).strip().lower()
-        return {"near": 3, "medium": 2, "mid": 2, "far": 1}.get(key, 0)
+        return {
+            "close": 5,
+            "very_near": 4,
+            "near": 3,
+            "medium": 2,
+            "mid": 2,
+            "far": 1,
+        }.get(key, 0)
 
     @staticmethod
     def _bbox_area_from_list(bbox: Optional[List[float]]) -> float:
@@ -729,6 +844,47 @@ class DynamicTopoMap:
         attrs["best_anchor_score"] = {"range": rank, "bbox_area": bbox_area, "confidence": conf}
         attrs["best_anchor_step"] = self._current_step
 
+
+    def _sync_approach_point(
+        self,
+        obj_id: str,
+        viewpoint_id: Optional[str],
+        position: np.ndarray,
+    ) -> Optional[str]:
+        node = self._nodes.get(obj_id)
+        if node is None or node.node_type != NodeType.OBJECT:
+            return None
+        ap_pos = node.attributes.get("best_approach_position")
+        if ap_pos is None:
+            return None
+        ap_pos_arr = np.array(ap_pos, dtype=np.float32)
+
+        existing_ap_id = node.attributes.get("approach_point_id")
+        if existing_ap_id is not None and existing_ap_id in self._nodes:
+            existing = self._nodes[existing_ap_id]
+            moved = float(np.linalg.norm(existing.position - ap_pos_arr)) > 0.15
+            if moved:
+                existing.position = ap_pos_arr.copy()
+                existing.step_id = self._current_step
+            return existing_ap_id
+
+        ap_id = self.add_node(
+            NodeType.WAYPOINT_APPROACH,
+            position=ap_pos_arr,
+            confidence=float(node.confidence),
+            label=f"approach_{node.label}",
+            attributes={
+                "source_object_id": obj_id,
+                "object_label": node.label,
+                "created_step": self._current_step,
+            },
+        )
+        node.attributes["approach_point_id"] = ap_id
+        self.add_edge(ap_id, obj_id, EdgeType.SERVES_OBJECT)
+        if viewpoint_id is not None and viewpoint_id in self._nodes:
+            self.add_edge(viewpoint_id, ap_id, EdgeType.NAVIGABLE)
+        return ap_id
+
     def promote_object_anchor_if_better(
         self,
         node: SemanticNode,
@@ -768,6 +924,7 @@ class DynamicTopoMap:
         target_relevance: float,
         room_prior_score: float,
         spatial_attrs: Optional[Dict[str, Any]] = None,
+        object_attrs: Optional[Dict[str, Any]] = None,
     ) -> None:
         attrs = node.attributes
         obs = {
@@ -779,7 +936,10 @@ class DynamicTopoMap:
             "source": source,
         }
         clean_spatial = self._clean_object_spatial_attrs(spatial_attrs)
+        clean_object_attrs = self._clean_object_attributes(object_attrs)
         obs.update(clean_spatial)
+        if clean_object_attrs:
+            obs["attributes"] = dict(clean_object_attrs)
         attrs.setdefault("bbox_observations", []).append(obs)
         attrs.setdefault("detection_scores", []).append(float(confidence))
         if viewpoint_id is not None and viewpoint_id not in attrs.setdefault("viewpoints", []):
@@ -797,6 +957,12 @@ class DynamicTopoMap:
         attrs["target_relevance"] = max(float(attrs.get("target_relevance", 0.0)), float(target_relevance))
         attrs["room_prior_score"] = max(float(attrs.get("room_prior_score", 0.0)), float(room_prior_score))
         attrs.update(clean_spatial)
+        if clean_object_attrs:
+            merged_attrs = attrs.setdefault("object_attributes", {})
+            if isinstance(merged_attrs, dict):
+                merged_attrs.update(clean_object_attrs)
+            else:
+                attrs["object_attributes"] = dict(clean_object_attrs)
         low_scores = [s for s in attrs.get("detection_scores", []) if float(s) < 0.35]
         attrs["redundancy_penalty"] = max(0.0, (len(low_scores) - 1) / 5.0)
         attrs["conflict_penalty"] = self._nearby_conflict_penalty(node, position)
@@ -850,6 +1016,28 @@ class DynamicTopoMap:
         if relation is None:
             relation = []
         clean["spatial_relation"] = [str(x) for x in relation]
+        return clean
+
+    @staticmethod
+    def _clean_object_attributes(object_attrs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(object_attrs, dict):
+            return {}
+        clean: Dict[str, Any] = {}
+        for key, value in object_attrs.items():
+            if value is None:
+                continue
+            text_key = str(key).strip()
+            if not text_key:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                clean[text_key] = value
+            elif isinstance(value, (list, tuple)):
+                clean[text_key] = [
+                    x for x in value
+                    if isinstance(x, (str, int, float, bool)) and str(x).strip()
+                ]
+            else:
+                clean[text_key] = str(value)
         return clean
 
     def _compute_best_approach(self, object_node_id: str) -> np.ndarray:
@@ -1139,6 +1327,12 @@ class DynamicTopoMap:
                 continue
             if float(node.attributes.get("target_relevance", 0.0)) > 0:
                 continue
+            # P11: Protect confirmed objects even if not task-relevant
+            if node.node_type == NodeType.OBJECT:
+                if float(node.confidence) >= 0.55:
+                    continue  # High-confidence objects survive
+                if int(node.attributes.get("multi_view_count", 0)) >= 2:
+                    continue  # Multi-view confirmed objects survive
             if pos is not None and node.node_type in (NodeType.OBJECT, NodeType.LANDMARK):
                 dist = float(np.linalg.norm(node.position - pos))
                 if dist > self.far_prune_distance:
@@ -1150,6 +1344,8 @@ class DynamicTopoMap:
             else:
                 threshold = self.prune_threshold
             if node.confidence < threshold:
+                if node.node_type == NodeType.OBJECT:
+                    self._object_memory.update_state(node, expired=True)
                 to_remove.append(node.node_id)
         for nid in to_remove:
             self.remove_node(nid)
@@ -1385,6 +1581,72 @@ class DynamicTopoMap:
         self._mark_waypoint_roles(entrance_ids)
         return removed
 
+
+    def _sync_object_summary_from_room(self, room_node: SemanticNode) -> Optional[str]:
+        summary = room_node.attributes.get("semantic_summary", {})
+        contains = summary.get("contains_labels", {})
+        if not contains:
+            return None
+
+        existing_id = room_node.attributes.get("object_summary_node_id")
+        if existing_id is not None and existing_id in self._nodes:
+            existing = self._nodes[existing_id]
+            existing.attributes["contains_labels"] = dict(contains)
+            existing.step_id = self._current_step
+            return existing_id
+
+        obj_summary_id = self.add_node(
+            NodeType.OBJECT_SUMMARY,
+            position=room_node.position.copy(),
+            confidence=room_node.confidence,
+            label=f"summary_{room_node.label}",
+            attributes={
+                "room_node_id": room_node.node_id,
+                "contains_labels": dict(contains),
+                "created_step": self._current_step,
+            },
+        )
+        room_node.attributes["object_summary_node_id"] = obj_summary_id
+        self.add_edge(obj_summary_id, room_node.node_id, EdgeType.BELONGS_TO)
+        return obj_summary_id
+
+    def _sync_goal_region(
+        self,
+        goal_key: str,
+        target_label: str,
+        anchor_position: Optional[np.ndarray],
+    ) -> Optional[str]:
+        if anchor_position is None:
+            return None
+
+        nearest_room = self.find_nearest_node(anchor_position, NodeType.ROOM)
+        if nearest_room is None:
+            return None
+
+        region_label = nearest_room.label
+
+        for node in self.get_nodes_by_type(NodeType.GOAL_REGION):
+            if node.attributes.get("goal_key") == goal_key:
+                node.step_id = self._current_step
+                node.confidence = max(node.confidence, 0.6)
+                return node.node_id
+
+        goal_region_id = self.add_node(
+            NodeType.GOAL_REGION,
+            position=nearest_room.position.copy(),
+            confidence=0.6,
+            label=f"goal_region_{region_label}_{target_label}",
+            attributes={
+                "goal_key": goal_key,
+                "target_label": target_label,
+                "room_label": region_label,
+                "room_node_id": nearest_room.node_id,
+                "created_step": self._current_step,
+            },
+        )
+        self.add_edge(goal_region_id, nearest_room.node_id, EdgeType.BELONGS_TO)
+        return goal_region_id
+
     def _room_region_summaries(self) -> List[SemanticNode]:
         return [
             room for room in self.get_nodes_by_type(NodeType.ROOM)
@@ -1451,6 +1713,7 @@ class DynamicTopoMap:
         NodeType.WAYPOINT_VISITED,
         NodeType.WAYPOINT_FRONTIER,
         NodeType.WAYPOINT_CANDIDATE,
+        NodeType.WAYPOINT_APPROACH,
     )
 
     def _is_structural_landmark_node(self, node: SemanticNode) -> bool:
@@ -1482,12 +1745,16 @@ class DynamicTopoMap:
         return edges
 
     def structure_layer_nodes(self) -> List[SemanticNode]:
-        """Rooms + portals + structural landmarks that form the skeleton."""
+        """Rooms + portals + structural landmarks + summaries + goal regions."""
         out: List[SemanticNode] = []
         for node in self._nodes.values():
             if node.node_type == NodeType.ROOM and node.attributes.get("summary_type") == "room_region":
                 out.append(node)
             elif self._is_structural_landmark_node(node):
+                out.append(node)
+            elif node.node_type == NodeType.OBJECT_SUMMARY:
+                out.append(node)
+            elif node.node_type == NodeType.GOAL_REGION:
                 out.append(node)
         return out
 
@@ -1501,6 +1768,14 @@ class DynamicTopoMap:
                 continue
             if node_a in struct_ids and node_b in struct_ids:
                 edges.append((node_a, node_b, dict(data)))
+
+        # P2: Include IN_ROOM edges between structure layer nodes and OBJECTs
+        for node_a, node_b, data in self.graph.edges(data=True):
+            if data.get("edge_type") != EdgeType.IN_ROOM.value:
+                continue
+            if node_a in struct_ids or node_b in struct_ids:
+                edges.append((node_a, node_b, dict(data)))
+
         return edges
 
     def cross_layer_waypoint_room_edges(self) -> List[Tuple[str, str]]:
@@ -1676,11 +1951,15 @@ class DynamicTopoMap:
                 room.attributes["region_instance"] = inst["instance_suffix"]
                 room.attributes["waypoint_ids"] = inst["waypoint_ids"]
                 room.attributes["region_source"] = "waypoint_cluster"
+                if room.attributes.get("cross_goal_preserved"):
+                    room.attributes["cross_goal_preserved"] = True
             keep_ids.add(room.node_id)
             result.append(room)
 
         for room in list(self._room_region_summaries()):
             if room.node_id not in keep_ids:
+                if room.attributes.get("cross_goal_preserved"):
+                    continue
                 src = room.attributes.get("region_source")
                 if src == "waypoint_cluster" or str(room.node_id).startswith("region::"):
                     self.remove_node(room.node_id)
@@ -1697,6 +1976,8 @@ class DynamicTopoMap:
         }
         for room in list(self._room_region_summaries()):
             if room.node_id in keep_ids:
+                continue
+            if room.attributes.get("cross_goal_preserved"):
                 continue
             norm = normalize_region_label(room.label) or str(room.label or "").strip().lower()
             if norm in canonical_labels:

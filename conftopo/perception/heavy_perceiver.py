@@ -5,7 +5,7 @@ loaded lazily so Phase 2 CLIP-only execution and tests do not require model
 weights or the GroundingDINO package.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 import hashlib
 import os
@@ -54,7 +54,9 @@ class ObjectObservation:
     bearing: str = "unknown"
     range_bin: str = "unknown"
     spatial_relation: List[str] = None
+    bbox_confidence: str = "medium"
     room_context: Optional[str] = None
+    attributes: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.spatial_relation is None:
@@ -75,8 +77,10 @@ class ObjectObservation:
             "visibility": self.visibility,
             "bearing": self.bearing,
             "range_bin": self.range_bin,
+            "bbox_confidence": self.bbox_confidence,
             "spatial_relation": list(self.spatial_relation),
             "room_context": self.room_context,
+            "attributes": dict(self.attributes),
         }
 
     @classmethod
@@ -100,7 +104,9 @@ class ObjectObservation:
             bearing=str(data.get("bearing", "unknown")),
             range_bin=str(data.get("range_bin", data.get("range", "unknown"))),
             spatial_relation=[str(x) for x in relation],
+            bbox_confidence=str(data.get("bbox_confidence", "medium")),
             room_context=data.get("room_context"),
+            attributes=dict(data.get("attributes") or {}),
         )
 
 
@@ -213,6 +219,104 @@ class GroundingDINOBackend:
         image_pil = Image.fromarray(arr).convert("RGB")
         image_tensor, _ = transform(image_pil, None)
         return image_tensor
+
+
+
+def normalize_bbox_flexible(raw: Any) -> Optional[List[float]]:
+    """Like `normalize_bbox` but handles VLM-common output quirks:
+
+    - string-encoded lists (e.g. ``"[0.1, 0.2, 0.3, 0.4]"``)
+    - dicts with various key names
+    - lists of strings
+
+    Also adds strict validation that the original lacks:
+    - rejects NaN / inf
+    - clamps values slightly outside [0, 1] (logs a warning)
+    - rejects grossly out-of-range values
+    - rejects degenerate (zero-area) boxes
+    """
+    if raw is None:
+        return None
+    # String-encoded list
+    if isinstance(raw, str):
+        import ast, json
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(raw)
+                if isinstance(parsed, (list, tuple)) and len(parsed) >= 4:
+                    raw = parsed
+                    break
+            except Exception:
+                continue
+        else:
+            return None
+    # Dict format  (try common key-name conventions)
+    if isinstance(raw, dict):
+        for x1k, x2k in (("x1","x2"),("xmin","xmax"),("min_x","max_x"),
+                         ("left","right"),("bbox_x1","bbox_x2")):
+            x1 = raw.get(x1k, raw.get("bbox_"+x1k))
+            x2 = raw.get(x2k, raw.get("bbox_"+x2k))
+            if x1 is not None and x2 is not None:
+                for y1k, y2k in (("y1","y2"),("ymin","ymax"),("min_y","max_y"),
+                                 ("top","bottom"),("bbox_y1","bbox_y2")):
+                    y1 = raw.get(y1k, raw.get("bbox_"+y1k))
+                    y2 = raw.get(y2k, raw.get("bbox_"+y2k))
+                    if y1 is not None and y2 is not None:
+                        raw = [x1, y1, x2, y2]
+                        break
+                break
+        else:
+            return None
+    # List of strings → floats
+    if isinstance(raw, (list, tuple)):
+        try:
+            raw = [float(v) for v in raw[:4]]
+        except (TypeError, ValueError):
+            import logging
+            logging.getLogger("conftopo.perception").debug(
+                "normalize_bbox_flexible: non-numeric values in %r", raw)
+            return None
+    else:
+        return None
+
+    # --- strict validation ---
+    import math
+    clamped = False
+    out = []
+    for v in raw[:4]:
+        if not math.isfinite(v):
+            import logging
+            logging.getLogger("conftopo.perception").debug(
+                "normalize_bbox_flexible: NaN/inf in %r", raw)
+            return None
+        if v < -0.05 or v > 1.05:
+            # Grossly out of range – reject
+            import logging
+            logging.getLogger("conftopo.perception").debug(
+                "normalize_bbox_flexible: value %s out of range in %r", v, raw)
+            return None
+        if v < 0.0 or v > 1.0:
+            clamped = True
+        out.append(min(1.0, max(0.0, v)))
+
+    if out[2] <= out[0] or out[3] <= out[1]:
+        import logging
+        logging.getLogger("conftopo.perception").debug(
+            "normalize_bbox_flexible: degenerate box %r", out)
+        return None
+
+    area = (out[2] - out[0]) * (out[3] - out[1])
+    if area < 1e-4:
+        import logging
+        logging.getLogger("conftopo.perception").debug(
+            "normalize_bbox_flexible: near-zero area %r", out)
+        return None
+
+    if clamped:
+        import logging
+        logging.getLogger("conftopo.perception").debug(
+            "normalize_bbox_flexible: clamped %r → %r", raw, out)
+    return out
 
 
 def _as_numpy(value: Any) -> np.ndarray:

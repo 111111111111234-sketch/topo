@@ -24,7 +24,8 @@ import numpy as np
 from conftopo.config import ConfTopoConfig
 from conftopo.agents.base_agent import ConfTopoBaseAgent
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType, EdgeType, SemanticNode
-from conftopo.core.instruction_graph import InstructionGraph, GoalNode
+from conftopo.core.hypothesis_pool import Hypothesis, HypothesisPool
+from conftopo.core.instruction_graph import GoalProposal, InstructionGraph, GoalNode, normalize_goal_node
 from conftopo.core.landmark_roles import is_structural_label
 from conftopo.core.room_classifier import RoomClassifier, RoomClassifierConfig
 from conftopo.core.rule_scorer import compute_semantic_bias
@@ -35,6 +36,9 @@ from conftopo.perception.clip_gdino_report_builder import ClipGdinoReportBuilder
 from conftopo.perception.perception_trigger import PerceptionTrigger, TriggerState
 from conftopo.perception.vlm_perceiver import VLMPerceiver
 from conftopo.navigation.pathfinder_executor import GlobalGraphPlanner
+
+
+CLIP_PROPOSAL_SCORE_CAP = 0.65
 
 
 def _angle_delta(a: float, b: float) -> float:
@@ -222,7 +226,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates: List[Dict[str, Any]] = []
         self._last_navigation_event: Dict[str, Any] = {}
         self._last_plan_debug: Dict[str, Any] = {}
+        self._last_goal_proposals: List[GoalProposal] = []
+        self._last_clip_goal_proposals: List[GoalProposal] = []
+        self.hypothesis_pool = HypothesisPool()
         self._environment_landmark_labels: Set[str] = set()
+        self._runtime_room_prior: List[str] = []
+        self._runtime_landmarks: List[str] = []
         self._goal_local_step: int = 0
         self._goal_travel_distance: float = 0.0
         self._last_heavy_step: Optional[int] = None
@@ -312,7 +321,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._last_skipped_candidates = []
         self._last_navigation_event = {}
         self._last_plan_debug = {}
+        self._last_goal_proposals = []
+        self._last_clip_goal_proposals = []
+        self.hypothesis_pool.clear()
         self._last_structure_target_id: Optional[str] = None
+        self._runtime_room_prior = []
+        self._runtime_landmarks = []
         self._goal_local_step = 0
         self._goal_travel_distance = 0.0
         self._last_heavy_step = None
@@ -363,11 +377,51 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self.heavy_perceiver = perceiver
         self.config.perception.heavy_enabled = perceiver is not None
 
+    @staticmethod
+    def _dedupe_labels(labels: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for label in labels:
+            text = str(label).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+        return out
+
+    def _effective_room_priors(self, goal: Optional[GoalNode]) -> List[str]:
+        base = list(getattr(goal, "room_prior", []) or []) if goal is not None else []
+        return self._dedupe_labels(base + list(self._runtime_room_prior))
+
+    def _effective_landmarks(self, goal: Optional[GoalNode]) -> List[str]:
+        base = list(getattr(goal, "landmarks", []) or []) if goal is not None else []
+        return self._dedupe_labels(base + list(self._runtime_landmarks))
+
+    def _instruction_graph_with_effective_goal(self) -> Optional[InstructionGraph]:
+        if self.instruction_graph is None:
+            return None
+        goal = self.instruction_graph.get_current_goal()
+        if not isinstance(goal, GoalNode):
+            return self.instruction_graph
+        effective_goal = normalize_goal_node(goal)
+        effective_goal.room_prior = self._effective_room_priors(goal)
+        effective_goal.landmarks = self._effective_landmarks(goal)
+        return InstructionGraph(goal_type="object_goal", goal_nodes=[effective_goal])
+
+    def _goal_id_for_current_goal(self) -> str:
+        if self.instruction_graph is None:
+            return "goal_none"
+        return f"goal_{self.instruction_graph.current_idx}"
+
     def set_new_goal(self, goal: GoalNode):
         """Switch to a new goal within the same episode (memory preserved).
 
         This is the key for multi-goal: DynamicTopoMap is NOT cleared.
         """
+        goal = normalize_goal_node(goal)
         old_label = None
         if self.instruction_graph is not None:
             old_goal = self.instruction_graph.get_current_goal()
@@ -381,20 +435,21 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
         self.reset_keep_memory()
         self._clear_sticky("new_goal")
+        self._last_goal_proposals = []
+        self._last_clip_goal_proposals = []
+        self.hypothesis_pool.clear()
 
         self._previous_goal_label = old_label
         self._previous_goal_object_nodes = old_goal_nodes
 
-        # v5: backfill category search priors when the dataset goal has none,
-        # so exploration is biased toward likely rooms / landmarks.
+        # Runtime category priors are agent-side search context, not part of
+        # the original GoalGraph task prior.
+        self._runtime_room_prior = []
+        self._runtime_landmarks = []
         if not getattr(goal, "room_prior", None):
-            room_prior = _category_priors(goal.target_object, OBJECT_CATEGORY_ROOM_PRIORS)
-            if room_prior:
-                goal.room_prior = room_prior
+            self._runtime_room_prior = _category_priors(goal.target_object, OBJECT_CATEGORY_ROOM_PRIORS)
         if not getattr(goal, "landmarks", None):
-            landmark_prior = _category_priors(goal.target_object, OBJECT_CATEGORY_LANDMARK_PRIORS)
-            if landmark_prior:
-                goal.landmarks = landmark_prior
+            self._runtime_landmarks = _category_priors(goal.target_object, OBJECT_CATEGORY_LANDMARK_PRIORS)
 
         if self.instruction_graph is None:
             self.instruction_graph = InstructionGraph(
@@ -408,10 +463,16 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             labels=[goal.target_object],
             embeddings=goal.target_embedding[np.newaxis, :] if goal.target_embedding is not None else None,
         )
-        if goal.landmarks:
+        effective_landmarks = self._effective_landmarks(goal)
+        if effective_landmarks:
+            landmark_embeddings = (
+                goal.landmark_embeddings
+                if effective_landmarks == list(getattr(goal, "landmarks", []) or [])
+                else None
+            )
             self.perceiver.set_landmark_labels(
-                labels=goal.landmarks,
-                embeddings=goal.landmark_embeddings,
+                labels=effective_landmarks,
+                embeddings=landmark_embeddings,
             )
 
         # Reset target_relevance for non-current-goal objects, but preserve
@@ -517,6 +578,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return
 
         self._goal_local_step += 1
+        self.hypothesis_pool.decay(self.topo_map.current_step)
 
         # 1. Add/update visited waypoint
         cur_vp = self._add_visited_waypoint()
@@ -1055,6 +1117,50 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if len(tags) > 12:
             del tags[:-12]
 
+    def _record_clip_goal_hypotheses(self, cur_vp: str, room_label: Optional[str]) -> None:
+        """Store CLIP goal/landmark suspicions without creating map objects."""
+        node = self.topo_map.get_node(cur_vp)
+        if node is None or self._cur_report.source == "none":
+            return
+        goal_id = self._goal_id_for_current_goal()
+        pcfg = self.config.perception
+        hypotheses = node.attributes.setdefault("clip_goal_hypotheses", [])
+        for label, sim in self._cur_report.goal_scores:
+            sim = float(sim)
+            if sim < pcfg.object_threshold:
+                continue
+            clean_label = str(label).strip().lower()
+            entry = {
+                "hypothesis_id": None,
+                "label": clean_label,
+                "confidence": sim,
+                "step": self.topo_map.current_step,
+                "source": "clip",
+            }
+            if room_label and room_label != "unknown":
+                entry["room_label"] = room_label
+            hyp = self.hypothesis_pool.add_or_update(Hypothesis(
+                id="",
+                goal_id=goal_id,
+                kind="object",
+                label=clean_label,
+                source="clip",
+                anchor_node_id=cur_vp,
+                position=node.position.copy(),
+                score=sim,
+                confidence=sim,
+                attributes={"room_label": room_label} if room_label and room_label != "unknown" else {},
+                first_seen_step=self.topo_map.current_step,
+                last_seen_step=self.topo_map.current_step,
+                seen_count=1,
+                ttl=20,
+                trigger_reason="clip_goal_score",
+            ))
+            entry["hypothesis_id"] = hyp.id
+            hypotheses.append(entry)
+        if len(hypotheses) > 16:
+            del hypotheses[:-16]
+
     def _record_view_object_labels(self, cur_vp: str) -> None:
         """Store object labels seen from this waypoint for later search scoring."""
         node = self.topo_map.get_node(cur_vp)
@@ -1126,48 +1232,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     k: round(v, 4) for k, v in clf_result.scores.items()
                 }
 
-        # CLIP goal object nodes — skip when VLM is the primary object source
-        # to avoid duplicate / false-positive anchor nodes.
-        if pcfg.backend != "vlm":
-            for label, sim in self._cur_report.goal_scores:
-                sim = float(sim)
-                if sim < pcfg.object_threshold:
-                    continue
-                existing = self.topo_map.find_nodes_within_radius(
-                    self._position, radius=2.0, node_type=NodeType.OBJECT
-                )
-                matched = next(
-                    (
-                        o for o in existing
-                        if o.label == label and self._object_room_compatible(o, room_label)
-                    ),
-                    None,
-                )
-                if matched:
-                    matched.confidence = max(matched.confidence, sim)
-                    matched.step_id = self.topo_map.current_step
-                    self._update_object_room_context(matched, room_label)
-                    if self._cur_rgb_embed is not None:
-                        matched.embedding = self._cur_rgb_embed
-                else:
-                    clip_attrs = self._object_room_attributes(room_label, "light_clip")
-                    clip_attrs.update({
-                        "anchor_waypoint_id": cur_vp,
-                        "observed_from": cur_vp,
-                        "position_source": "anchor_waypoint",
-                    })
-                    vp_node = self.topo_map.get_node(cur_vp)
-                    clip_pos = vp_node.position.copy() if vp_node is not None else self._position.copy()
-                    obj_id = self.topo_map.add_node(
-                        NodeType.OBJECT,
-                        position=clip_pos,
-                        embedding=self._cur_rgb_embed,
-                        confidence=sim,
-                        label=label,
-                        attributes=clip_attrs,
-                    )
-                    self.topo_map.add_edge(cur_vp, obj_id, EdgeType.OBSERVED_AT)
-                    self._link_semantic_to_room_summary(obj_id, room_label)
+        self._record_clip_goal_hypotheses(cur_vp, room_label)
 
         # Navigation landmark: only goal/instruction hints, not environment vocabulary.
         for label, sim in self._cur_report.landmark_scores:
@@ -1292,10 +1357,13 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             for part in _split_compound_label(target):
                 labels.append(part)
             labels.extend(str(a) for a in getattr(goal, "attributes", []) if a)
-            labels.extend(str(lm) for lm in getattr(goal, "landmarks", []) if lm)
+            labels.extend(str(lm) for lm in self._effective_landmarks(goal) if lm)
         for label, sim in self._cur_report.goal_scores:
             if float(sim) >= self.config.perception.object_threshold:
                 labels.append(str(label))
+        for hyp in self.hypothesis_pool.get_top_for_vlm(self._goal_id_for_current_goal(), k=3):
+            if hyp.label:
+                labels.append(str(hyp.label))
 
         align = bool(getattr(self.config.perception, "heavy_align_with_structure_target", True))
         used_structure_vocab = False
@@ -1452,6 +1520,18 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 self._clear_sticky("search_no_progress")
 
     def _should_run_heavy_perception(self) -> Tuple[bool, str]:
+        goal_id = self._goal_id_for_current_goal()
+        top_hypotheses = self.hypothesis_pool.get_top_for_vlm(goal_id=goal_id, k=1)
+        if (
+            top_hypotheses
+            and top_hypotheses[0].status == "needs_verify"
+            and self.config.perception.heavy_enabled
+            and (self.heavy_perceiver is not None or self.vlm_perceiver is not None)
+            and self._cur_rgb is not None
+        ):
+            interval = max(1, int(self.config.perception.heavy_near_goal_cooldown))
+            if self._last_heavy_step is None or self.topo_map.current_step - self._last_heavy_step >= interval:
+                return True, "hypothesis_needs_verify"
         self._trigger_state.last_heavy_step = self._last_heavy_step
         self._trigger_state.last_heavy_summary_step = self._last_heavy_summary_step
         self._trigger_state.goal_local_step = self._goal_local_step
@@ -1513,8 +1593,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         if goal is None:
             return None
         parts: List[str] = []
-        room_priors = [str(r) for r in (getattr(goal, "room_prior", []) or []) if str(r).strip()]
-        landmark_priors = [str(l) for l in (getattr(goal, "landmarks", []) or []) if str(l).strip()]
+        room_priors = [str(r) for r in self._effective_room_priors(goal) if str(r).strip()]
+        landmark_priors = [str(l) for l in self._effective_landmarks(goal) if str(l).strip()]
         if room_priors:
             parts.append(f"Target likely found in: {', '.join(room_priors)}")
         if landmark_priors:
@@ -1524,6 +1604,11 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "Even if the goal is not visible, report any of these "
                 "landmarks/objects you see — they help narrow the search."
             )
+        top_hypotheses = self.hypothesis_pool.get_top_for_vlm(self._goal_id_for_current_goal(), k=3)
+        if top_hypotheses:
+            labels = ", ".join(h.label for h in top_hypotheses if h.label)
+            if labels:
+                parts.append(f"Weak hypotheses needing verification: {labels}")
         return "; ".join(parts) if parts else None
 
     def _add_heavy_object_nodes(self, cur_vp: str, room_label: Optional[str]) -> Optional[str]:
@@ -1603,9 +1688,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         self._cur_vlm_mode = vlm_mode
         goal = self.instruction_graph.get_current_goal() if self.instruction_graph else None
         room_label = self._cur_report.room_label if self._cur_report.source != "none" else None
-        room_priors = set(getattr(goal, "room_prior", []) or [])
+        room_priors = set(self._effective_room_priors(goal))
         merges = 0
         skipped_writes = 0
+        promoted_hypotheses: List[str] = []
         suppress_object_writes = backend_name == "vlm" and vlm_mode == "confirm"
         if suppress_object_writes:
             skipped_writes = len(observations)
@@ -1642,7 +1728,15 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 room_prior_score=room_prior_score,
                 source=obs.source,
                 spatial_attrs=spatial_attrs,
+                object_attrs=getattr(obs, "attributes", None),
             )
+            promoted = self.hypothesis_pool.promote_matching(
+                goal_id=self._goal_id_for_current_goal(),
+                label=obs.label,
+                anchor_node_id=cur_vp,
+                object_node_id=obj_id,
+            )
+            promoted_hypotheses.extend(h.id for h in promoted)
             self._link_semantic_to_room_summary(obj_id, room_label)
             if obs.source != "vlm":
                 summary_id = self.topo_map.mark_recovered_from_summary(
@@ -1666,12 +1760,22 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             if merged:
                 merges += 1
                 self._object_merge_count += 1
+        rejected_hypotheses: List[str] = []
+        if should_run and not observations and reason == "hypothesis_needs_verify":
+            rejected = self.hypothesis_pool.reject_goal_near_anchor(
+                goal_id=self._goal_id_for_current_goal(),
+                anchor_node_id=cur_vp,
+                reason="verification_no_detection",
+            )
+            rejected_hypotheses.extend(h.id for h in rejected)
         self._last_heavy_debug = {
             "ran": True,
             "reason": reason,
             "detections": len(observations),
             "labels": labels,
             "merged": merges,
+            "promoted_hypotheses": promoted_hypotheses,
+            "rejected_hypotheses": rejected_hypotheses,
             "skipped_writes": skipped_writes,
             "confirm_write_suppressed": suppress_object_writes,
             "structure_target_id": struct_target_id,
@@ -1813,16 +1917,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return False
         target_label = (getattr(goal, "target_object", "") or "").strip()
         target_parts = _split_compound_label(target_label) if target_label else set()
-        room_prior = {
-            str(r).strip().lower()
-            for r in (getattr(goal, "room_prior", []) or [])
-            if str(r).strip()
-        }
-        landmarks = {
-            str(l).strip().lower()
-            for l in (getattr(goal, "landmarks", []) or [])
-            if str(l).strip()
-        }
+        room_prior = {str(r).strip().lower() for r in self._effective_room_priors(goal) if str(r).strip()}
+        landmarks = {str(l).strip().lower() for l in self._effective_landmarks(goal) if str(l).strip()}
         node_label = (node.label or "").strip().lower()
 
         if node.node_type == NodeType.ROOM:
@@ -1898,8 +1994,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 return None
 
         ids = [node.node_id for node in struct_nodes]
+        scoring_graph = self._instruction_graph_with_effective_goal()
         scores = compute_semantic_bias(
-            goal_graph=self.instruction_graph,
+            goal_graph=scoring_graph or self.instruction_graph,
             topo_map=self.topo_map,
             candidate_node_ids=ids,
             agent_position=self._position,
@@ -2254,11 +2351,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         goal = self.instruction_graph.get_current_goal()
         if goal is None:
             return set()
-        return {
-            str(r).strip().lower()
-            for r in (getattr(goal, "room_prior", []) or [])
-            if str(r).strip()
-        }
+        return {str(r).strip().lower() for r in self._effective_room_priors(goal) if str(r).strip()}
 
     def _goal_context_landmark_priors(self) -> set:
         if self.instruction_graph is None:
@@ -2266,11 +2359,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         goal = self.instruction_graph.get_current_goal()
         if goal is None:
             return set()
-        return {
-            str(l).strip().lower()
-            for l in (getattr(goal, "landmarks", []) or [])
-            if str(l).strip()
-        }
+        return {str(l).strip().lower() for l in self._effective_landmarks(goal) if str(l).strip()}
 
     def _label_in_priors(self, label: Optional[str], priors: set) -> bool:
         if not label or not priors:
@@ -2317,6 +2406,62 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     labels.add(str(room_name).strip().lower())
         return labels
 
+    def _clip_hypotheses_for_node(self, node: SemanticNode) -> List[Dict[str, Any]]:
+        hyps: List[Dict[str, Any]] = []
+        goal_id = self._goal_id_for_current_goal()
+        anchor_ids = {node.node_id}
+        for neighbor_id in self.topo_map.get_neighbors(node.node_id):
+            anchor_ids.add(neighbor_id)
+        for hyp in self.hypothesis_pool.get_active(goal_id=goal_id, include_needs_verify=True):
+            if hyp.source != "clip" or hyp.anchor_node_id not in anchor_ids:
+                continue
+            hyps.append({
+                "id": hyp.id,
+                "label": hyp.label,
+                "confidence": hyp.confidence,
+                "score": hyp.score,
+                "status": hyp.status,
+                "source": hyp.source,
+                "anchor_node_id": hyp.anchor_node_id,
+                "seen_count": hyp.seen_count,
+                "trigger_reason": hyp.trigger_reason,
+            })
+        return hyps
+
+    def _clip_goal_score_for_node(self, node: SemanticNode) -> float:
+        if self.instruction_graph is None:
+            return 0.0
+        goal = self.instruction_graph.get_current_goal()
+        target = getattr(goal, "target_object", "") if goal is not None else ""
+        target_labels = _split_compound_label(str(target)) if target else set()
+        best = 0.0
+        for hyp in self._clip_hypotheses_for_node(node):
+            label = str(hyp.get("label", "")).strip().lower()
+            if not label or (target_labels and not _label_matches_goal(label, target_labels)):
+                continue
+            best = max(best, float(hyp.get("confidence", hyp.get("score", 0.0))))
+        return best
+
+    def _frontier_value_for_node(self, node: SemanticNode) -> float:
+        if node.node_type != NodeType.WAYPOINT_FRONTIER:
+            return 0.0
+        room_priors = self._goal_context_room_priors()
+        landmark_priors = self._goal_context_landmark_priors()
+        labels = set(self._waypoint_view_context_labels(node))
+        for neighbor_id in self.topo_map.get_neighbors(node.node_id):
+            neighbor = self.topo_map.get_node(neighbor_id)
+            if neighbor is not None:
+                labels.update(self._waypoint_view_context_labels(neighbor))
+        value = 0.0
+        clip_score = self._clip_goal_score_for_node(node)
+        if clip_score > 0.0:
+            value += min(1.0, clip_score)
+        if labels & room_priors:
+            value += 0.35
+        if labels & landmark_priors:
+            value += 0.30
+        return float(min(value, 1.5))
+
     def _nearest_context_landmark_dist(self, position: np.ndarray, landmark_priors: set) -> float:
         best = float("inf")
         for node in self.topo_map.get_nodes_by_type(NodeType.LANDMARK):
@@ -2347,8 +2492,6 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             return scores
         room_priors = self._goal_context_room_priors()
         landmark_priors = self._goal_context_landmark_priors()
-        if not room_priors and not landmark_priors:
-            return scores
 
         boosted = scores.astype(np.float32).copy()
         for i, node in enumerate(candidates):
@@ -2394,6 +2537,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
 
             if node.node_type == NodeType.WAYPOINT_FRONTIER:
                 boosted[i] += 0.35
+                frontier_value = self._frontier_value_for_node(node)
+                node.attributes["frontier_value"] = frontier_value
+                boosted[i] += frontier_value
                 near_ctx = self._nearest_context_landmark_dist(node.position, landmark_priors)
                 if near_ctx < 4.0:
                     boosted[i] += 0.8 * max(0.0, 1.0 - near_ctx / 4.0)
@@ -2429,6 +2575,157 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                     if node_dist > anchor_dist + 2.0:
                         boosted[i] -= 2.0
         return boosted
+
+    def _proposal_source_for_node(self, node: SemanticNode) -> str:
+        if node.node_type in (NodeType.WAYPOINT_VISITED, NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+            if self._clip_goal_score_for_node(node) > 0.0:
+                return "clip"
+        if node.node_type == NodeType.OBJECT:
+            return "object_memory"
+        if node.node_type == NodeType.ROOM:
+            return "room_prior"
+        if node.node_type == NodeType.WAYPOINT_FRONTIER:
+            return "frontier"
+        if node.node_type == NodeType.LANDMARK:
+            return "landmark_memory"
+        return "navigation_memory"
+
+    def _proposal_anchor_for_node(self, node: SemanticNode) -> Optional[str]:
+        attrs = node.attributes or {}
+        return (
+            attrs.get("anchor_waypoint_id")
+            or attrs.get("observed_from")
+            or attrs.get("room_id")
+            or attrs.get("anchor_room_id")
+        )
+
+    def _relation_refs_for_current_goal(self) -> set:
+        if self.instruction_graph is None:
+            return set()
+        goal = self.instruction_graph.get_current_goal()
+        refs = set()
+        for rel in getattr(goal, "relations", []) or []:
+            if str(getattr(rel, "relation_type", "")).strip().lower() != "near":
+                continue
+            ref = str(getattr(rel, "reference", "")).strip().lower()
+            if ref:
+                refs.add(ref)
+        return refs
+
+    def _proposal_relation_score(self, node: SemanticNode) -> float:
+        refs = self._relation_refs_for_current_goal()
+        if not refs:
+            return 0.0
+        labels = set()
+        if node.label:
+            labels.add(str(node.label).strip().lower())
+        for key in ("contains_labels", "view_object_labels"):
+            for label in node.attributes.get(key, []) or []:
+                if label:
+                    labels.add(str(label).strip().lower())
+        for neighbor_id in self.topo_map.get_neighbors(node.node_id):
+            neighbor = self.topo_map.get_node(neighbor_id)
+            if neighbor and neighbor.label:
+                labels.add(str(neighbor.label).strip().lower())
+        return 1.0 if labels & refs else 0.0
+
+    def _proposal_room_score(self, node: SemanticNode) -> float:
+        room_priors = self._goal_context_room_priors()
+        if not room_priors:
+            return 0.0
+        labels = set()
+        if node.node_type == NodeType.ROOM and node.label:
+            labels.add(str(node.label).strip().lower())
+        view_room = node.attributes.get("view_room_label")
+        if view_room:
+            labels.add(str(view_room).strip().lower())
+        room_id = node.attributes.get("room_id") or node.attributes.get("anchor_room_id")
+        if room_id:
+            room_node = self.topo_map.get_node(room_id)
+            if room_node and room_node.label:
+                labels.add(str(room_node.label).strip().lower())
+        return 1.0 if labels & room_priors else 0.0
+
+    def generate_goal_proposals(
+        self,
+        candidates: List[SemanticNode],
+        scores: np.ndarray,
+    ) -> List[GoalProposal]:
+        """Bind current GoalNode to runtime map candidates without creating instances."""
+        proposals: List[GoalProposal] = []
+        goal_id = self._goal_id_for_current_goal()
+        for idx, node in enumerate(candidates):
+            target_pos, _ = self._target_output_for_node(node)
+            target_arr = None if target_pos is None else np.asarray(target_pos, dtype=np.float32)
+            evidence_refs: List[Any] = []
+            clip_hyps = self._clip_hypotheses_for_node(node)
+            if clip_hyps:
+                evidence_refs.append({"type": "clip_hypotheses", "items": clip_hyps[-4:]})
+            frontier_value = float(node.attributes.get("frontier_value", 0.0))
+            if node.node_type == NodeType.WAYPOINT_FRONTIER:
+                evidence_refs.append({"type": "frontier_value", "value": frontier_value})
+            proposal = GoalProposal(
+                goal_id=goal_id,
+                candidate_node_id=node.node_id,
+                candidate_type=node.node_type.value,
+                anchor_node_id=self._proposal_anchor_for_node(node),
+                target_position=target_arr,
+                score=float(scores[idx]) if idx < len(scores) else 0.0,
+                semantic_score=float(scores[idx]) if idx < len(scores) else 0.0,
+                room_score=self._proposal_room_score(node),
+                relation_score=self._proposal_relation_score(node),
+                frontier_value=frontier_value,
+                source=self._proposal_source_for_node(node),
+                status="active",
+                evidence_refs=evidence_refs,
+            )
+            if proposal.source == "clip":
+                proposal.can_stop = False
+                proposal.requires_verification = True
+            proposals.append(proposal)
+        return proposals
+
+    def score_goal_proposals(self, proposals: List[GoalProposal]) -> List[GoalProposal]:
+        """Keep proposal scoring explicit while reusing the existing score pipeline."""
+        for proposal in proposals:
+            proposal.score = (
+                float(proposal.score)
+                + 0.05 * float(proposal.room_score)
+                + 0.05 * float(proposal.relation_score)
+                + 0.05 * float(proposal.reachability_score)
+                + 0.05 * float(proposal.frontier_value)
+            )
+            if proposal.source == "clip":
+                proposal.score = min(float(proposal.score), CLIP_PROPOSAL_SCORE_CAP)
+        return proposals
+
+    def select_best_proposal(self, proposals: List[GoalProposal]) -> Optional[GoalProposal]:
+        active = [p for p in proposals if p.status == "active"]
+        if not active:
+            return None
+        return max(active, key=lambda p: p.score)
+
+    @staticmethod
+    def _proposal_debug(proposals: List[GoalProposal]) -> List[Dict[str, Any]]:
+        debug = []
+        for p in proposals:
+            debug.append({
+                "goal_id": p.goal_id,
+                "candidate_node_id": p.candidate_node_id,
+                "candidate_type": p.candidate_type,
+                "anchor_node_id": p.anchor_node_id,
+                "score": round(float(p.score), 4),
+                "semantic_score": round(float(p.semantic_score), 4),
+                "room_score": round(float(p.room_score), 4),
+                "relation_score": round(float(p.relation_score), 4),
+                "reachability_score": round(float(p.reachability_score), 4),
+                "frontier_value": round(float(p.frontier_value), 4),
+                "source": p.source,
+                "status": p.status,
+                "can_stop": bool(p.can_stop),
+                "requires_verification": bool(p.requires_verification),
+            })
+        return debug
 
     def _current_room_id(self) -> Optional[str]:
         """Return the room node id the agent is currently inside, if any."""
@@ -2874,6 +3171,8 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         candidate_ids = primary_ids if primary_candidates else fallback_ids
 
         if not candidates:
+            self._last_goal_proposals = []
+            self._last_clip_goal_proposals = []
             self._last_plan_debug = self._debug_plan_state()
             self._last_stop_debug = {
                 "stop_allowed": False, "reason": "no_candidates",
@@ -2890,8 +3189,9 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
                 "structure_target_id": structure_target_id,
             }
 
+        scoring_graph = self._instruction_graph_with_effective_goal()
         scores = compute_semantic_bias(
-            goal_graph=self.instruction_graph,
+            goal_graph=scoring_graph or self.instruction_graph,
             topo_map=self.topo_map,
             candidate_node_ids=candidate_ids,
             agent_position=self._position,
@@ -2903,10 +3203,14 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
         scores = self._apply_reachability_components(candidates, scores)
         scores = self._apply_goal_driven_search_boost(candidates, scores)
         scores = self._apply_goal_latch_boost(candidates, scores)
+        proposals = self.score_goal_proposals(self.generate_goal_proposals(candidates, scores))
+        self._last_goal_proposals = proposals
+        self._last_clip_goal_proposals = [p for p in proposals if p.source == "clip"]
 
         sticky_plan = self._sticky_plan_if_valid(candidates, candidate_ids, scores)
         if sticky_plan is not None:
             sticky_plan["structure_target_id"] = structure_target_id
+            sticky_plan["goal_proposals"] = self._proposal_debug(proposals)
             sticky_plan.setdefault("plan_action", "navigate")
             self._last_stop_debug = {
                 "stop_allowed": False, "reason": "navigating",
@@ -2914,7 +3218,12 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             }
             return sticky_plan
 
-        best_idx = int(np.argmax(scores))
+        best_proposal = self.select_best_proposal(proposals)
+        best_idx = (
+            candidate_ids.index(best_proposal.candidate_node_id)
+            if best_proposal is not None and best_proposal.candidate_node_id in candidate_ids
+            else int(np.argmax(scores))
+        )
         best_node = candidates[best_idx]
         original_best_node = best_node
         best_node, best_idx = self._explore_frontier_fallback(
@@ -2936,6 +3245,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "skipped_candidates": self._last_skipped_candidates,
             "navigation_event": self._last_navigation_event,
             "structure_target_id": structure_target_id,
+            "selected_goal_proposal": (
+                best_proposal.candidate_node_id if best_proposal is not None else None
+            ),
+            "goal_proposals": self._proposal_debug(proposals),
             "explore_frontier_fallback": {
                 "used": used_explore_frontier_fallback,
                 "from_node_id": original_best_node.node_id,
@@ -2957,6 +3270,7 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "is_exploration": best_node.node_type == NodeType.WAYPOINT_FRONTIER,
             "scores": scores,
             "candidate_ids": candidate_ids,
+            "goal_proposals": self._proposal_debug(proposals),
             "sticky_debug": self._last_plan_debug,
             "structure_target_id": structure_target_id,
         }
@@ -2991,6 +3305,10 @@ class ConfTopoGOATAgent(ConfTopoBaseAgent):
             "target_node_id": plan_output.get("target_node_id"),
             "candidate_ids": plan_output.get("candidate_ids", []),
             "scores": plan_output.get("scores", []),
+            "goal_proposals": plan_output.get("goal_proposals", []),
+            "hypotheses": self.hypothesis_pool.to_debug_list(
+                goal_id=self._goal_id_for_current_goal(), limit=12,
+            ),
             "is_exploration": plan_output.get("is_exploration", True),
             "sticky_debug": plan_output.get("sticky_debug", self._last_plan_debug),
         }

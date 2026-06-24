@@ -1,7 +1,13 @@
 """ConfTopo perception modules."""
 
 from conftopo.perception.light_perceiver import LightPerceiver
-from conftopo.perception.clip_runtime import ClipRuntimeEncoder
+from conftopo.perception.clip_runtime import (
+    ClipRuntimeEncoder,
+    GoatModalityClipEncoder,
+    agent_current_goal_type,
+    encode_agent_rgb_embed,
+    encode_agent_image_goal_embed,
+)
 from conftopo.perception.heavy_perceiver import (
     FakeGroundingDINOBackend,
     GroundingDINOBackend,
@@ -17,6 +23,10 @@ from conftopo.perception.vlm_perceiver import VLMPerceiver
 __all__ = [
     "LightPerceiver",
     "ClipRuntimeEncoder",
+    "GoatModalityClipEncoder",
+    "agent_current_goal_type",
+    "encode_agent_rgb_embed",
+    "encode_agent_image_goal_embed",
     "HeavyPerceiver",
     "ObjectObservation",
     "GroundingDINOBackend",

@@ -7,6 +7,37 @@ from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, SemanticNode, NodeType
 
 
+def _norm_label(label: Optional[str]) -> str:
+    return str(label or "").strip().lower()
+
+
+def _split_compound_label(label: Optional[str]) -> set:
+    text = _norm_label(label)
+    if not text:
+        return set()
+    parts = {text}
+    for sep in (" and ", " or "):
+        if sep in text:
+            parts.update(p.strip() for p in text.split(sep) if p.strip())
+    return parts
+
+
+def _label_matches(label: Optional[str], targets: set) -> bool:
+    text = _norm_label(label)
+    if not text or not targets:
+        return False
+    if text in targets:
+        return True
+    for target in targets:
+        if text in target or target in text:
+            return True
+    words = {w for w in text.split() if len(w) > 2}
+    for target in targets:
+        if words & {w for w in target.split() if len(w) > 2}:
+            return True
+    return False
+
+
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two vectors."""
     if a is None or b is None:
@@ -98,10 +129,14 @@ def _score_node(
 def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopoMap) -> float:
     """Score a node for object-goal task."""
     score = 0.0
+    target_parts = _split_compound_label(getattr(goal, "target_object", None))
 
-    if node.node_type == NodeType.OBJECT and goal.target_embedding is not None:
-        sim = cosine_similarity(goal.target_embedding, node.embedding)
-        score += 0.4 * sim
+    if node.node_type == NodeType.OBJECT:
+        if _label_matches(node.label, target_parts):
+            score += 0.45
+        if goal.target_embedding is not None:
+            sim = cosine_similarity(goal.target_embedding, node.embedding)
+            score += 0.4 * sim
         failed = int(node.attributes.get("failed_approach_count", 0))
         if failed > 0:
             score -= 0.3 * min(failed, 3)
@@ -167,7 +202,90 @@ def _score_object_goal(goal: GoalNode, node: SemanticNode, topo_map: DynamicTopo
                     if sim > 0.5:
                         score += 0.2 * sim
 
+    score += _score_goal_relations(goal, node, topo_map, target_parts)
     return score
+
+
+def _relation_references(goal: GoalNode) -> set:
+    refs = set()
+    for rel in getattr(goal, "relations", []) or []:
+        if _norm_label(getattr(rel, "relation_type", "")) != "near":
+            continue
+        ref = _norm_label(getattr(rel, "reference", ""))
+        if ref:
+            refs.add(ref)
+    return refs
+
+
+def _node_context_labels(node: SemanticNode) -> set:
+    labels = {_norm_label(node.label)} if _norm_label(node.label) else set()
+    attrs = node.attributes or {}
+    for key in ("contains_labels", "view_object_labels", "scene_vocabulary"):
+        for item in attrs.get(key, []) or []:
+            if isinstance(item, dict):
+                item = item.get("label") or item.get("name") or item.get("type")
+            text = _norm_label(item)
+            if text:
+                labels.add(text)
+    summary = attrs.get("semantic_summary", {}) or {}
+    contains = summary.get("contains_labels", {}) if isinstance(summary, dict) else {}
+    if isinstance(contains, dict):
+        labels.update(_norm_label(k) for k in contains.keys() if _norm_label(k))
+    return labels
+
+
+def _near_reference_node(
+    node: SemanticNode,
+    topo_map: DynamicTopoMap,
+    refs: set,
+    radius: float = 3.0,
+) -> bool:
+    if not refs:
+        return False
+    for candidate_type in (NodeType.OBJECT, NodeType.LANDMARK):
+        for other in topo_map.get_nodes_by_type(candidate_type):
+            if other.node_id == node.node_id or other.attributes.get("folded"):
+                continue
+            if not _label_matches(other.label, refs):
+                continue
+            if float(np.linalg.norm(other.position - node.position)) <= radius:
+                return True
+    for neighbor_id in topo_map.get_neighbors(node.node_id):
+        neighbor = topo_map.get_node(neighbor_id)
+        if neighbor is not None and _label_matches(neighbor.label, refs):
+            return True
+    return False
+
+
+def _score_goal_relations(
+    goal: GoalNode,
+    node: SemanticNode,
+    topo_map: DynamicTopoMap,
+    target_parts: set,
+) -> float:
+    refs = _relation_references(goal)
+    if not refs:
+        return 0.0
+
+    if node.node_type == NodeType.OBJECT:
+        if _label_matches(node.label, target_parts) and _near_reference_node(node, topo_map, refs):
+            return 0.35
+        return 0.0
+
+    labels = _node_context_labels(node)
+    if labels & refs:
+        if node.node_type == NodeType.ROOM:
+            return 0.18
+        if node.node_type in (NodeType.WAYPOINT_VISITED, NodeType.WAYPOINT_FRONTIER, NodeType.WAYPOINT_CANDIDATE):
+            return 0.16
+        if node.node_type == NodeType.LANDMARK:
+            return 0.12
+
+    for neighbor_id in topo_map.get_neighbors(node.node_id):
+        neighbor = topo_map.get_node(neighbor_id)
+        if neighbor is not None and _label_matches(neighbor.label, refs):
+            return 0.12
+    return 0.0
 
 
 def _score_route_goal(goal: SubGoal, node: SemanticNode, topo_map: DynamicTopoMap) -> float:

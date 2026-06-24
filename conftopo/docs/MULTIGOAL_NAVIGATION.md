@@ -167,7 +167,24 @@ _goal_local_step += 1
 6. decay / merge / prune / assign_waypoint_to_room
 ```
 
-**OBJECT 位置**：所有 object（VLM / GroundingDINO / CLIP）使用观测 waypoint 作为
+当前边界已经调整为：
+
+```text
+CLIP
+-> HypothesisPool / waypoint debug context / frontier_value
+
+VLM / GroundingDINO
+-> ObjectObservation
+-> DynamicTopoMap OBJECT
+```
+
+因此：
+
+- CLIP 不再直接创建正式 `OBJECT` 节点。
+- 正式 `OBJECT` 写入只来自 heavy / VLM confirmed observation。
+- `clip_goal_hypotheses` 仅作为 debug cache，主流程由 `HypothesisPool` 管理短期怀疑。
+
+**OBJECT 位置**：所有写入到 `DynamicTopoMap` 的 confirmed object 都使用观测 waypoint 作为
 semantic anchor position（`position_source = "anchor_waypoint"`），不做 bbox depth 估计。
 
 **Heavy 感知触发优先级**（`_should_run_heavy_perception`）：
@@ -200,6 +217,28 @@ structure_target = _select_structure_target()   # ROOM / portal LANDMARK
 → sticky_plan_if_valid or argmax 选最高分
 → _target_output_for_node() 输出 target_position
 ```
+
+当前在 `compute_semantic_bias` 之后，还会显式生成：
+
+```text
+GoalProposal
+```
+
+也就是：
+
+```text
+GoalNode
+-> map candidates
+-> GoalProposal candidates
+-> select_best_proposal()
+```
+
+这使 planner 的输入单位更清楚：
+
+- `GoalNode` 不是实例。
+- `ObjectNode / Room / Frontier` 是环境记忆。
+- `GoalProposal` 是运行时假设。
+- `GoalProposal(source="clip")` 必须验证，不能直接 stop，且 score 有上限。
 
 **候选过滤**（`_candidate_skip_reason`）：
 
@@ -235,6 +274,24 @@ score = object_match(0.55*sim)
       + confidence_bonus(0.1*conf)
       + structure_anchor_bonus
 ```
+
+除此之外，当前 planner 还显式引入：
+
+```text
+frontier_value
+```
+
+其作用是表达：
+
+```text
+这个 frontier 是否携带更强的目标相关探索价值
+```
+
+主要证据来源：
+
+- CLIP goal hint
+- room prior context
+- landmark prior context
 
 ### 4.4 Sticky Target（防振荡）
 

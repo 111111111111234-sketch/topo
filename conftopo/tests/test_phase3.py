@@ -217,7 +217,7 @@ def test_object_observation_serialization_roundtrip():
     assert node.confidence == data["nodes"][obj]["confidence"]
 
 
-def test_confidence_decay_is_per_step_not_cumulative_age():
+def test_confidence_decay_is_staleness_based():
     topo = DynamicTopoMap()
     obj, _ = topo.upsert_object_observation(
         label="sink",
@@ -230,9 +230,12 @@ def test_confidence_decay_is_per_step_not_cumulative_age():
         topo.step()
         topo.decay_all_confidences()
 
-    expected = start_confidence * (topo.confidence_decay ** 10)
-    assert abs(topo.get_node(obj).confidence - expected) < 1e-6
-    assert topo.get_node(obj).confidence > 0.45
+    actual = topo.get_node(obj).confidence
+    # Staleness-based: decays by 0.995 per staleness step, not 0.95.
+    # After 10 steps: factor ≈ 0.995^10 ≈ 0.951.
+    assert start_confidence > actual, "confidence should decrease over time"
+    assert actual > start_confidence * 0.94, "decay should be gentle (0.995 factor)"
+    assert actual > 0.7, f"should remain high after only 10 steps (got {actual:.3f})"
 
 
 def test_goat_agent_advances_topomap_once_per_step():

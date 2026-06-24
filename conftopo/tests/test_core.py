@@ -9,7 +9,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType, EdgeType, SemanticNode
-from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode, Relation
+from conftopo.core.instruction_graph import (
+    GoalProposal,
+    InstructionGraph,
+    SubGoal,
+    GoalNode,
+    Relation,
+    normalize_goal_node,
+)
+from conftopo.core.hypothesis_pool import Hypothesis, HypothesisPool
 from conftopo.core.confidence import (
     ConfidenceFactors,
     compute_semantic_confidence,
@@ -189,6 +197,114 @@ def test_instruction_graph_object_goal():
     assert ig.get_current_goal().goal_type == "description"
 
     print("  [PASS] instruction graph (object_goal mode)")
+
+
+def test_goal_node_normalization_preserves_llm_semantics():
+    """GoalGraph semantics come from the LLM and are not rule-rewritten."""
+    goal = GoalNode(target_object="white chair", attributes=["wooden"])
+    normalized = normalize_goal_node(goal)
+    assert normalized.target_object == "white chair"
+    assert normalized.attributes == ["wooden"]
+    assert goal.target_object == "white chair"
+    assert goal.attributes == ["wooden"]
+
+    compound = normalize_goal_node(GoalNode(target_object="dining table"))
+    assert compound.target_object == "dining table"
+    assert compound.attributes == []
+
+    print("  [PASS] goal node normalization")
+
+
+def test_goal_node_normalization_does_not_parse_full_sentence():
+    raw = "find the red chair near the dining table"
+    normalized = normalize_goal_node(GoalNode(target_object=raw, goal_type="description"))
+    assert normalized.description is None
+    assert normalized.target_object == raw
+    assert normalized.attributes == []
+
+    with_description = normalize_goal_node(
+        GoalNode(target_object="chair", description=f"  {raw}  ", attributes="red")
+    )
+    assert with_description.description == raw
+    assert with_description.target_object == "chair"
+    assert with_description.attributes == ["red"]
+    print("  [PASS] schema-only goal normalization")
+
+
+def test_goal_proposal_dataclass():
+    proposal = GoalProposal(
+        goal_id="goal_0",
+        candidate_node_id="obj_1",
+        candidate_type="object",
+        anchor_node_id="wp_1",
+        score=0.9,
+        semantic_score=0.8,
+        relation_score=1.0,
+        evidence_refs=["frame_1"],
+    )
+    assert proposal.node_id == "obj_1"
+    assert proposal.candidate_node_id == "obj_1"
+    assert proposal.candidate_type == "object"
+    assert proposal.evidence_refs == ["frame_1"]
+    assert proposal.can_stop is True
+    assert proposal.requires_verification is False
+    print("  [PASS] goal proposal dataclass")
+
+
+def test_hypothesis_pool_lifecycle():
+    pool = HypothesisPool(default_ttl=3, verify_seen_count=2, verify_confidence=0.4)
+    first = pool.add_or_update(Hypothesis(
+        id="",
+        goal_id="goal_0",
+        kind="object",
+        label="Chair",
+        source="clip",
+        anchor_node_id="wp_1",
+        position=np.array([0, 0, 0], dtype=np.float32),
+        score=0.5,
+        confidence=0.5,
+        first_seen_step=1,
+        last_seen_step=1,
+    ))
+    second = pool.add_or_update(Hypothesis(
+        id="",
+        goal_id="goal_0",
+        kind="object",
+        label="chair",
+        source="clip",
+        anchor_node_id="wp_1",
+        position=np.array([0.2, 0, 0], dtype=np.float32),
+        score=0.55,
+        confidence=0.55,
+        first_seen_step=2,
+        last_seen_step=2,
+    ))
+
+    assert first.id == second.id
+    assert second.seen_count == 2
+    assert second.status == "needs_verify"
+    assert pool.get_top_for_vlm("goal_0", k=1)[0].id == second.id
+
+    promoted = pool.promote(second.id, "obj_1")
+    assert promoted.status == "promoted"
+    assert promoted.promoted_node_id == "obj_1"
+
+    stale = pool.add_or_update(Hypothesis(
+        id="",
+        goal_id="goal_0",
+        kind="object",
+        label="table",
+        source="clip",
+        anchor_node_id="wp_2",
+        position=None,
+        score=0.3,
+        confidence=0.3,
+        first_seen_step=1,
+        last_seen_step=1,
+    ))
+    pool.decay(10)
+    assert stale.status == "expired"
+    print("  [PASS] hypothesis pool lifecycle")
 
 
 def test_instruction_graph_serialization():

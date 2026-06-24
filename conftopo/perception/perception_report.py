@@ -38,6 +38,13 @@ class PerceptionReport:
     # --- VLM-enhanced fields (only when source == "vlm") ---
     scene_summary: str = ""
     goal_visible: bool = False
+    goal_match_confidence: float = 0.0
+    target_direction: str = "unknown"
+    target_visibility: str = "not_visible"
+    apparent_scale: str = "unknown"
+    relative_progress: str = "uncertain"
+    stop_candidate: bool = False
+    recommended_action: str = "search"
     goal_reason: str = ""
     portals: List[str] = field(default_factory=list)
     uncertainty: float = 0.0
@@ -65,6 +72,13 @@ class PerceptionReport:
             "objects": [o.to_dict() for o in self.objects],
             "scene_summary": self.scene_summary,
             "goal_visible": self.goal_visible,
+            "goal_match_confidence": float(self.goal_match_confidence),
+            "target_direction": self.target_direction,
+            "target_visibility": self.target_visibility,
+            "apparent_scale": self.apparent_scale,
+            "relative_progress": self.relative_progress,
+            "stop_candidate": self.stop_candidate,
+            "recommended_action": self.recommended_action,
             "goal_reason": self.goal_reason,
             "portals": list(self.portals),
             "uncertainty": float(self.uncertainty),
@@ -98,6 +112,13 @@ class PerceptionReport:
             ],
             scene_summary=str(data.get("scene_summary", "")),
             goal_visible=bool(data.get("goal_visible", False)),
+            goal_match_confidence=float(data.get("goal_match_confidence", 0.0)),
+            target_direction=str(data.get("target_direction", "unknown")),
+            target_visibility=str(data.get("target_visibility", "not_visible")),
+            apparent_scale=str(data.get("apparent_scale", "unknown")),
+            relative_progress=str(data.get("relative_progress", "uncertain")),
+            stop_candidate=bool(data.get("stop_candidate", False)),
+            recommended_action=str(data.get("recommended_action", "search")),
             goal_reason=str(data.get("goal_reason", "")),
             portals=[str(p) for p in data.get("portals", [])],
             uncertainty=float(data.get("uncertainty", 0.0)),

@@ -1,53 +1,32 @@
 """InstructionGraph: unified goal representation for R2R / GOAT / SOON tasks."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 import json
-import re
 import numpy as np
 
 
-_FIND_RE = re.compile(
-    r"(?:find|locate|look for)\s+(?:me\s+)?(?:a|an|the|some)?\s*(.+?)(?:\s+(?:on|in|at|near|opposite|which|that|next|between|behind|under|above|below|beside|with)\b)",
-    re.IGNORECASE,
-)
+def _dedupe_strings(values: List[Any]) -> List[str]:
+    seen = set()
+    out = []
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
 
 
-_STOP_WORDS = {"in", "on", "at", "near", "which", "that", "is", "it", "and", "or", "to", "with", "behind", "under", "above", "below", "beside", "next", "between", "opposite"}
-_ARTICLES = {"the", "a", "an", "some"}
-
-
-def _extract_head_noun(text: str) -> str:
-    """Quick extraction of head noun from a description sentence (for backward compat)."""
-    text = text.strip()
-    m = _FIND_RE.search(text)
-    if m:
-        candidate = m.group(1).strip()
-        if candidate:
-            words = candidate.split()
-            if len(words) <= 2:
-                return candidate
-            segments = re.split(r",\s*|\s+and\s+", candidate)
-            last_seg = segments[-1].strip()
-            seg_words = last_seg.split()
-            if len(seg_words) <= 2 and len(segments) > 1:
-                return seg_words[-1]
-            if len(seg_words) <= 2:
-                return last_seg
-            return " ".join(seg_words[-2:])
-    # Fallback: collect leading content words until a stop word/preposition
-    words = text.split()
-    result_words = []
-    for w in words:
-        clean = w.lower().rstrip(".,;:")
-        if clean in _ARTICLES and not result_words:
-            continue  # skip leading articles
-        if clean in _STOP_WORDS and result_words:
-            break
-        result_words.append(w.rstrip(".,;:"))
-        if len(result_words) >= 3:
-            break
-    return " ".join(result_words) if result_words else text[:40]
+def _as_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return _dedupe_strings(list(value))
+    return _dedupe_strings([value])
 
 
 @dataclass
@@ -85,6 +64,73 @@ class GoalNode:
     goal_type: str = "category"  # category / description / image
     confidence: float = 1.0
     status: str = "pending"  # pending / active / completed / failed
+    embedding_source: Optional[str] = None   # goat_official_cache / rendered_clip / text_clip / text_clip_fallback / none
+    match_status: Optional[str] = None       # official_cache_hit / rendered / text_fallback / failed
+    image_cache_key: Optional[str] = None    # e.g. "GLAQ4DNUx5U_cabinet_476"
+    goal_image_id: Optional[int] = None      # task[3] index into image_goals
+
+
+@dataclass
+class GoalProposal:
+    """Runtime hypothesis binding one semantic goal to an existing map node."""
+    goal_id: str
+    candidate_node_id: str
+    candidate_type: str
+    anchor_node_id: Optional[str] = None
+    target_position: Optional[np.ndarray] = None
+    score: float = 0.0
+    semantic_score: float = 0.0
+    room_score: float = 0.0
+    relation_score: float = 0.0
+    reachability_score: float = 0.0
+    frontier_value: float = 0.0
+    task_score: float = 0.0
+    attribute_score: float = 0.0
+    history_bonus: float = 0.0
+    distance_cost: float = 0.0
+    risk_penalty: float = 0.0
+    negative_evidence: float = 0.0
+    source: str = "object_memory"
+    status: str = "active"
+    can_stop: bool = True
+    requires_verification: bool = False
+    evidence_refs: List[Any] = field(default_factory=list)
+
+    @property
+    def node_id(self) -> str:
+        """Backward-compatible alias for older debug/test code."""
+        return self.candidate_node_id
+
+
+def normalize_goal_node(goal: GoalNode) -> GoalNode:
+    """Return a schema-normalized copy of a GoalNode without mutating input.
+
+    GoalGraph semantics are produced by the LLM parser. This function only
+    normalizes container shape and whitespace; it deliberately does not infer
+    object nouns, split attributes, or rewrite target_object.
+    """
+    raw_target = str(goal.target_object or "").strip()
+    description = str(goal.description).strip() if goal.description is not None else None
+    attributes = _as_string_list(goal.attributes)
+
+    return GoalNode(
+        target_object=raw_target,
+        description=description,
+        target_embedding=goal.target_embedding,
+        attributes=attributes,
+        room_prior=_as_string_list(goal.room_prior),
+        room_prior_embeddings=goal.room_prior_embeddings,
+        landmarks=_as_string_list(goal.landmarks),
+        landmark_embeddings=goal.landmark_embeddings,
+        relations=list(goal.relations or []),
+        goal_type=goal.goal_type,
+        confidence=goal.confidence,
+        status=goal.status,
+        embedding_source=goal.embedding_source,
+        match_status=goal.match_status,
+        image_cache_key=goal.image_cache_key,
+        goal_image_id=goal.goal_image_id,
+    )
 
 
 class InstructionGraph:
@@ -195,6 +241,15 @@ class InstructionGraph:
             return None
         return np.stack(embeddings, axis=0)
 
+    @staticmethod
+    def _embedding_to_json(embedding: Optional[np.ndarray]):
+        if embedding is None:
+            return None
+        arr = np.asarray(embedding, dtype=np.float32)
+        if arr.ndim == 1:
+            return arr.tolist()
+        return [row.tolist() for row in arr]
+
     def to_dict(self) -> dict:
         """Serialize to dict for JSON storage."""
         data = {"goal_type": self.goal_type, "current_idx": self._current_idx}
@@ -208,12 +263,18 @@ class InstructionGraph:
                     "implied_room": sg.implied_room,
                     "termination_condition": sg.termination_condition,
                     "status": sg.status,
+                    **(
+                        {"landmark_embedding": self._embedding_to_json(sg.landmark_embedding)}
+                        if sg.landmark_embedding is not None
+                        else {}
+                    ),
                 }
                 for sg in self.sub_goals
             ]
         else:
-            data["goal_nodes"] = [
-                {
+            goal_nodes = []
+            for gn in self.goal_nodes:
+                node = {
                     "target_object": gn.target_object,
                     **({"description": gn.description} if gn.description else {}),
                     "attributes": gn.attributes,
@@ -227,8 +288,25 @@ class InstructionGraph:
                     "confidence": gn.confidence,
                     "status": gn.status,
                 }
-                for gn in self.goal_nodes
-            ]
+                target_emb = self._embedding_to_json(gn.target_embedding)
+                if target_emb is not None:
+                    node["target_embedding"] = target_emb
+                room_emb = self._embedding_to_json(gn.room_prior_embeddings)
+                if room_emb is not None:
+                    node["room_prior_embeddings"] = room_emb
+                landmark_emb = self._embedding_to_json(gn.landmark_embeddings)
+                if landmark_emb is not None:
+                    node["landmark_embeddings"] = landmark_emb
+                if gn.embedding_source is not None:
+                    node["embedding_source"] = gn.embedding_source
+                if gn.match_status is not None:
+                    node["match_status"] = gn.match_status
+                if gn.image_cache_key is not None:
+                    node["image_cache_key"] = gn.image_cache_key
+                if gn.goal_image_id is not None:
+                    node["goal_image_id"] = gn.goal_image_id
+                goal_nodes.append(node)
+            data["goal_nodes"] = goal_nodes
         return data
 
     @classmethod
@@ -267,19 +345,9 @@ class InstructionGraph:
                 if landmark_embeddings is not None:
                     landmark_embeddings = np.asarray(landmark_embeddings, dtype=np.float32)
 
-                raw_target = gn_data["target_object"]
-                description = gn_data.get("description")
-                goal_type_val = gn_data.get("goal_type", "category")
-
-                # Backward compat: if target_object looks like a full sentence
-                # (old format), migrate it to description and extract clean noun
-                if description is None and goal_type_val == "description" and len(raw_target) > 60:
-                    description = raw_target
-                    raw_target = _extract_head_noun(raw_target)
-
-                ig.goal_nodes.append(GoalNode(
-                    target_object=raw_target,
-                    description=description,
+                goal_node = GoalNode(
+                    target_object=gn_data["target_object"],
+                    description=gn_data.get("description"),
                     target_embedding=target_embedding,
                     attributes=gn_data.get("attributes", []),
                     room_prior=gn_data.get("room_prior", []),
@@ -287,10 +355,15 @@ class InstructionGraph:
                     landmarks=gn_data.get("landmarks", []),
                     landmark_embeddings=landmark_embeddings,
                     relations=relations,
-                    goal_type=goal_type_val,
+                    goal_type=gn_data.get("goal_type", "category"),
                     confidence=gn_data.get("confidence", 1.0),
                     status=gn_data.get("status", "pending"),
-                ))
+                    embedding_source=gn_data.get("embedding_source"),
+                    match_status=gn_data.get("match_status"),
+                    image_cache_key=gn_data.get("image_cache_key"),
+                    goal_image_id=gn_data.get("goal_image_id"),
+                )
+                ig.goal_nodes.append(normalize_goal_node(goal_node))
         return ig
 
     @classmethod

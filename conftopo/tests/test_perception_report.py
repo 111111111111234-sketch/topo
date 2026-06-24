@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from conftopo.perception.perception_report import PerceptionReport, EMPTY
 from conftopo.perception.clip_gdino_report_builder import ClipGdinoReportBuilder
 from conftopo.perception.heavy_perceiver import ObjectObservation
+from conftopo.perception.vlm_perceiver import VLMPerceiver
 
 
 # ---- PerceptionReport schema tests ----
@@ -26,6 +27,13 @@ def test_default_values():
     assert r.objects == []
     assert r.scene_summary == ""
     assert r.goal_visible is False
+    assert r.goal_match_confidence == 0.0
+    assert r.target_direction == "unknown"
+    assert r.target_visibility == "not_visible"
+    assert r.apparent_scale == "unknown"
+    assert r.relative_progress == "uncertain"
+    assert r.stop_candidate is False
+    assert r.recommended_action == "search"
     assert r.goal_reason == ""
     assert r.portals == []
     assert r.uncertainty == 0.0
@@ -44,7 +52,12 @@ def test_empty_sentinel():
 
 def test_to_dict_from_dict_roundtrip():
     embed = np.random.randn(8).astype(np.float32)
-    obj = ObjectObservation(label="chair", bbox=[0.1, 0.2, 0.3, 0.4], confidence=0.85)
+    obj = ObjectObservation(
+        label="chair",
+        bbox=[0.1, 0.2, 0.3, 0.4],
+        confidence=0.85,
+        attributes={"color": "red"},
+    )
     r = PerceptionReport(
         room_label="kitchen",
         room_confidence=0.92,
@@ -56,6 +69,13 @@ def test_to_dict_from_dict_roundtrip():
         objects=[obj],
         scene_summary="A kitchen with a sink.",
         goal_visible=True,
+        goal_match_confidence=0.91,
+        target_direction="center",
+        target_visibility="clear",
+        apparent_scale="large",
+        relative_progress="closer",
+        stop_candidate=True,
+        recommended_action="stop_candidate",
         goal_reason="sink detected in bbox",
         portals=["door_left"],
         uncertainty=0.15,
@@ -73,12 +93,40 @@ def test_to_dict_from_dict_roundtrip():
     assert r2.best_goal_sim == 0.7
     assert len(r2.objects) == 1
     assert r2.objects[0].label == "chair"
+    assert r2.objects[0].attributes == {"color": "red"}
     assert r2.scene_summary == "A kitchen with a sink."
     assert r2.goal_visible is True
+    assert r2.goal_match_confidence == 0.91
+    assert r2.target_direction == "center"
+    assert r2.target_visibility == "clear"
+    assert r2.apparent_scale == "large"
+    assert r2.relative_progress == "closer"
+    assert r2.stop_candidate is True
+    assert r2.recommended_action == "stop_candidate"
     assert r2.source == "clip_groundingdino"
     assert r2.is_full is True
     assert r2.step_id == 42
     np.testing.assert_allclose(r2.visual_embed, embed, atol=1e-6)
+
+
+def test_vlm_object_attributes_preserved():
+    report = VLMPerceiver._build_report(
+        {
+            "room": {"label": "dining room", "confidence": 0.8},
+            "objects": [
+                {
+                    "label": "chair",
+                    "bbox": [0.1, 0.2, 0.4, 0.8],
+                    "confidence": 0.6,
+                    "attributes": {"color": "red", "material": "fabric"},
+                }
+            ],
+        },
+        visual_embed=None,
+        step_id=3,
+    )
+    assert report.objects[0].attributes["color"] == "red"
+    assert report.objects[0].attributes["material"] == "fabric"
 
 
 def test_from_dict_missing_keys():
