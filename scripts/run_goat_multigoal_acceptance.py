@@ -27,9 +27,10 @@ from run_goat_minimal import ROOT, find_scene_file, load_json_gz, make_sim, norm
 from run_goat_topo_trace import load_goal_graph, pick_episode, quat_to_heading, rgb_to_embedding, snapshot_topo
 from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
+from conftopo.core.dynamic_topo_map import NodeType
 from conftopo.core.instruction_graph import GoalNode
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
-from conftopo.perception import ClipRuntimeEncoder
+from conftopo.perception import GoatModalityClipEncoder, encode_agent_rgb_embed, encode_agent_image_goal_embed
 
 
 DEFAULT_STEPS_PER_GOAL = 500  # GOAT-Bench README: 500 actions per subtask
@@ -172,7 +173,10 @@ def set_start_state(sim_agent, episode):
 
 
 def is_semantic_node_id(node_id: str | None) -> bool:
-    return bool(node_id) and node_id.startswith(("obj_", "roo_", "lan_"))
+    return bool(node_id) and (
+        node_id.startswith(("obj_", "roo_", "lan_"))
+        or node_id.startswith("region::")
+    )
 
 
 def known_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
@@ -181,6 +185,21 @@ def known_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
 
 def semantic_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
     return {nid for nid in known_node_ids(agent) if is_semantic_node_id(nid)}
+
+
+def durable_memory_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
+    """Semantic nodes that are expected to survive a goal switch."""
+    durable: set[str] = set()
+    for node_id, node in agent.topo_map._nodes.items():
+        if node.node_type in (NodeType.ROOM, NodeType.LANDMARK):
+            durable.add(node_id)
+            continue
+        if (
+            node.node_type == NodeType.OBJECT
+            and node.attributes.get("semantic_role") in ("object_anchor", "context_object")
+        ):
+            durable.add(node_id)
+    return durable
 
 
 def run_step(
@@ -196,7 +215,6 @@ def run_step(
     record_topo: bool,
     frame_dir: Path | None = None,
     step_index: int = 0,
-    goal_instance_positions: list[np.ndarray] | None = None,
 ):
     obs = sim.get_sensor_observations()
     state = sim_agent.get_state()
@@ -207,20 +225,22 @@ def run_step(
         frame_path = frame_dir / f"rgb_{step_index:04d}.png"
         imageio.imwrite(frame_path, rgb_save)
         frame_rel = str(frame_path.relative_to(ROOT))
-    rgb_embed = rgb_to_embedding(rgb) if use_placeholder else encoder.encode_image(rgb)
+    rgb_embed = encode_agent_rgb_embed(
+        encoder, rgb, agent,
+        use_placeholder=use_placeholder,
+        placeholder_fn=rgb_to_embedding,
+    )
+    image_goal_embed = None
+    if not use_placeholder and rgb is not None:
+        image_goal_embed = encode_agent_image_goal_embed(encoder, rgb, agent)
     world_position = np.asarray(state.position, dtype=np.float32)
     world_heading = quat_to_heading([state.rotation.real, *list(state.rotation.imag)])
-    instance_distance = None
-    if goal_instance_positions:
-        instance_distance = _euclidean_distance_to_instances(
-            world_position, goal_instance_positions,
-        )
     out = agent.step({
         "rgb": rgb,
         "rgb_embed": rgb_embed,
+        "image_goal_embed": image_goal_embed,
         "position": world_position,
         "heading": world_heading,
-        "instance_distance": instance_distance,
     })
     rel_position = world_position - origin
     collision = tracker.update(previous_action, rel_position)
@@ -277,24 +297,31 @@ def run_step(
                 else:
                     target_pos, _ = agent._target_output_for_node(node)
                     target = target_pos
-        action, nav = executor.step(sim, np.asarray(target), origin, target_node_id=target_id)
-        if action == "target_reached":
-            nav_event = agent.on_navigation_event(target_id, "target_reached")
-            evt_action = nav_event.get("action")
-            if evt_action == "should_stop":
-                action = "stop"
-                nav = {"reachable": True, "reason": nav_event.get("reason", "object_should_stop")}
-            elif evt_action == "anchor_reached_awaiting_confirm":
+        if selected is None and candidate_ids:
+            for cid in candidate_ids[:5]:
+                agent.on_navigation_event(cid, "unreachable")
+            action = "move_forward" if (step_index % 3 == 0) else "turn_right"
+            nav = {"reachable": False, "reason": "all_candidates_unreachable",
+                   "controller_mode": "no_reachable_candidate"}
+        else:
+            action, nav = executor.step(sim, np.asarray(target), origin, target_node_id=target_id)
+            if action == "target_reached":
+                nav_event = agent.on_navigation_event(target_id, "target_reached")
+                evt_action = nav_event.get("action")
+                if evt_action == "should_stop":
+                    action = "stop"
+                    nav = {"reachable": True, "reason": nav_event.get("reason", "object_should_stop")}
+                elif evt_action == "anchor_reached_awaiting_confirm":
+                    action = "turn_left"
+                    nav = {"reachable": False, "reason": evt_action}
+                elif evt_action in ("consumed_frontier", "blocked_target"):
+                    action = "target_reached"
+                    nav = {"reachable": True, "reason": nav_event.get("reason", "target_reached")}
+                else:
+                    nav = {"reachable": True, "reason": nav_event.get("reason", "target_reached")}
+            elif action == "unreachable":
+                agent.on_navigation_event(target_id, nav.get("reason", "unreachable"))
                 action = "turn_left"
-                nav = {"reachable": False, "reason": evt_action}
-            elif evt_action in ("consumed_frontier", "blocked_target"):
-                action = "target_reached"
-                nav = {"reachable": True, "reason": nav_event.get("reason", "target_reached")}
-            else:
-                nav = {"reachable": True, "reason": nav_event.get("reason", "target_reached")}
-        elif action == "unreachable":
-            agent.on_navigation_event(target_id, nav.get("reason", "unreachable"))
-            action = "turn_left"
     if action not in ("stop", "target_reached", "unreachable"):
         sim.step(action)
     rec = {
@@ -475,6 +502,7 @@ def main():
     ap.add_argument("--report", default="data/logs/goat_topo/multigoal_acceptance/multigoal_acceptance_report.json")
     ap.add_argument("--frame-dir", default=None)
     ap.add_argument("--clip-model", default="ViT-B/32")
+    ap.add_argument("--clip-image-model", default="RN50", help="CLIP model for image-goal rgb_embed (GOAT official: RN50)")
     ap.add_argument("--clip-device", default="auto")
     ap.add_argument(
         "--perception-backend",
@@ -547,6 +575,7 @@ def main():
 
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
+    config.perception.clip_image_model = args.clip_image_model
     config.perception.clip_device = args.clip_device
     config.perception.backend = args.perception_backend
     config.perception.vlm_api_base = args.vlm_api_base
@@ -575,7 +604,9 @@ def main():
         config.perception.landmark_threshold = float(thresholds["landmark"])
     agent = ConfTopoGOATAgent(config)
     agent.set_goal(ig)
-    encoder = None if args.use_placeholder_embed else ClipRuntimeEncoder(args.clip_model, args.clip_device)
+    encoder = None if args.use_placeholder_embed else GoatModalityClipEncoder(
+        args.clip_model, args.clip_image_model, args.clip_device,
+    )
     if encoder is not None:
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
 
@@ -585,6 +616,8 @@ def main():
         frame_dir.mkdir(parents=True, exist_ok=True)
     sim = make_sim(scene_file)
     sim_agent = sim.initialize_agent(0)
+    if hasattr(agent, "set_pathfinder"):
+        agent.set_pathfinder(sim)
     # Success metric: Euclidean distance from STOP position to target instance center(s).
     state = set_start_state(sim_agent, episode)
     origin = np.array(state.position, dtype=np.float32)
@@ -601,6 +634,7 @@ def main():
             before = agent.memory_stats.copy()
             known_before = known_node_ids(agent)
             semantic_before = semantic_node_ids(agent)
+            durable_before = durable_memory_node_ids(agent)
             agent.set_new_goal(goal)
             start = len(steps)
             monitor_target_id = None
@@ -634,7 +668,6 @@ def main():
                     args.record_topo or args.viz,
                     frame_dir=frame_dir,
                     step_index=len(steps),
-                    goal_instance_positions=goal_instance_positions,
                 )
                 rec["task_index"] = idx
                 rec["goal"] = {
@@ -643,19 +676,37 @@ def main():
                     "landmarks": goal.landmarks,
                 }
                 target_id = rec.get("target_node_id")
-                if target_id and target_id in known_before:
-                    memory_reuse_hits += 1
+                last_debug = (rec.get("memory") or {}).get("last_debug") or {}
+                reuse_ids = {
+                    node_id
+                    for node_id in (
+                        target_id,
+                        rec.get("semantic_target_node_id"),
+                        last_debug.get("active_anchor_id"),
+                    )
+                    if node_id
+                }
+                reused_known = reuse_ids & known_before
+                reused_semantic = {
+                    node_id for node_id in reused_known if is_semantic_node_id(node_id)
+                }
+                if reused_known:
+                    memory_reuse_hits += len(reused_known)
                     rec["memory_reuse"] = True
-                if is_semantic_node_id(target_id) and target_id in known_before:
-                    semantic_reuse_hits += 1
+                    rec["memory_reuse_node_ids"] = sorted(reused_known)
+                if reused_semantic:
+                    semantic_reuse_hits += len(reused_semantic)
                     rec["semantic_reuse"] = True
-                if idx > 0 and is_semantic_node_id(target_id):
+                    rec["semantic_reuse_node_ids"] = sorted(reused_semantic)
+                if idx > 0 and reused_semantic:
                     for prev_idx, prev_label in per_task_goal_label.items():
                         if prev_idx < idx and prev_label == goal.target_object:
                             prev_nodes = per_task_semantic_nodes.get(prev_idx, set())
-                            if target_id in prev_nodes:
-                                repeated_goal_reuse_hits += 1
+                            repeated_hits = reused_semantic & prev_nodes
+                            if repeated_hits:
+                                repeated_goal_reuse_hits += len(repeated_hits)
                                 rec["repeated_goal_reuse"] = True
+                                rec["repeated_goal_reuse_node_ids"] = sorted(repeated_hits)
                                 break
                 target_distance = planar_target_distance(rec.get("position"), rec.get("target_position"))
                 rec["target_distance"] = target_distance
@@ -711,6 +762,9 @@ def main():
                     goal_stop_distance = distance_to_target
                     break
             after = agent.memory_stats.copy()
+            durable_after = durable_memory_node_ids(agent)
+            preserved_durable = durable_before & durable_after
+            missing_durable = durable_before - durable_after
             # Compute SPL: S_i * l_i / max(p_i, l_i)
             goal_spl = None
             goal_optimal_path = None
@@ -746,7 +800,10 @@ def main():
                 "objects_after": after["objects"],
                 "rooms_after": after["rooms"],
                 "landmarks_after": after["landmarks"],
-                "memory_preserved": after["total_nodes"] >= before["total_nodes"],
+                "memory_preserved": not missing_durable,
+                "durable_nodes_before": len(durable_before),
+                "durable_nodes_preserved": len(preserved_durable),
+                "missing_durable_node_ids": sorted(missing_durable),
                 "known_nodes_before": len(known_before),
                 "memory_reuse_hits": memory_reuse_hits,
                 "semantic_reuse_hits": semantic_reuse_hits,

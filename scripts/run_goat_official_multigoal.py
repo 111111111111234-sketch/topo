@@ -34,7 +34,7 @@ from run_goat_minimal import ROOT, quat_to_heading, rgb_to_embedding
 from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
-from conftopo.perception import ClipRuntimeEncoder
+from conftopo.perception import GoatModalityClipEncoder, encode_agent_rgb_embed
 
 
 LOW_ACTIONS = ("move_forward", "turn_left", "turn_right")
@@ -361,6 +361,7 @@ def load_goal_graph_for_episode(goal_graph_dir: Path, split: str, episode) -> In
 def make_conftopo_config(args) -> ConfTopoConfig:
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
+    config.perception.clip_image_model = getattr(args, "clip_image_model", "RN50")
     config.perception.clip_device = args.clip_device
     config.perception.backend = args.perception_backend
     config.perception.vlm_api_base = args.vlm_api_base
@@ -406,7 +407,12 @@ def run_episode(env, args, action_map: dict[str, int], encoder) -> dict[str, Any
         if rgb is None:
             raise RuntimeError("No RGB observation found in official env observations.")
         position, heading, pose_source = extract_pose(env, observations, args.allow_sim_pose_fallback)
-        rgb_embed = rgb_to_embedding(rgb) if args.use_placeholder_embed else encoder.encode_image(rgb)
+        rgb_embed = encode_agent_rgb_embed(
+            encoder, rgb, agent,
+            goal_type=goals[local_goal_idx].goal_type if local_goal_idx < len(goals) else "category",
+            use_placeholder=args.use_placeholder_embed,
+            placeholder_fn=rgb_to_embedding,
+        )
 
         out = agent.step({
             "rgb": rgb,
@@ -503,6 +509,7 @@ def main() -> None:
     parser.add_argument("--allow-sim-pose-fallback", action="store_true")
 
     parser.add_argument("--clip-model", default="ViT-B/32")
+    parser.add_argument("--clip-image-model", default="RN50", help="CLIP model for image-goal rgb_embed (GOAT official: RN50)")
     parser.add_argument("--clip-device", default="auto")
     parser.add_argument("--use-placeholder-embed", action="store_true")
     parser.add_argument("--perception-backend", choices=["clip_groundingdino", "vlm"], default="clip_groundingdino")
@@ -520,7 +527,9 @@ def main() -> None:
     configure_paths(config, args)
     action_map = build_action_map(config)
     env = make_env(config)
-    encoder = None if args.use_placeholder_embed else ClipRuntimeEncoder(args.clip_model, args.clip_device)
+    encoder = None if args.use_placeholder_embed else GoatModalityClipEncoder(
+        args.clip_model, args.clip_image_model, args.clip_device,
+    )
 
     results: list[dict[str, Any]] = []
     try:

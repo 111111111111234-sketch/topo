@@ -23,7 +23,7 @@ from run_goat_minimal import (
 from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
-from conftopo.perception import ClipRuntimeEncoder
+from conftopo.perception import GoatModalityClipEncoder, encode_agent_rgb_embed
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
 
 
@@ -167,7 +167,7 @@ def dedupe_labels(labels: list[str]) -> list[str]:
 def configure_landmark_perception(
     agent: ConfTopoGOATAgent,
     first_goal: GoalNode | None,
-    encoder: ClipRuntimeEncoder | None,
+    encoder: GoatModalityClipEncoder | None,
     env_landmark_labels: list[str],
 ) -> list[str]:
     goal_lm_names = landmark_names(first_goal.landmarks) if isinstance(first_goal, GoalNode) else []
@@ -369,6 +369,7 @@ def main() -> None:
     parser.add_argument("--output", default="data/logs/goat_topo/topo_trace_semantic.json")
     parser.add_argument("--frame-dir", default=None)
     parser.add_argument("--clip-model", default="ViT-B/32")
+    parser.add_argument("--clip-image-model", default="RN50", help="CLIP model for image-goal rgb_embed (GOAT official: RN50)")
     parser.add_argument("--clip-device", default="auto")
     parser.add_argument("--object-threshold", type=float, default=None)
     parser.add_argument("--heavy-enabled", action="store_true")
@@ -411,6 +412,7 @@ def main() -> None:
 
     config = ConfTopoConfig()
     config.perception.clip_model = args.clip_model
+    config.perception.clip_image_model = args.clip_image_model
     config.perception.clip_device = args.clip_device
     if args.object_threshold is not None:
         config.perception.object_threshold = args.object_threshold
@@ -438,7 +440,11 @@ def main() -> None:
 
     encoder = None
     if not args.use_placeholder_embed:
-        encoder = ClipRuntimeEncoder(config.perception.clip_model, config.perception.clip_device)
+        encoder = GoatModalityClipEncoder(
+            config.perception.clip_model,
+            config.perception.clip_image_model,
+            config.perception.clip_device,
+        )
         agent.perceiver.room_text_embeds = encoder.encode_text(agent.perceiver.room_labels)
         active_landmark_labels = configure_landmark_perception(agent, first_goal, encoder, env_landmark_labels)
     else:
@@ -534,7 +540,11 @@ def main() -> None:
                 frame_path = frame_dir / f"rgb_{step:04d}.png"
                 imageio.imwrite(frame_path, rgb_save)
                 frame_rel = str(frame_path.relative_to(ROOT))
-            rgb_embed = rgb_to_embedding(rgb) if args.use_placeholder_embed else encoder.encode_image(rgb)
+            rgb_embed = encode_agent_rgb_embed(
+                encoder, rgb, agent,
+                use_placeholder=args.use_placeholder_embed,
+                placeholder_fn=rgb_to_embedding,
+            )
             conf_obs = {
                 "rgb": rgb,
                 "rgb_embed": rgb_embed,
