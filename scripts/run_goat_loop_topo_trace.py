@@ -31,7 +31,9 @@ from run_goat_topo_trace import (
     snapshot_perception,
     snapshot_topo,
 )
-from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_etpnav import ConfTopoGOATAgentETPNav, ETPGoatConfig
+from conftopo.agents.goat_agent_etpnav_clean import ConfTopoGOATAgentCleanETPNav, CleanETPGoatConfig
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode
 from conftopo.navigation import CollisionLikeTracker, PathfinderExecutor
@@ -186,6 +188,7 @@ def build_loop_route(
         raise RuntimeError("Could not sample enough reachable same-floor points for loop trajectory")
 
     best = None
+    best_any = None
     last_error = ""
     for n_anchors in range(max(2, anchor_count), 1, -1):
         for min_dist in [min_start_dist, max(2.5, min_start_dist * 0.75), max(1.8, min_start_dist * 0.5)]:
@@ -206,16 +209,23 @@ def build_loop_route(
             if extent_candidate < min_extent:
                 last_error = f"Loop trajectory extent too small: {extent_candidate:.2f}m"
                 continue
+            candidate = (anchors, route_world, total_geo, extent_candidate, y_range_candidate)
+            if best_any is None or total_geo < best_any[2]:
+                best_any = candidate
             if total_geo <= max_geodesic_length:
-                best = (anchors, route_world, total_geo, extent_candidate, y_range_candidate)
+                best = candidate
                 break
             last_error = f"loop longer than requested: {total_geo:.2f}m > {max_geodesic_length:.2f}m"
-        if best is not None and best[2] <= max_geodesic_length:
+        if best is not None:
             break
     if best is None:
-        raise RuntimeError(last_error or f"Could not build same-floor loop trajectory within {max_geodesic_length:.2f}m")
+        if best_any is not None:
+            best = best_any
+        else:
+            raise RuntimeError(last_error or f"Could not build same-floor loop trajectory within {max_geodesic_length:.2f}m")
 
     anchors, route_world, total_geo, extent, y_range = best
+    over_limit = total_geo > max_geodesic_length
     route_rel = [world_to_relative(p, origin_world).round(4).tolist() for p in route_world]
     anchor_rel = [world_to_relative(p, origin_world).round(4).tolist() for p in anchors]
     return {
@@ -229,6 +239,7 @@ def build_loop_route(
         "y_range": y_range,
         "floor_y_tolerance": float(floor_y_tolerance),
         "max_geodesic_length": float(max_geodesic_length),
+        "over_max_geodesic_length": bool(over_limit),
         "sample_count": len(samples),
     }
 
@@ -263,6 +274,14 @@ def main() -> None:
     parser.add_argument("--clip-model", default="ViT-B/32")
     parser.add_argument("--clip-image-model", default="RN50", help="CLIP model for image-goal rgb_embed (GOAT official: RN50)")
     parser.add_argument("--clip-device", default="auto")
+    parser.add_argument(
+        "--perception-backend",
+        choices=["clip_groundingdino", "vlm"],
+        default="clip_groundingdino",
+    )
+    parser.add_argument("--vlm-api-base", default="http://localhost:8000/v1")
+    parser.add_argument("--vlm-model", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--vlm-timeout", type=float, default=60.0)
     parser.add_argument("--object-threshold", type=float, default=None)
     parser.add_argument("--heavy-enabled", action="store_true")
     parser.add_argument("--heavy-interval", type=int, default=None)
@@ -282,11 +301,17 @@ def main() -> None:
     parser.add_argument("--loop-samples", type=int, default=80)
     parser.add_argument("--loop-min-start-dist", type=float, default=4.0)
     parser.add_argument("--loop-min-extent", type=float, default=4.0)
-    parser.add_argument("--loop-max-geodesic-length", type=float, default=18.0)
+    parser.add_argument("--loop-max-geodesic-length", type=float, default=40.0)
     parser.add_argument("--loop-floor-y-tolerance", type=float, default=0.35)
     parser.add_argument("--loop-reach-radius", type=float, default=0.45)
     parser.add_argument("--loop-return-radius", type=float, default=0.75)
     parser.add_argument("--instruction", default="Walk one loop around the room on the same floor and return to the start.")
+    parser.add_argument(
+        "--agent",
+        choices=["final", "etpnav", "clean"],
+        default="final",
+        help="Agent variant: goat_agent_final, goat_agent_etpnav, or goat_agent_etpnav_clean.",
+    )
     args = parser.parse_args()
     env_landmark_labels = parse_env_landmarks(args.env_landmarks)
 
@@ -300,9 +325,13 @@ def main() -> None:
     config.perception.clip_model = args.clip_model
     config.perception.clip_image_model = args.clip_image_model
     config.perception.clip_device = args.clip_device
+    config.perception.backend = args.perception_backend
+    config.perception.vlm_api_base = args.vlm_api_base
+    config.perception.vlm_model = args.vlm_model
+    config.perception.vlm_timeout = args.vlm_timeout
     if args.object_threshold is not None:
         config.perception.object_threshold = args.object_threshold
-    config.perception.heavy_enabled = bool(args.heavy_enabled)
+    config.perception.heavy_enabled = bool(args.heavy_enabled or args.perception_backend == "vlm")
     if args.heavy_interval is not None:
         config.perception.heavy_interval = args.heavy_interval
     if args.object_detection_threshold is not None:
@@ -318,7 +347,17 @@ def main() -> None:
     if args.landmark_threshold is not None:
         config.perception.landmark_threshold = args.landmark_threshold
 
-    agent = ConfTopoGOATAgent(config)
+    if args.agent == "clean":
+        etp_config = CleanETPGoatConfig()
+        agent = ConfTopoGOATAgentCleanETPNav(config, etp_config)
+        agent_variant = "ConfTopoGOATCleanETPNavAgent"
+    elif args.agent == "etpnav":
+        etp_config = ETPGoatConfig()
+        agent = ConfTopoGOATAgentETPNav(config, etp_config)
+        agent_variant = "ConfTopoGOATAgentETPNav"
+    else:
+        agent = ConfTopoGOATAgent(config)
+        agent_variant = "ConfTopoGOATAgentFinal"
     agent.set_goal(ig)
     first_goal = ig.get_current_goal()
     if isinstance(first_goal, GoalNode):
@@ -383,10 +422,15 @@ def main() -> None:
         "goal_type": ig.goal_type,
         **goal_modality_debug,
         "instruction": args.instruction,
+        "agent_variant": agent_variant,
         "current_goal": current_goal_summary(ig),
         "environment_landmarks": env_landmark_labels,
         "active_landmark_labels": active_landmark_labels,
-        "embedding_source": "placeholder" if args.use_placeholder_embed else f"clip:{args.clip_model}",
+        "embedding_source": (
+            f"vlm:{args.vlm_model}" if args.perception_backend == "vlm"
+            else ("placeholder" if args.use_placeholder_embed else f"clip:{args.clip_model}")
+        ),
+        "perception_backend": args.perception_backend,
         "thresholds": {
             "object": config.perception.object_threshold,
             "room": config.perception.room_threshold,

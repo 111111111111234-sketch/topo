@@ -1,4 +1,8 @@
-"""Multigoal acceptance harness for ConfTopo-GOAT.
+"""Multigoal acceptance harness for ConfTopo-GOAT-ETPNav.
+
+This is the ETPNav-style variant of ``run_goat_multigoal_acceptance.py``.
+It uses ``ConfTopoGOATAgentETPNav``: RGB-only ghost candidates, graph-aware
+route costs, candidate promote/consume, and waypoint stop memory.
 
 Success criteria follow the GOAT-Bench benchmark definition (README):
   - Each subtask has a budget of 500 agent actions.
@@ -25,7 +29,8 @@ import numpy as np
 
 from run_goat_minimal import ROOT, find_scene_file, load_json_gz, make_sim, normalize_quat
 from run_goat_topo_trace import load_goal_graph, pick_episode, quat_to_heading, rgb_to_embedding, snapshot_topo
-from conftopo.agents import ConfTopoGOATAgent
+from conftopo.agents.goat_agent_etpnav import ConfTopoGOATAgentETPNav, ETPGoatConfig
+from conftopo.agents.goat_agent_etpnav_clean import ConfTopoGOATAgentCleanETPNav, CleanETPGoatConfig
 from conftopo.config import ConfTopoConfig
 from conftopo.core.dynamic_topo_map import NodeType
 from conftopo.core.instruction_graph import GoalNode
@@ -179,15 +184,15 @@ def is_semantic_node_id(node_id: str | None) -> bool:
     )
 
 
-def known_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
+def known_node_ids(agent: ConfTopoGOATAgentETPNav) -> set[str]:
     return set(agent.topo_map._nodes.keys())
 
 
-def semantic_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
+def semantic_node_ids(agent: ConfTopoGOATAgentETPNav) -> set[str]:
     return {nid for nid in known_node_ids(agent) if is_semantic_node_id(nid)}
 
 
-def durable_memory_node_ids(agent: ConfTopoGOATAgent) -> set[str]:
+def durable_memory_node_ids(agent: ConfTopoGOATAgentETPNav) -> set[str]:
     """Semantic nodes that are expected to survive a goal switch."""
     durable: set[str] = set()
     for node_id, node in agent.topo_map._nodes.items():
@@ -314,7 +319,13 @@ def run_step(
                 elif evt_action == "anchor_reached_awaiting_confirm":
                     action = "turn_left"
                     nav = {"reachable": False, "reason": evt_action}
-                elif evt_action in ("consumed_frontier", "blocked_target"):
+                elif evt_action in (
+                    "consumed_frontier",
+                    "consumed_candidate",
+                    "candidate_promoted",
+                    "blocked_target",
+                    "blacklisted_stop_waypoint",
+                ):
                     action = "target_reached"
                     nav = {"reachable": True, "reason": nav_event.get("reason", "target_reached")}
                 else:
@@ -324,6 +335,8 @@ def run_step(
                 action = "turn_left"
     if action not in ("stop", "target_reached", "unreachable"):
         sim.step(action)
+    if hasattr(agent, "record_executed_action"):
+        agent.record_executed_action(action)
     rec = {
         "step": int(step_index),
         "rgb_frame": frame_rel,
@@ -346,6 +359,7 @@ def run_step(
         "requires_regrounding": bool(out.get("requires_regrounding", False)),
         "target_anchor_type": out.get("target_anchor_type"),
         "semantic_target_node_id": out.get("semantic_target_node_id"),
+        "etp_route_debug": out.get("etp_route_debug", {}),
         "anchor_waypoint_id": out.get("anchor_waypoint_id"),
         "anchor_room_id": out.get("anchor_room_id"),
         "reground_state": out.get("reground_state"),
@@ -353,6 +367,7 @@ def run_step(
         "reground_anchor_node_id": out.get("reground_anchor_node_id"),
         "target_object_detected_this_scan": bool(out.get("target_object_detected_this_scan", False)),
         "last_heavy": agent.memory_stats.get("last_heavy", {}),
+        "task_telemetry": out.get("task_telemetry"),
     }
     if record_topo:
         rec["topo"] = snapshot_topo(agent)
@@ -490,6 +505,12 @@ def build_multigoal_acceptance_report(
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--agent-variant",
+        choices=["etpnav", "clean"],
+        default="clean",
+        help="ETPNav agent implementation: legacy patched etpnav or self-contained clean ETP-lite.",
+    )
     ap.add_argument("--split", default="val_seen")
     ap.add_argument("--scene", default="GLAQ4DNUx5U")
     ap.add_argument("--episode-index", type=int, default=0)
@@ -498,8 +519,8 @@ def main():
     ap.add_argument("--dataset-dir", default="data/datasets/goat_bench/hm3d/v1")
     ap.add_argument("--scene-root", default="data/scene_datasets/hm3d")
     ap.add_argument("--goal-graph-dir", default="data/goal_graphs/goat")
-    ap.add_argument("--output", default="data/logs/goat_topo/multigoal_acceptance/topo_trace_multigoal.json")
-    ap.add_argument("--report", default="data/logs/goat_topo/multigoal_acceptance/multigoal_acceptance_report.json")
+    ap.add_argument("--output", default="data/logs/goat_topo/etpnav_multigoal_acceptance/topo_trace_multigoal_etpnav.json")
+    ap.add_argument("--report", default="data/logs/goat_topo/etpnav_multigoal_acceptance/multigoal_acceptance_report_etpnav.json")
     ap.add_argument("--frame-dir", default=None)
     ap.add_argument("--clip-model", default="ViT-B/32")
     ap.add_argument("--clip-image-model", default="RN50", help="CLIP model for image-goal rgb_embed (GOAT official: RN50)")
@@ -508,7 +529,7 @@ def main():
         "--perception-backend",
         choices=["clip_groundingdino", "vlm"],
         default="clip_groundingdino",
-        help="Perception backend used by ConfTopoGOATAgent.",
+        help="Perception backend used by ConfTopoGOATAgentETPNav.",
     )
     ap.add_argument("--vlm-api-base", default="http://localhost:8000/v1")
     ap.add_argument("--vlm-model", default="Qwen/Qwen3-VL-8B-Instruct")
@@ -546,6 +567,15 @@ def main():
     ap.add_argument("--viz-fps", type=int, default=6)
     ap.add_argument("--block-stuck-target-after", type=int, default=24)
     ap.add_argument("--block-stuck-target-min-progress", type=float, default=0.25)
+    ap.add_argument("--ghost-merge-radius", type=float, default=None)
+    ap.add_argument("--ghost-min-distance", type=float, default=None)
+    ap.add_argument("--ghost-confidence", type=float, default=None)
+    ap.add_argument("--ghost-graph-distance-cap", type=float, default=None)
+    ap.add_argument("--disable-route-next-hop", action="store_true")
+    ap.add_argument("--disable-stop-memory", action="store_true")
+    ap.add_argument("--stop-memory-proposal-threshold", type=float, default=None)
+    ap.add_argument("--stop-memory-min-write-score", type=float, default=None)
+    ap.add_argument("--stop-memory-score-weight", type=float, default=None)
     ap.add_argument(
         "--success-distance",
         type=float,
@@ -602,7 +632,32 @@ def main():
         config.perception.room_threshold = float(thresholds["room"])
     if "landmark" in thresholds:
         config.perception.landmark_threshold = float(thresholds["landmark"])
-    agent = ConfTopoGOATAgent(config)
+    etp_config = CleanETPGoatConfig() if args.agent_variant == "clean" else ETPGoatConfig()
+    if args.ghost_merge_radius is not None:
+        etp_config.ghost_merge_radius = args.ghost_merge_radius
+    if args.ghost_min_distance is not None:
+        etp_config.ghost_min_distance = args.ghost_min_distance
+    if args.ghost_confidence is not None:
+        etp_config.ghost_confidence = args.ghost_confidence
+    if args.ghost_graph_distance_cap is not None:
+        etp_config.ghost_graph_distance_cap = args.ghost_graph_distance_cap
+    if args.disable_route_next_hop:
+        etp_config.route_next_hop_enabled = False
+    if args.disable_stop_memory:
+        etp_config.stop_memory_enabled = False
+    if args.stop_memory_proposal_threshold is not None:
+        etp_config.stop_memory_proposal_threshold = args.stop_memory_proposal_threshold
+    if args.stop_memory_min_write_score is not None:
+        etp_config.stop_memory_min_write_score = args.stop_memory_min_write_score
+    if args.stop_memory_score_weight is not None:
+        etp_config.stop_memory_score_weight = args.stop_memory_score_weight
+
+    if args.agent_variant == "clean":
+        agent = ConfTopoGOATAgentCleanETPNav(config, etp_config)
+        agent_variant_name = "ConfTopoGOATCleanETPNavAgent"
+    else:
+        agent = ConfTopoGOATAgentETPNav(config, etp_config)
+        agent_variant_name = "ConfTopoGOATAgentETPNav"
     agent.set_goal(ig)
     encoder = None if args.use_placeholder_embed else GoatModalityClipEncoder(
         args.clip_model, args.clip_image_model, args.clip_device,
@@ -677,11 +732,13 @@ def main():
                 }
                 target_id = rec.get("target_node_id")
                 last_debug = (rec.get("memory") or {}).get("last_debug") or {}
+                etp_route_debug = rec.get("etp_route_debug") or {}
                 reuse_ids = {
                     node_id
                     for node_id in (
                         target_id,
                         rec.get("semantic_target_node_id"),
+                        etp_route_debug.get("semantic_reuse_node_id"),
                         last_debug.get("active_anchor_id"),
                     )
                     if node_id
@@ -694,14 +751,7 @@ def main():
                     memory_reuse_hits += len(reused_known)
                     rec["memory_reuse"] = True
                     rec["memory_reuse_node_ids"] = sorted(reused_known)
-                selected_proposal = (rec.get("memory") or {}).get("selected_goal_proposal") or {}
-                proposal_source = selected_proposal.get("source", "")
-                proposal_node = selected_proposal.get("node_id", "")
-                if proposal_source == "semantic_memory" and proposal_node:
-                    semantic_reuse_hits += 1
-                    rec["semantic_reuse"] = True
-                    rec["semantic_reuse_node_ids"] = [proposal_node]
-                elif reused_semantic:
+                if reused_semantic:
                     semantic_reuse_hits += len(reused_semantic)
                     rec["semantic_reuse"] = True
                     rec["semantic_reuse_node_ids"] = sorted(reused_semantic)
@@ -828,11 +878,18 @@ def main():
                 "goal_path_length": round(goal_path_length, 4),
                 "goal_optimal_path": round(goal_optimal_path, 4) if goal_optimal_path is not None else None,
                 "goal_spl": goal_spl,
+                "task_telemetry": (
+                    agent.task_telemetry.snapshot()
+                    if hasattr(agent, "task_telemetry")
+                    else None
+                ),
             })
     finally:
         sim.close()
 
     trace = {
+        "agent_variant": agent_variant_name,
+        "navigation_style": "rgb_only_etpnav_ghost_graph",
         "coordinate_frame": "episode_start_relative",
         "scene": args.scene,
         "episode_index": args.episode_index,
@@ -867,6 +924,29 @@ def main():
             "vlm_api_base": config.perception.vlm_api_base,
             "vlm_model": config.perception.vlm_model,
             "vlm_timeout": config.perception.vlm_timeout,
+        },
+        "etpnav": {
+            "ghost_rays": [[float(a), float(d)] for a, d in etp_config.ghost_rays],
+            "ghost_merge_radius": etp_config.ghost_merge_radius,
+            "ghost_min_distance": etp_config.ghost_min_distance,
+            "ghost_confidence": etp_config.ghost_confidence,
+            "ghost_graph_distance_cap": etp_config.ghost_graph_distance_cap,
+            "route_next_hop_enabled": etp_config.route_next_hop_enabled,
+            "semantic_context_weight": etp_config.semantic_context_weight,
+            "semantic_direction_weight": etp_config.semantic_direction_weight,
+            "repeat_candidate_penalty_weight": etp_config.repeat_candidate_penalty_weight,
+            "stop_memory_enabled": etp_config.stop_memory_enabled,
+            "stop_memory_min_write_score": etp_config.stop_memory_min_write_score,
+            "stop_memory_proposal_threshold": etp_config.stop_memory_proposal_threshold,
+            "stop_memory_score_weight": etp_config.stop_memory_score_weight,
+            "stop_memory_min_bbox_score": etp_config.stop_memory_min_bbox_score,
+            "stop_memory_require_anchor": etp_config.stop_memory_require_anchor,
+            "min_forward_before_stop": etp_config.min_forward_before_stop,
+            "min_approach_distance": etp_config.min_approach_distance,
+            "bbox_min_growth_ratio": etp_config.bbox_min_growth_ratio,
+            "stop_require_bbox_growth": etp_config.stop_require_bbox_growth,
+            "stop_min_fresh_bbox": etp_config.stop_min_fresh_bbox,
+            "stop_short_approach_max": etp_config.stop_short_approach_max,
         },
         "task_summaries": tasks,
         "steps": steps,
@@ -921,6 +1001,8 @@ def main():
 
     print(json.dumps({
         "ok": True,
+        "agent_variant": trace["agent_variant"],
+        "navigation_style": trace["navigation_style"],
         "output": str(out),
         "report": str(report_path),
         "overall_passed": report["overall_passed"],

@@ -20,7 +20,7 @@ from run_goat_minimal import (
     rgb_to_embedding,
     make_sim,
 )
-from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 from conftopo.perception import GoatModalityClipEncoder, encode_agent_rgb_embed
@@ -87,8 +87,31 @@ def top_scores(scores: list, k: int = 5) -> list[dict[str, Any]]:
     return [{"label": label, "score": float(score)} for label, score in scores[:k]]
 
 
+def _agent_perception_dict(agent: ConfTopoGOATAgent) -> dict[str, Any]:
+    """Support legacy ``_cur_perception`` and modular ``_last_packet.report``."""
+    if hasattr(agent, "_cur_perception"):
+        return dict(agent._cur_perception or {})
+    packet = getattr(agent, "_last_packet", None)
+    if packet is not None and getattr(packet, "report", None) is not None:
+        report = packet.report
+        return {
+            "room_label": report.room_label,
+            "room_confidence": float(report.room_confidence),
+            "best_goal_sim": float(report.best_goal_sim),
+            "best_landmark_sim": float(report.best_landmark_sim),
+            "room_scores": list(report.room_scores),
+            "goal_scores": list(report.goal_scores),
+            "landmark_scores": list(report.landmark_scores),
+            "best_view_idx": int(getattr(report, "best_view_idx", 0)),
+            "fresh_vlm": bool(getattr(packet, "fresh_vlm", False)),
+            "trigger_reason": str(getattr(packet, "trigger_reason", "")),
+            "object_count": len(report.objects),
+        }
+    return {}
+
+
 def snapshot_perception(agent: ConfTopoGOATAgent) -> dict[str, Any]:
-    p = agent._cur_perception or {}
+    p = _agent_perception_dict(agent)
     return {
         "room_label": p.get("room_label", "unknown"),
         "room_confidence": float(p.get("room_confidence", 0.0)),

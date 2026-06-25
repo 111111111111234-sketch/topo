@@ -24,7 +24,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import GoalNode, InstructionGraph
 
