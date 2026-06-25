@@ -217,6 +217,8 @@ class ObjectMemoryPool:
         for node in candidates:
             if node.label != label:
                 continue
+            if node.attributes.get("cross_goal_preserved"):
+                continue
             if node.attributes.get("folded"):
                 continue
             if not self._room_context_compatible(node, room_context):

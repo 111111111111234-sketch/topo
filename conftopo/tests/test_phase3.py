@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents import ConfTopoGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.confidence import ConfidenceFactors, compute_semantic_confidence
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, EdgeType, NodeType

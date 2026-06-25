@@ -1368,8 +1368,14 @@ class DynamicTopoMap:
             dist = float(np.linalg.norm(node.position - pos))
             if node.node_type == NodeType.OBJECT:
                 debug["object_nodes"] += 1
-                if node.attributes.get("cross_goal_preserved"):
+                attrs = node.attributes
+                if attrs.get("cross_goal_preserved"):
+                    attrs["long_term_retained"] = True
+                    attrs.setdefault("allow_fold", True)
+                if attrs.get("cross_goal_preserved") and self._should_keep_object_detail(node):
                     node.attributes["granularity"] = "object"
+                    node.attributes["detail_active"] = True
+                    node.attributes["allow_fold"] = False
                     debug["object_detail_kept"] += 1
                     continue
                 detail_score = self._semantic_detail_score(node, pos)
@@ -1383,11 +1389,14 @@ class DynamicTopoMap:
                         detail_score *= decay
                 if dist <= self.near_radius:
                     node.attributes["granularity"] = "object"
+                    node.attributes["detail_active"] = True
                     debug["object_detail_kept"] += 1
                     continue
                 if dist > self.room_level_min_distance:
                     debug["far_object_candidates"] += 1
                     node.attributes["granularity"] = "room_level"
+                    node.attributes["detail_active"] = False
+                    node.attributes["allow_fold"] = True
                     self._compress_object_history(node, "far_low_confidence")
                     summary_id = self._add_node_to_room_summary(node, "far_low_confidence")
                     debug["object_room_level_updates"] += 1
@@ -1398,9 +1407,12 @@ class DynamicTopoMap:
                     debug["folded_anchor_marks"] += 1
                 elif detail_score >= self.summary_mid_detail_threshold:
                     node.attributes["granularity"] = "object"
+                    node.attributes["detail_active"] = True
                     debug["object_detail_kept"] += 1
                 else:
                     node.attributes["granularity"] = "landmark"
+                    node.attributes["detail_active"] = False
+                    node.attributes["allow_fold"] = True
                     self._compress_object_history(node, "mid_or_far_object")
                     self._fuse_object_to_landmark(node)
                     debug["object_landmark_updates"] += 1
@@ -1427,6 +1439,22 @@ class DynamicTopoMap:
         self._maintain_spatial_structure_graph()
         if getattr(self, "waypoint_compress_enabled", True):
             self.compress_distant_waypoints(pos)
+
+    def _should_keep_object_detail(self, node: SemanticNode) -> bool:
+        """Whether a long-term object should stay as detailed active memory."""
+        attrs = node.attributes
+        role = attrs.get("semantic_role")
+        if role == "object_anchor":
+            return True
+        if attrs.get("is_semantic_anchor") and float(attrs.get("target_relevance", 0.0)) > 0:
+            return True
+        if float(node.confidence) >= 0.55:
+            return True
+        if int(attrs.get("multi_view_count", node.visit_count)) >= 2:
+            return True
+        if float(attrs.get("target_relevance", 0.0)) > 0.3:
+            return True
+        return False
 
     def _waypoint_nav_neighbors(self, waypoint_id: str) -> List[str]:
         neighbors = []
@@ -2352,6 +2380,7 @@ class DynamicTopoMap:
         attrs["folded"] = False
         attrs["folded_detail"] = False
         attrs["is_active_detail"] = True
+        attrs["detail_active"] = True
 
     def _mark_node_folded_anchor(
         self,
@@ -2364,6 +2393,8 @@ class DynamicTopoMap:
         attrs["folded_detail"] = True
         attrs["folded_reason"] = reason
         attrs["is_active_detail"] = False
+        attrs["detail_active"] = False
+        attrs["allow_fold"] = True
         attrs["is_semantic_anchor"] = True
 
         attrs["anchor_position"] = node.position.tolist()

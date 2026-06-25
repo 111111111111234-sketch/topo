@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from conftopo.perception.light_perceiver import LightPerceiver, cosine_sim
 from conftopo.agents.etpnav_agent import ConfTopoETPNavAgent
-from conftopo.agents.goat_agent_new import ConfTopoGOATAgent
+from conftopo.agents import ConfTopoGOATAgent
 from conftopo.agents.goat_agent import ConfTopoGOATAgent as MainGOATAgent
 from conftopo.config import ConfTopoConfig
 from conftopo.core.instruction_graph import InstructionGraph, SubGoal, GoalNode, Relation

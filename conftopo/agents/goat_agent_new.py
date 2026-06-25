@@ -1,7 +1,8 @@
 """ConfTopo-GOAT Agent (modular scheduler).
 
-Drop-in replacement for the monolithic ``goat_agent.py``.  Import
-``ConfTopoGOATAgent`` from here — it is the same class as ``GoatAgent``.
+Base implementation for perception, memory, proposals, and servo mechanics.
+For the paper-facing navigation state machine, import ``ConfTopoGOATAgent``
+from ``conftopo.agents.goat_agent_final`` (or ``conftopo.agents``).
 """
 
 from __future__ import annotations
@@ -266,6 +267,7 @@ class NavPhase(str, Enum):
     GLOBAL_SEARCH = "GLOBAL_SEARCH"
     ROUTE_TO_STRUCTURE = "ROUTE_TO_STRUCTURE"
     ROUTE_TO_OBJECT_ANCHOR = "ROUTE_TO_OBJECT_ANCHOR"
+    TRACK_TARGET = "TRACK_TARGET"
     LOCAL_VISUAL_APPROACH = "LOCAL_VISUAL_APPROACH"
     PEAK_RETURN = "PEAK_RETURN"
     STOP_VERIFY = "STOP_VERIFY"
@@ -285,7 +287,10 @@ class NewGoatConfig:
     waypoint_merge_radius: float = 0.45
     min_move_for_frontier: float = 0.5
     servo_entry_evidence: int = 2
-    stop_buffer_size: int = 3
+    stop_buffer_size: int = 5
+    track_buffer_size: int = 5
+    track_visible_min: int = 2
+    track_bbox_min: int = 1
     anchor_blacklist_steps: int = 40
     object_write_throttle_steps: int = 4
     no_progress_window: int = 8
@@ -317,13 +322,20 @@ class NewGoatConfig:
     triangulation_max_condition: float = 100.0
     triangulation_max_range: float = 12.0
     camera_hfov_degrees: float = 90.0
-    materialize_clip_threshold: float = 0.28
-    materialize_room_prior_clip_threshold: float = 0.22
-    materialize_alias_min_confidence: float = 0.25
-    frontier_room_prior_boost: float = 3.5
-    frontier_room_prior_boost_no_anchor: float = 6.5
-    fresh_anchor_single_frame_steps: int = 16
+    materialize_clip_threshold: float = 0.22
+    materialize_room_prior_clip_threshold: float = 0.18
+    materialize_alias_min_confidence: float = 0.20
+    materialize_synthesize_conf_floor: float = 0.30
+    frontier_room_prior_boost: float = 2.5
+    frontier_room_prior_boost_no_anchor: float = 4.0
+    fresh_anchor_single_frame_steps: int = 24
     cross_goal_semantic_bonus: float = 0.30
+    semantic_room_bonus: float = 3.0
+    stop_min_fresh_bbox: float = 0.06
+    stop_short_approach_max: float = 0.8
+    stop_mode: str = "simple"
+    stop_close_min: int = 2
+    track_timeout_steps: int = 24
 
 
 @dataclass
@@ -335,6 +347,9 @@ class PerceptionPacket:
     vlm_mode: str = "explore"
     step_id: int = 0
     trigger_reason: str = ""
+    vlm_cache_age: Optional[int] = None
+    vlm_position_delta: Optional[float] = None
+    vlm_heading_delta: Optional[float] = None
 
 
 @dataclass
@@ -448,6 +463,9 @@ class ServoState:
     lost_count: int = 0
     confirm_buffer: List[bool] = field(default_factory=list)
     stop_buffer: List[bool] = field(default_factory=list)
+    centered_buffer: List[bool] = field(default_factory=list)
+    close_buffer: List[bool] = field(default_factory=list)
+    track_buffer: List[Dict[str, Any]] = field(default_factory=list)
     fresh_vlm_stop_step: Optional[int] = None
     last_fresh_bbox: float = 0.0
     aligned_at_peak: bool = False
@@ -475,6 +493,9 @@ class ServoState:
         self.lost_count = 0
         self.confirm_buffer = []
         self.stop_buffer = []
+        self.centered_buffer = []
+        self.close_buffer = []
+        self.track_buffer = []
         self.fresh_vlm_stop_step = None
         self.last_fresh_bbox = 0.0
         self.aligned_at_peak = False
@@ -698,18 +719,23 @@ class PerceptionManager:
         # ── P0: Feed CLIP hints into HypothesisPool ──
         self._feed_clip_hypotheses(packet, goal_manager, position, step_id)
         vlm_mode = "confirm" if nav_phase in (
+            NavPhase.TRACK_TARGET,
             NavPhase.LOCAL_VISUAL_APPROACH,
             NavPhase.STOP_VERIFY,
             NavPhase.PEAK_RETURN,
         ) else "explore"
         self.trigger_state.nav_phase = {
+            NavPhase.TRACK_TARGET: "approach_confirm",
             NavPhase.LOCAL_VISUAL_APPROACH: "approach_confirm",
             NavPhase.STOP_VERIFY: "confirm",
             NavPhase.PEAK_RETURN: "approach",
         }.get(nav_phase, "explore")
 
         force_fresh = nav_phase == NavPhase.STOP_VERIFY
-        if force_fresh and self.vlm_perceiver is not None and rgb is not None:
+        force_reason = getattr(self, "_force_heavy_reason", None)
+        if force_reason and self.vlm_perceiver is not None and rgb is not None:
+            should_run, reason = True, str(force_reason)
+        elif force_fresh and self.vlm_perceiver is not None and rgb is not None:
             should_run, reason = True, "stop_verify_fresh"
         else:
             should_run, reason = self._should_run_vlm(
@@ -783,6 +809,11 @@ class PerceptionManager:
             if cached is not None:
                 cached_report = PerceptionReport.from_dict(cached.to_dict())
                 cached_report.source = "cached_vlm"
+                cache_age = int(step_id - self.last_vlm_step)
+                pos_delta = None
+                if position is not None and self.last_vlm_position is not None:
+                    pos_delta = float(np.linalg.norm(position - self.last_vlm_position))
+                heading_delta = abs(_angle_delta(float(heading), self.last_vlm_heading))
                 return PerceptionPacket(
                     report=cached_report,
                     source="cached_vlm",
@@ -791,6 +822,9 @@ class PerceptionManager:
                     vlm_mode=vlm_mode,
                     step_id=step_id,
                     trigger_reason="cache_valid",
+                    vlm_cache_age=cache_age,
+                    vlm_position_delta=pos_delta,
+                    vlm_heading_delta=heading_delta,
                 )
         packet.vlm_mode = vlm_mode
         packet.trigger_reason = reason
@@ -916,11 +950,13 @@ class PerceptionManager:
         room_label = str(report.room_label or "").lower().strip()
         room_prior = {x.lower() for x in goal_manager.room_prior}
         room_matches_prior = bool(room_label and room_label in room_prior)
+        synth_floor = float(self.new_config.materialize_synthesize_conf_floor)
         should_synthesize = (
             (report.goal_visible and top_conf >= min_conf)
-            or top_conf >= max(min_conf, 0.35)
+            or top_conf >= max(min_conf, synth_floor)
             or clip_sim >= clip_threshold
             or (room_matches_prior and clip_sim >= room_clip_threshold)
+            or (report.goal_visible and clip_sim >= room_clip_threshold)
         )
         if not should_synthesize:
             return
@@ -1869,10 +1905,12 @@ class NavigationPlanner:
             if no_goal_anchor
             else self.cfg.frontier_room_prior_boost
         )
+        rp_best = 0.0
         for rp_pos in self._room_prior_positions(topo_map, goal):
             rp_dist = float(np.linalg.norm(node.position - rp_pos))
             if rp_dist < 12.0:
-                sem_score += room_boost * max(0.0, 1.0 - rp_dist / 12.0)
+                rp_best = max(rp_best, room_boost * max(0.0, 1.0 - rp_dist / 12.0))
+        sem_score += rp_best
         hypothesis_positions = goal.active_hypothesis_positions if goal else []
         for hyp_pos in hypothesis_positions:
             hyp_dist = float(np.linalg.norm(node.position - hyp_pos))
@@ -2358,7 +2396,7 @@ class NavigationPlanner:
                     p.history_bonus += float(self.cfg.cross_goal_semantic_bonus)
                 ctype = p.candidate_type or ""
                 is_room = ctype in ("room", "room_summary", "goal_region")
-                room_bonus = 1.5 if is_room else 0.0
+                room_bonus = float(self.cfg.semantic_room_bonus) if is_room else 0.0
                 p.score = (
                     0.30 * p.semantic_score
                     + 0.35 * p.task_score
@@ -2522,10 +2560,22 @@ class LocalVisualServo:
         if packet.fresh_vlm:
             self._append(self.state.confirm_buffer, confirm)
             self._append(self.state.stop_buffer, stop_pose)
+            self._append(self.state.centered_buffer, aligned)
+            self._append(
+                self.state.close_buffer,
+                raw_range_bin in ("near", "very_near", "close")
+                or raw_bbox_area >= self.cfg.bbox_min_stop,
+            )
             if stop_pose:
                 self.state.fresh_vlm_stop_step = packet.step_id
         elif packet.cached_vlm and raw_bbox_area >= self.cfg.bbox_min_approach:
             self._append(self.state.confirm_buffer, confirm)
+            self._append(self.state.centered_buffer, aligned)
+            self._append(
+                self.state.close_buffer,
+                raw_range_bin in ("near", "very_near", "close")
+                or raw_bbox_area >= self.cfg.bbox_min_stop,
+            )
         if confirm:
             self.state.lost_count = 0
             # best_bbox_area --- fresh VLM + real bbox only ---
@@ -2757,7 +2807,10 @@ class StopVerifier:
         position: Optional[np.ndarray],
         servo_evidence: Optional[Dict[str, Any]] = None,
     ) -> StopDecision:
-        layer1 = sum(self.state.confirm_buffer[-self.cfg.stop_buffer_size:]) >= self.cfg.servo_entry_evidence
+        visible_count = sum(self.state.confirm_buffer[-self.cfg.stop_buffer_size:])
+        centered_count = sum(self.state.centered_buffer[-self.cfg.stop_buffer_size:])
+        close_count = sum(self.state.close_buffer[-self.cfg.stop_buffer_size:])
+        layer1 = visible_count >= self.cfg.servo_entry_evidence
         approach_enough = (
             self.state.forward_action_count >= self.cfg.min_forward_before_stop
             and self.state.approach_travel_distance >= self.cfg.min_approach_distance
@@ -2842,10 +2895,14 @@ class StopVerifier:
             landmarks=goal.landmark_prior,
         ) if best_task_obs else 0.0
 
+        short_approach = (
+            self.state.approach_travel_distance < self.cfg.stop_short_approach_max
+        )
         fresh_stop_ok = (
             packet.fresh_vlm
             and packet.report.goal_visible
             and task_score_stop > 0.3
+            and fresh_raw_bbox_area >= self.cfg.stop_min_fresh_bbox
             and (
                 packet.report.stop_candidate
                 or fresh_range_bin in ("very_near", "close")
@@ -2856,6 +2913,7 @@ class StopVerifier:
                     and fresh_bbox_confidence in ("medium", "high", "unknown")
                 )
             )
+            and (not short_approach or packet.report.stop_candidate)
             and current_centered
             and fresh_visibility_clear
             and progress_ok
@@ -2865,6 +2923,8 @@ class StopVerifier:
             and near_peak
             and near_anchor
             and fresh_stop_ok
+            and centered_count >= self.cfg.servo_entry_evidence
+            and close_count >= 1
             and stop_votes >= self.cfg.servo_entry_evidence
         )
         should = bool(layer1 and layer2 and layer3 and not retreating)
@@ -3018,6 +3078,9 @@ class DebugTracer:
                 "lost_count": servo_state.lost_count,
                 "confirm_buffer": list(servo_state.confirm_buffer),
                 "stop_buffer": list(servo_state.stop_buffer),
+                    "centered_buffer": list(servo_state.centered_buffer),
+                "close_buffer": list(servo_state.close_buffer),
+                "track_buffer": list(servo_state.track_buffer),
             },
             "bbox_area": servo_evidence.get("bbox_area", 0.0),
             "effective_bbox_area": servo_evidence.get("effective_bbox_area", servo_evidence.get("bbox_area", 0.0)),
@@ -3104,6 +3167,7 @@ class GoatAgent(ConfTopoBaseAgent):
         self._target_object_detected_this_scan: bool = False
         self._goal_enter_step: int = -1
         self._recent_actions: List[str] = []
+        self._environment_landmark_labels: Set[str] = set()
         if self.config.perception.backend == "vlm":
             self._init_vlm_perceiver()
 
@@ -3120,6 +3184,10 @@ class GoatAgent(ConfTopoBaseAgent):
     @property
     def perceiver(self) -> LightPerceiver:
         return self.perception_manager.light
+
+    def set_environment_landmark_labels(self, labels: List[str]) -> None:
+        """Mark landmark labels that are scene-level anchors rather than goal hints."""
+        self._environment_landmark_labels = {str(label) for label in labels}
 
     def reset(self):
         super().reset()
@@ -3247,6 +3315,11 @@ class GoatAgent(ConfTopoBaseAgent):
     def _mark_cross_goal_preserved(self) -> None:
         """Protect nodes from pruning across goals.
 
+        Cross-goal preservation means the memory trace survives a goal switch;
+        it does not require the object to stay in detailed active form.
+        DynamicTopoMap.adaptive_granularity decides whether preserved objects
+        remain detailed or fold into landmark / room summaries.
+
         Preserves:
         - OBJECT (object_anchor, context_object, target_relevance > 0)
         - All ROOM nodes
@@ -3260,13 +3333,19 @@ class GoatAgent(ConfTopoBaseAgent):
             role = node.attributes.get("semantic_role")
             if role in ("object_anchor", "context_object"):
                 node.attributes["cross_goal_preserved"] = True
+                node.attributes["long_term_retained"] = True
+                node.attributes.setdefault("allow_fold", role != "object_anchor")
                 preserved_object_ids.add(node.node_id)
             elif float(node.attributes.get("target_relevance", 0.0)) > 0:
                 node.attributes["cross_goal_preserved"] = True
+                node.attributes["long_term_retained"] = True
+                node.attributes.setdefault("allow_fold", True)
                 preserved_object_ids.add(node.node_id)
             elif float(node.attributes.get("strong_negative_evidence", 0.0)) <= 0.3:
                 # Objects without strong rejection also preserved
                 node.attributes["cross_goal_preserved"] = True
+                node.attributes["long_term_retained"] = True
+                node.attributes.setdefault("allow_fold", True)
                 preserved_object_ids.add(node.node_id)
 
         for node in self.topo_map.get_nodes_by_type(NodeType.ROOM):
@@ -3323,7 +3402,7 @@ class GoatAgent(ConfTopoBaseAgent):
 
     def update_memory(self) -> None:
         if self.recovery_manager.note_position(self._position):
-            if self.nav_phase not in (NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY):
+            if self.nav_phase not in (NavPhase.TRACK_TARGET, NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY):
                 self._transition(NavPhase.RECOVERY, "no_progress")
         packet = self.perception_manager.run(
             rgb=self._cur_rgb,
@@ -3408,6 +3487,97 @@ class GoatAgent(ConfTopoBaseAgent):
             ))
         return proposals
 
+    def _update_track_buffer(self) -> None:
+        packet = self._last_packet
+        if not packet.fresh_vlm:
+            return
+        if (
+            self.servo_state.track_buffer
+            and int(self.servo_state.track_buffer[-1].get("step_id", -1)) == int(packet.step_id)
+        ):
+            return
+        best = max(
+            (o for o in packet.report.objects
+             if _label_matches(o.label, self.goal_manager.target_labels)),
+            key=lambda o: _bbox_area(o.bbox) + float(o.confidence),
+            default=None,
+        )
+        visible = bool(packet.report.goal_visible or best is not None)
+        bbox_area = _bbox_area(best.bbox) if best is not None else 0.0
+        bearing = (
+            packet.report.target_direction
+            if packet.report.target_direction != "unknown"
+            else (best.bearing if best is not None else "unknown")
+        )
+        range_bin = str(best.range_bin if best is not None else "unknown").lower()
+        sample = {
+            "step_id": int(packet.step_id),
+            "visible": visible,
+            "bbox_valid": bbox_area > 0.0,
+            "confidence": float(best.confidence) if best is not None else float(packet.report.goal_match_confidence),
+            "centered": str(bearing).lower() in _CENTER_BEARINGS,
+            "bearing": str(bearing).lower(),
+            "range_bin": range_bin,
+        }
+        self.servo_state.track_buffer.append(sample)
+        if len(self.servo_state.track_buffer) > self.new_config.track_buffer_size:
+            del self.servo_state.track_buffer[:-self.new_config.track_buffer_size]
+
+    def _target_seen_recently(self) -> bool:
+        window = self.servo_state.track_buffer[-self.new_config.track_buffer_size:]
+        return sum(bool(x.get("visible")) for x in window) >= self.new_config.track_visible_min
+
+    def _track_ready_for_approach(self) -> bool:
+        window = self.servo_state.track_buffer[-self.new_config.track_buffer_size:]
+        visible_count = sum(bool(x.get("visible")) for x in window)
+        bbox_count = sum(bool(x.get("bbox_valid")) for x in window)
+        return (
+            visible_count >= self.new_config.track_visible_min
+            and bbox_count >= self.new_config.track_bbox_min
+        )
+
+    def _track_scan_decision(
+        self,
+        nav_target: NavTarget,
+        candidate_ids: List[str],
+        scores: List[float],
+        reason: str = "track_target_scan",
+    ) -> PlanDecision:
+        bearing = "unknown"
+        for item in reversed(self.servo_state.track_buffer):
+            if item.get("bearing") and item.get("bearing") != "unknown":
+                bearing = str(item.get("bearing"))
+                break
+        if bearing in ("left", "left_front", "front-left"):
+            action = "turn_left"
+        elif bearing in ("right", "right_front", "front-right"):
+            action = "turn_right"
+        else:
+            action = "turn_left" if self.topo_map.current_step % 2 == 0 else "turn_right"
+        return self._decision(
+            action,
+            "track_target",
+            None,
+            nav_target.target_node_id or self.servo_state.active_anchor_id,
+            "track_target",
+            reason,
+            candidate_ids,
+            scores,
+            NavPhase.TRACK_TARGET,
+        )
+
+    def _plan_track_phase(
+        self,
+        nav_target: NavTarget,
+        candidate_ids: List[str],
+        scores: List[float],
+    ) -> PlanDecision:
+        self._update_track_buffer()
+        if self._track_ready_for_approach():
+            self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "track_target_confirmed")
+            return self._plan_servo_phase(nav_target, candidate_ids, scores)
+        return self._track_scan_decision(nav_target, candidate_ids, scores)
+
     def plan(self) -> PlanDecision:
         structure = self.structure_planner.select(self.topo_map, self.goal_manager, self._position)
         proposals = self.navigation_planner.collect_goal_proposals(
@@ -3448,8 +3618,10 @@ class GoatAgent(ConfTopoBaseAgent):
             anchor_id = nav_target.target_node_id
             if anchor_id and self.servo_state.active_anchor_id != anchor_id:
                 self.local_servo.enter(anchor_id, self.topo_map.current_step)
-            if self.nav_phase not in (NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY, NavPhase.STOP):
-                self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "at_anchor_waypoint_servo")
+            if self.nav_phase not in (NavPhase.TRACK_TARGET, NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY, NavPhase.STOP):
+                self._transition(NavPhase.TRACK_TARGET, "at_anchor_waypoint_track")
+            if self.nav_phase == NavPhase.TRACK_TARGET:
+                return self._plan_track_phase(nav_target, candidate_ids, scores)
             servo_decision = self._plan_servo_phase(nav_target, candidate_ids, scores)
             if servo_decision is not None:
                 return servo_decision
@@ -3481,6 +3653,9 @@ class GoatAgent(ConfTopoBaseAgent):
             elif self.nav_phase == NavPhase.STOP_VERIFY:
                 self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "stop_verify_timeout")
 
+        if self.nav_phase == NavPhase.TRACK_TARGET:
+            return self._plan_track_phase(nav_target, candidate_ids, scores)
+
         if self.nav_phase in (NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY):
             servo_decision = self._plan_servo_phase(nav_target, candidate_ids, scores)
             if servo_decision is not None:
@@ -3492,7 +3667,7 @@ class GoatAgent(ConfTopoBaseAgent):
         if nav_target.target_node_id and nav_target.target_type == "object_anchor":
             self._transition(NavPhase.ROUTE_TO_OBJECT_ANCHOR, "selected_object_anchor")
         elif nav_target.target_node_id and nav_target.target_type == "object_approach":
-            self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "selected_object_approach")
+            self._transition(NavPhase.ROUTE_TO_OBJECT_ANCHOR, "selected_object_approach")
         elif nav_target.target_node_id and nav_target.target_type in (
             "room", "landmark", "room_summary", "object_summary",
             "goal_region", "context_object",
@@ -3519,6 +3694,13 @@ class GoatAgent(ConfTopoBaseAgent):
         candidate_ids: List[str],
         scores: List[float],
     ) -> Optional[PlanDecision]:
+        self._update_track_buffer()
+        if self.nav_phase == NavPhase.LOCAL_VISUAL_APPROACH and not self._target_seen_recently():
+            self._transition(NavPhase.TRACK_TARGET, "target_not_seen_recently")
+            return self._track_scan_decision(
+                nav_target, candidate_ids, scores, "track_target_reacquire",
+            )
+
         servo_evidence = self.local_servo.update_evidence(
             self._last_packet,
             self.goal_manager,
@@ -3589,7 +3771,7 @@ class GoatAgent(ConfTopoBaseAgent):
         return self._decision("move_forward", "approach_confirm", None, None, "servo_guard", "servo_phase_guard", candidate_ids, scores)
 
     def _maybe_enter_servo_near_anchor(self, nav_target: NavTarget) -> None:
-        if self.nav_phase in (NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY, NavPhase.STOP):
+        if self.nav_phase in (NavPhase.TRACK_TARGET, NavPhase.LOCAL_VISUAL_APPROACH, NavPhase.STOP_VERIFY, NavPhase.STOP):
             return
         if self._position is None:
             return
@@ -3615,33 +3797,10 @@ class GoatAgent(ConfTopoBaseAgent):
             return
         if self.goal_manager.is_repeated_goal and not at_waypoint:
             return
-        if self.goal_manager.is_repeated_goal and not self._last_packet.fresh_vlm:
-            return
-
-        goal_visible = self._last_packet.report.goal_visible
-        if not goal_visible:
-            goal_visible = any(
-                _label_matches(obs.label, self.goal_manager.target_labels)
-                for obs in self._last_packet.report.objects
-            )
-        if not goal_visible and self.servo_state.best_bbox_area < self.new_config.bbox_min_approach:
-            return
-        best_obs = max(
-            (o for o in self._last_packet.report.objects if _label_matches(o.label, self.goal_manager.target_labels)),
-            key=lambda o: _bbox_area(o.bbox),
-            default=None,
-        )
-        if best_obs is not None:
-            raw_bbox = _bbox_area(best_obs.bbox)
-            range_bin = str(best_obs.range_bin or "unknown").lower()
-            if raw_bbox < self.new_config.bbox_min_approach and range_bin not in ("near", "close"):
-                return
-        elif self.goal_manager.is_repeated_goal:
-            return
 
         if self.servo_state.active_anchor_id != anchor.node_id:
             self.local_servo.enter(anchor.node_id, self.topo_map.current_step)
-        self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "near_anchor_goal_visible")
+        self._transition(NavPhase.TRACK_TARGET, "near_anchor_track_target")
 
     def act(self, plan_output: PlanDecision) -> Dict[str, Any]:
         debug = self.debug_tracer.build(
@@ -3687,7 +3846,7 @@ class GoatAgent(ConfTopoBaseAgent):
         self._last_navigation_event = out
         if out.get("action") == "object_anchor_reached":
             self.local_servo.enter(target_node_id, self.topo_map.current_step)
-            self._transition(NavPhase.LOCAL_VISUAL_APPROACH, "object_anchor_reached")
+            self._transition(NavPhase.TRACK_TARGET, "object_anchor_reached_track")
         elif out.get("action") == "consumed_frontier":
             if target_node_id:
                 self._consumed_frontier_ids.add(target_node_id)

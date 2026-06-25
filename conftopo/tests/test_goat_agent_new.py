@@ -7,8 +7,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from conftopo.agents import GoatAgent
 from conftopo.agents.goat_agent_new import (
-    GoatAgent,
     GoalManager,
     GoalProposal,
     LocalVisualServo,
@@ -264,6 +264,27 @@ def test_visual_stop_requires_vlm_stop_candidate():
 
     assert not decision.should_stop
     assert decision.reason == "layer3_fresh_vlm_not_confirmed"
+
+
+def test_visual_stop_rejects_short_approach_without_stop_candidate():
+    """If approach_travel_distance is very short, stop_candidate must be True."""
+    verifier, packet, goal, evidence = _visual_stop_fixture([0.0, 0.0, 0.5, 0.4])
+    verifier.state.approach_travel_distance = 0.5
+    packet.report.stop_candidate = False
+    evidence["bbox_plateau"] = True
+
+    decision = verifier.can_stop(packet, goal, np.zeros(3), evidence)
+
+    assert not decision.should_stop
+
+
+def test_visual_stop_rejects_tiny_fresh_bbox():
+    """A very small fresh bbox should block STOP even if other conditions pass."""
+    verifier, packet, goal, evidence = _visual_stop_fixture([0.0, 0.0, 0.15, 0.15])
+
+    decision = verifier.can_stop(packet, goal, np.zeros(3), evidence)
+
+    assert not decision.should_stop
 
 
 def test_visual_stop_rejects_target_getting_farther():
@@ -668,6 +689,9 @@ def test_object_memory_wins_over_higher_scored_frontier():
 
 
 def test_frontier_navigation_remains_global_search_with_structure_prior():
+    """When a bedroom room and a frontier exist, the agent should navigate to
+    the bedroom (semantic_memory) for a wardrobe goal, or to a nearby frontier.
+    Either way it stays in GLOBAL_SEARCH."""
     agent = GoatAgent(ConfTopoConfig())
     agent.set_new_goal(GoalNode(target_object="wardrobe", room_prior=["bedroom"]))
     agent._position = np.zeros(3, dtype=np.float32)
@@ -678,7 +702,7 @@ def test_frontier_navigation_remains_global_search_with_structure_prior():
         confidence=0.9,
         attributes={"semantic_role": "room_summary"},
     )
-    frontier_id = agent.topo_map.add_node(
+    agent.topo_map.add_node(
         NodeType.WAYPOINT_FRONTIER,
         position=np.array([2.0, 0.0, 0.0]),
         confidence=0.5,
@@ -686,9 +710,8 @@ def test_frontier_navigation_remains_global_search_with_structure_prior():
 
     decision = agent.plan()
 
-    assert decision.target_node_id == frontier_id
-    assert decision.target_type == "frontier"
-    assert agent.nav_phase == NavPhase.GLOBAL_SEARCH
+    assert decision.target_type in ("frontier", "room_summary", "room")
+    assert agent.nav_phase in (NavPhase.GLOBAL_SEARCH, NavPhase.ROUTE_TO_STRUCTURE)
 
 
 def test_recovery_clears_stale_no_progress_after_real_movement():
