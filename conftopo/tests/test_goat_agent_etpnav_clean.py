@@ -15,7 +15,7 @@ from conftopo.agents.goat_agent_etpnav_clean import (
     ETPBBoxGrowthStopVerifier,
     classify_goal_evidence,
 )
-from conftopo.agents.goat_agent_new import GoalManager, NavPhase, ServoState, StopDecision
+from conftopo.agents.goat_agent_new import GoalManager, NavPhase, NavTarget, ServoState, StopDecision
 from conftopo.core.dynamic_topo_map import DynamicTopoMap, NodeType
 from conftopo.core.instruction_graph import GoalNode, GoalProposal
 
@@ -179,15 +179,20 @@ def test_approach_transitions_to_verify_not_stop():
         with patch.object(agent.local_servo, "act", return_value=servo_action):
             with patch.object(
                 type(agent.stop_verifier),
-                "is_verify_candidate",
+                "is_near_stop_evidence",
                 return_value=True,
             ):
                 with patch.object(
                     type(agent.stop_verifier),
-                    "can_stop",
-                    return_value=stop_decision,
+                    "is_verify_candidate",
+                    return_value=True,
                 ):
-                    decision = agent._plan_servo_phase(agent._last_nav_target, [], [])
+                    with patch.object(
+                        type(agent.stop_verifier),
+                        "can_stop",
+                        return_value=stop_decision,
+                    ):
+                        decision = agent._plan_servo_phase(agent._last_nav_target, [], [])
 
     assert agent.nav_phase == NavPhase.STOP_VERIFY
     assert decision is not None
@@ -225,3 +230,106 @@ def test_goal_evidence_buffer_records_outside_track_phase():
     assert len(agent.servo_state.track_buffer) == 1
     assert agent.servo_state.track_buffer[0]["visible"] is True
     assert agent.servo_state.track_buffer[0]["evidence_type"] == "far_visible"
+
+
+def test_far_from_anchor_forces_route_phase():
+    agent = ConfTopoGOATAgentCleanETPNav()
+    agent.set_new_goal(GoalNode(target_object="rack"))
+    agent.topo_map.step()
+    agent._position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    wp_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([8.0, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        label="wp",
+    )
+    oid = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([8.5, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        label="rack",
+        attributes={
+            "semantic_role": "object_anchor",
+            "anchor_waypoint_id": wp_id,
+            "anchor_waypoint_position": [8.0, 0.0, 0.0],
+        },
+    )
+    agent.nav_phase = NavPhase.LOCAL_VISUAL_APPROACH
+    agent.servo_state.active_anchor_id = oid
+    nav_target = NavTarget(
+        target_position=np.array([8.0, 0.0, 0.0], dtype=np.float32),
+        target_node_id=oid,
+        target_type="object_anchor",
+        reason="route_to_object_anchor_waypoint",
+        expected_phase_after_reach=NavPhase.TRACK_TARGET,
+    )
+    decision = agent._enforce_object_anchor_route(nav_target, [], [])
+    assert decision is not None
+    assert decision.action == "navigate"
+    assert agent.nav_phase == NavPhase.ROUTE_TO_OBJECT_ANCHOR
+
+
+def test_within_track_radius_skips_forced_route():
+    agent = ConfTopoGOATAgentCleanETPNav()
+    agent.set_new_goal(GoalNode(target_object="heater"))
+    agent.topo_map.step()
+    agent._position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    wp_id = agent.topo_map.add_node(
+        NodeType.WAYPOINT_VISITED,
+        position=np.array([0.8, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        label="wp",
+    )
+    oid = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.array([0.9, 0.0, 0.0], dtype=np.float32),
+        confidence=0.9,
+        label="heater",
+        attributes={
+            "semantic_role": "object_anchor",
+            "anchor_waypoint_id": wp_id,
+            "anchor_waypoint_position": [0.8, 0.0, 0.0],
+        },
+    )
+    agent.nav_phase = NavPhase.TRACK_TARGET
+    agent.servo_state.active_anchor_id = oid
+    nav_target = NavTarget(
+        target_position=np.array([0.8, 0.0, 0.0], dtype=np.float32),
+        target_node_id=oid,
+        target_type="object_anchor",
+        reason="route_to_object_anchor_waypoint",
+        expected_phase_after_reach=NavPhase.TRACK_TARGET,
+    )
+    assert agent._enforce_object_anchor_route(nav_target, [], []) is None
+    assert agent.nav_phase == NavPhase.TRACK_TARGET
+
+
+def test_track_ready_without_centered():
+    agent = ConfTopoGOATAgentCleanETPNav()
+    agent.goal_manager.current_goal = GoalNode(target_object="heater")
+    agent._goal_servo_unlock_step = 0
+    agent.nav_phase = NavPhase.TRACK_TARGET
+    agent.topo_map.step()
+    oid = agent.topo_map.add_node(
+        NodeType.OBJECT,
+        position=np.zeros(3, dtype=np.float32),
+        confidence=0.9,
+        label="heater",
+        attributes={"semantic_role": "object_anchor"},
+    )
+    agent.servo_state.active_anchor_id = oid
+    agent.servo_state.track_buffer = [
+        {"visible": True, "bbox_valid": True, "centered": False},
+        {"visible": True, "bbox_valid": True, "centered": False},
+    ]
+    assert agent._track_ready_for_approach() is True
+
+
+def test_stop_verify_cooldown_blocks_reentry():
+    agent = ConfTopoGOATAgentCleanETPNav()
+    agent.set_new_goal(GoalNode(target_object="bed"))
+    agent._goal_servo_unlock_step = 0
+    agent.nav_phase = NavPhase.LOCAL_VISUAL_APPROACH
+    agent.topo_map.step()
+    agent._stop_verify_cooldown_until = agent.topo_map.current_step + 3
+    assert agent._stop_verify_entry_allowed(True, True, {}) is False
