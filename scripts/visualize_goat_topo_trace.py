@@ -11,6 +11,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from trace_goal_markers import draw_goal_position_markers, extend_xz_limits, load_goal_instances
+
 ROOT = Path(__file__).resolve().parents[1]
 COLORS = {"waypoint_visited": "#2563eb", "waypoint_frontier": "#f97316", "waypoint_candidate": "#06b6d4", "object": "#16a34a", "room": "#dc2626", "landmark": "#9333ea"}
 MARKERS = {"waypoint_visited": "o", "waypoint_frontier": "^", "waypoint_candidate": "v", "object": "D", "room": "s", "landmark": "P"}
@@ -94,6 +96,59 @@ def infer_navmesh_path(trace, override=None):
     return None, "navmesh not found"
 
 
+def infer_slice_height(trace, origin_world, bounds_min, pathfinder=None):
+    steps = trace.get("steps") or []
+    ys = []
+    for step in steps:
+        world = step.get("world_position")
+        if world is None:
+            continue
+        world_arr = np.asarray(world, dtype=np.float32)
+        if pathfinder is not None:
+            world_arr = np.asarray(pathfinder.snap_point(world_arr), dtype=np.float32)
+        ys.append(float(world_arr[1]))
+    if ys:
+        return float(np.median(ys)) + 0.02
+    if origin_world is not None:
+        return float(np.asarray(origin_world, dtype=np.float32)[1]) + 0.02
+    return float(bounds_min[1] + 0.1)
+
+
+def agent_world_position(step, origin_world=None, position_frame="episode_start_relative"):
+    if step.get("world_position") is not None:
+        return np.asarray(step["world_position"], dtype=np.float32)
+    return position_to_world(step.get("position", [0.0, 0.0, 0.0]), origin_world, position_frame)
+
+
+def world_xz_limits(trace, idx, origin_world, position_frame, pad=2.5):
+    xs, zs = [], []
+    for step in trace["steps"][: idx + 1]:
+        pos = agent_world_position(step, origin_world, position_frame)
+        xs.append(float(pos[0]))
+        zs.append(float(pos[2]))
+    for step in trace["steps"][: idx + 1]:
+        for node in step.get("topo", {}).get("nodes", []):
+            pos = position_to_world(node["position"], origin_world, position_frame)
+            xs.append(float(pos[0]))
+            zs.append(float(pos[2]))
+    extend_xz_limits(
+        xs,
+        zs,
+        trace,
+        use_world=True,
+        origin_world=origin_world,
+        position_frame=position_frame,
+    )
+    return (min(xs) - pad, max(xs) + pad), (min(zs) - pad, max(zs) + pad)
+
+
+def get_cached_topdown(pathfinder, resolution, slice_height, cache):
+    key = round(float(slice_height), 3)
+    if key not in cache:
+        cache[key] = np.asarray(pathfinder.get_topdown_view(resolution, float(slice_height)), dtype=bool)
+    return cache[key]
+
+
 def load_gt_topdown(trace, resolution, navmesh_override=None, disabled=False):
     if disabled:
         return {"available": False, "reason": "disabled by --no-gt-topdown"}
@@ -110,13 +165,16 @@ def load_gt_topdown(trace, resolution, navmesh_override=None, disabled=False):
         if not pathfinder.load_nav_mesh(str(navmesh_path)):
             return {"available": False, "reason": f"failed to load navmesh: {navmesh_path}", "origin_world": origin_world}
         bounds_min, bounds_max = pathfinder.get_bounds()
-        slice_height = float(bounds_min[1] + 0.1)
+        slice_height = infer_slice_height(trace, origin_world, bounds_min, pathfinder=pathfinder)
         topdown = np.asarray(pathfinder.get_topdown_view(resolution, slice_height), dtype=bool)
         return {
             "available": True,
             "topdown": topdown,
             "bounds_min": np.asarray(bounds_min, dtype=np.float32),
             "bounds_max": np.asarray(bounds_max, dtype=np.float32),
+            "slice_height": slice_height,
+            "pathfinder": pathfinder,
+            "topdown_cache": {round(float(slice_height), 3): topdown},
             "origin_world": origin_world,
             "origin_source": origin_source,
             "position_frame": position_frame,
@@ -153,6 +211,7 @@ def collect_limits(steps, trace=None):
     if trace is not None:
         for p in trace.get("trajectory", {}).get("path_points_relative", []):
             xs.append(p[0]); zs.append(p[2])
+        extend_xz_limits(xs, zs, trace, use_world=False)
     return (min(xs)-1.0, max(xs)+1.0), (min(zs)-1.0, max(zs)+1.0)
 
 
@@ -245,6 +304,11 @@ def draw_topo_on_axis(ax, trace, idx, xlim, zlim, title, use_world=False, origin
         arr = np.asarray(value, dtype=np.float32)
         return position_to_world(arr, origin_world, position_frame) if use_world and origin_world is not None else arr
 
+    def agent_pos(step):
+        if use_world and origin_world is not None:
+            return agent_world_position(step, origin_world, position_frame)
+        return np.asarray(step["position"], dtype=np.float32)
+
     for e in st["topo"]["edges"]:
         a, b = nodes.get(e["source"]), nodes.get(e["target"])
         if not a or not b:
@@ -260,8 +324,17 @@ def draw_topo_on_axis(ax, trace, idx, xlim, zlim, title, use_world=False, origin
         if node_id:
             rank_labels[node_id] = "#{} {:.3f}".format(rank, float(item.get("score", 0.0)))
 
-    for typ in ["waypoint_visited", "waypoint_frontier", "waypoint_candidate", "object", "room", "landmark"]:
-        group = [n for n in nodes.values() if n["type"] == typ]
+    object_anchors = [n for n in nodes.values() if n["type"] == "object" and n.get("attributes", {}).get("semantic_role") == "object_anchor"]
+    other_objects = [n for n in nodes.values() if n["type"] == "object" and n.get("attributes", {}).get("semantic_role") != "object_anchor"]
+    draw_groups = [
+        ("waypoint_visited", [n for n in nodes.values() if n["type"] == "waypoint_visited"]),
+        ("waypoint_frontier", [n for n in nodes.values() if n["type"] == "waypoint_frontier"]),
+        ("waypoint_candidate", [n for n in nodes.values() if n["type"] == "waypoint_candidate"]),
+        ("object", other_objects),
+        ("room", [n for n in nodes.values() if n["type"] == "room"]),
+        ("landmark", [n for n in nodes.values() if n["type"] == "landmark"]),
+    ]
+    for typ, group in draw_groups:
         if not group:
             continue
         positions = [pos(n["position"]) for n in group]
@@ -292,11 +365,39 @@ def draw_topo_on_axis(ax, trace, idx, xlim, zlim, title, use_world=False, origin
                         bbox={"facecolor": "#fef3c7", "edgecolor": "#f59e0b", "boxstyle": "round,pad=0.16", "alpha": 0.78},
                         zorder=6,
                     )
+    if object_anchors:
+        anchor_positions = [pos(n["position"]) for n in object_anchors]
+        ax.scatter(
+            [p[0] for p in anchor_positions],
+            [p[2] for p in anchor_positions],
+            s=[120 + 180 * float(n.get("confidence", 0.5)) for n in object_anchors],
+            marker="*",
+            color="#16a34a",
+            edgecolors="black",
+            linewidths=0.8,
+            alpha=0.95,
+            label="object_anchor (VLM)",
+            zorder=4,
+        )
+        if show_info_labels:
+            for n, p in zip(object_anchors, anchor_positions):
+                label = "{}:{}".format(n["id"], n.get("label") or "anchor")
+                ax.text(p[0], p[2] + 0.12, label, fontsize=7, ha="center", color="#14532d", zorder=6)
 
-    path = np.array([pos(s["position"]) for s in trace["steps"][:idx+1]])
+    path = np.array([agent_pos(s) for s in trace["steps"][:idx+1]])
     if len(path) > 1:
         ax.plot(path[:, 0], path[:, 2], color="#111827", linewidth=1.4, alpha=0.85, label="agent path", zorder=2)
-    cur = pos(st["position"])
+    draw_goal_position_markers(
+        ax,
+        trace,
+        st,
+        use_world=use_world,
+        origin_world=origin_world,
+        position_frame=position_frame,
+        pos_fn=pos,
+        show_labels=show_info_labels,
+    )
+    cur = agent_pos(st)
     ax.scatter([cur[0]], [cur[2]], marker="*", s=220, color="#facc15", edgecolors="black", linewidths=1.0, label="agent", zorder=5)
     if st.get("target_position"):
         tgt = pos(st["target_position"])
@@ -351,6 +452,7 @@ def draw_topo_frame(trace, idx, xlim, zlim, out_path=None):
     path = np.array([s["position"] for s in trace["steps"][:idx+1]])
     if len(path) > 1:
         ax.plot(path[:, 0], path[:, 2], color="#111827", linewidth=1.6, alpha=0.8, label="agent path", zorder=2)
+    draw_goal_position_markers(ax, trace, st, use_world=False, show_labels=True)
     cur = st["position"]
     ax.scatter([cur[0]], [cur[2]], marker="*", s=260, color="#facc15", edgecolors="black", linewidths=1.0, label="agent", zorder=5)
     if st.get("target_position"):
@@ -435,37 +537,56 @@ def draw_gt_topdown_axis(ax, trace, idx, gt_ctx, show_planned_route=False):
         ax.set_title("GT topdown + topo overlay")
         return
 
-    topdown = gt_ctx["topdown"]
     bounds_min = gt_ctx["bounds_min"]
     bounds_max = gt_ctx["bounds_max"]
+    origin_world = gt_ctx["origin_world"]
+    position_frame = gt_ctx.get("position_frame", "episode_start_relative")
+    resolution = float(gt_ctx.get("resolution", 0.05))
+    pathfinder = gt_ctx.get("pathfinder")
+    cache = gt_ctx.setdefault("topdown_cache", {})
+    st = trace["steps"][idx]
+    world_pos = agent_world_position(st, origin_world, position_frame)
+    if pathfinder is not None:
+        slice_height = float(np.asarray(pathfinder.snap_point(world_pos), dtype=np.float32)[1]) + 0.02
+        topdown = get_cached_topdown(pathfinder, resolution, slice_height, cache)
+        title = "GT topdown + topo overlay | slice_y={:.2f}".format(slice_height)
+    else:
+        topdown = gt_ctx["topdown"]
+        slice_height = float(gt_ctx.get("slice_height", bounds_min[1] + 0.1))
+        title = "GT topdown + topo overlay | slice_y={:.2f}".format(slice_height)
     extent = [bounds_min[0], bounds_max[0], bounds_max[2], bounds_min[2]]
     ax.imshow(topdown, cmap="gray", origin="upper", extent=extent, alpha=0.58)
+    xlim, zlim = world_xz_limits(trace, idx, origin_world, position_frame, pad=2.5)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*zlim)
     if show_planned_route:
         draw_trajectory_route_axis(
             ax,
             trace,
             idx,
             use_world=True,
-            origin_world=gt_ctx["origin_world"],
-            position_frame=gt_ctx.get("position_frame", "episode_start_relative"),
+            origin_world=origin_world,
+            position_frame=position_frame,
         )
     draw_topo_on_axis(
         ax,
         trace,
         idx,
-        (float(bounds_min[0]), float(bounds_max[0])),
-        (float(bounds_min[2]), float(bounds_max[2])),
-        "GT topdown + topo overlay",
+        xlim,
+        zlim,
+        title,
         use_world=True,
-        origin_world=gt_ctx["origin_world"],
-        position_frame=gt_ctx.get("position_frame", "episode_start_relative"),
+        origin_world=origin_world,
+        position_frame=position_frame,
         show_info_labels=False,
     )
 
 
 def goal_header(trace, idx, gt_ctx):
-    goal = trace.get("current_goal", {})
     st = trace["steps"][idx]
+    goal = dict(trace.get("current_goal", {}) or {})
+    if st.get("goal"):
+        goal["target_object"] = st.get("goal")
     instruction = trace.get("instruction") or goal.get("instruction") or goal.get("description") or ""
     target = goal.get("target_object") or goal.get("goal") or "n/a"
     goal_type = goal.get("goal_type", trace.get("goal_type", "n/a"))
@@ -547,6 +668,7 @@ def main():
     ap.add_argument("--show-planned-route", action="store_true")
     args = ap.parse_args()
     trace = json.load(open(ROOT / args.trace if not Path(args.trace).is_absolute() else args.trace))
+    load_goal_instances(trace)
     out_dir = ROOT / args.out_dir if not Path(args.out_dir).is_absolute() else Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     xlim, zlim = collect_limits(trace["steps"], trace)

@@ -54,6 +54,19 @@ def quat_to_heading(q: list[float]) -> float:
     return float(yaw)
 
 
+def apply_episode_rotation(state, episode: dict[str, Any]) -> None:
+    """Set habitat AgentState.rotation from a GOAT episode quaternion.
+
+    GOAT HM3D episodes often store yaw quaternions as [x, y, z, w] with x=z=0.
+    Habitat expects np.quaternion(w, x, y, z).
+    """
+    q = normalize_quat(episode["start_rotation"])
+    if abs(q[0]) < 1e-6 and abs(q[2]) < 1e-6 and (abs(q[1]) > 1e-6 or abs(q[3]) > 1e-6):
+        state.rotation = np.quaternion(q[3], q[0], q[1], q[2])
+    else:
+        state.rotation = np.quaternion(q[0], q[1], q[2], q[3])
+
+
 def rgb_to_embedding(rgb: np.ndarray, dim: int = 512) -> np.ndarray:
     """Deterministic lightweight visual embedding placeholder."""
     rgb = np.asarray(rgb, dtype=np.float32)
@@ -392,8 +405,7 @@ def main() -> None:
 
     state = habitat_sim.AgentState()
     state.position = np.array(episode["start_position"], dtype=np.float32)
-    q = normalize_quat(episode["start_rotation"])
-    state.rotation = np.quaternion(q[0], q[1], q[2], q[3])
+    apply_episode_rotation(state, episode)
     sim_agent.set_state(state)
     origin = np.array(state.position, dtype=np.float32)
 
@@ -461,3 +473,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -88,9 +88,22 @@ def top_scores(scores: list, k: int = 5) -> list[dict[str, Any]]:
 
 
 def _agent_perception_dict(agent: ConfTopoGOATAgent) -> dict[str, Any]:
-    """Support legacy ``_cur_perception`` and modular ``_last_packet.report``."""
+    """Support legacy ``_cur_perception``, refactored ``_last_clip_hint``, and ``_last_packet.report``."""
     if hasattr(agent, "_cur_perception"):
         return dict(agent._cur_perception or {})
+    hint = getattr(agent, "_last_clip_hint", None)
+    if hint is not None:
+        raw = getattr(hint, "raw", {}) or {}
+        return {
+            "room_label": str(getattr(hint, "room_label", "unknown")),
+            "room_confidence": float(getattr(hint, "room_confidence", 0.0)),
+            "best_goal_sim": float(getattr(hint, "best_goal_sim", 0.0)),
+            "best_landmark_sim": float(getattr(hint, "best_landmark_sim", 0.0)),
+            "room_scores": list(raw.get("room_scores", [])),
+            "goal_scores": list(getattr(hint, "goal_scores", [])),
+            "landmark_scores": list(getattr(hint, "landmark_scores", [])),
+            "best_view_idx": 0,
+        }
     packet = getattr(agent, "_last_packet", None)
     if packet is not None and getattr(packet, "report", None) is not None:
         report = packet.report
